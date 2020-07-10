@@ -129,9 +129,6 @@ struct CommonMemTrackers {
 
 std::unique_ptr<CommonMemTrackers> common_mem_trackers;
 
-static const string kWildCardHostAddressV6 = "::";
-static const string kWildCardHostAddressV4 = "0.0.0.0";
-
 } // anonymous namespace
 
 std::shared_ptr<MemTracker> CreateMemTrackerForServer() {
@@ -493,8 +490,7 @@ Status RpcAndWebServerBase::GetRegistration(ServerRegistrationPB* reg, RpcOnly r
   std::vector<HostPort> addrs = CHECK_NOTNULL(rpc_server())->GetRpcHostPort();
 
   // Fall back to hostname resolution if the rpc hostname is a wildcard.
-  if (addrs.size() > 1 || addrs[0].host() == kWildCardHostAddressV4 ||
-      addrs[0].host() == kWildCardHostAddressV6 || addrs[0].port() == 0) {
+  if (addrs.size() > 1 || IsWildcardAddress(addrs[0].host()) || addrs[0].port() == 0) {
     vector<Endpoint> endpoints =
         CHECK_NOTNULL(rpc_server())->GetBoundAddresses();
     RETURN_NOT_OK_PREPEND(

@@ -424,7 +424,11 @@ Status GetDynamicUrlTile(const string& path, const string& hostport, const int p
   RETURN_NOT_OK(hp.ParseString(hostport, port));
   hp.set_port(port);
 
-  *url = strings::Substitute("http://$0$1", hp.ToString(), path);
+  if (!IsWildcardAddress(hp.host())) {
+    *url = strings::Substitute("http://$0$1", hp.ToString(), path);
+  } else {
+    *url = strings::Substitute("$0", path);
+  }
   return Status::OK();
 }
 
