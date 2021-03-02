@@ -268,9 +268,19 @@ runPlatform := {
 
 libraryDependencies += "org.yb" % "yb-client" % "0.8.3-SNAPSHOT"
 
+libraryDependencies ++= Seq(
+  "io.swagger" %% "swagger-play2" % "1.6.1",
+  "io.swagger" %% "swagger-scala-module" % "1.0.5",
+  "com.fasterxml.jackson.module" %% "jackson-module-scala" % "2.9.8"
+)
+// https://mvnrepository.com/artifact/eu.unicredit/sbt-swagger-codegen-lib
+//libraryDependencies += "eu.unicredit" %% "sbt-swagger-codegen-lib" % "0.0.12"
+
+
 dependencyOverrides += "io.netty" % "netty-handler" % "4.0.36.Final"
 dependencyOverrides += "com.google.protobuf" % "protobuf-java" % "latest.integration"
 dependencyOverrides += "com.google.guava" % "guava" % "23.0"
+
 
 javaOptions in Test += "-Dconfig.file=src/main/resources/application.test.conf"
 testOptions += Tests.Argument(TestFrameworks.JUnit, "-v", "-q", "-a")
@@ -291,7 +301,7 @@ consoleSetting := {
     private def withConsoleReader[T](f: ConsoleReader => T): T = {
       val consoleReader = new ConsoleReader
       try f(consoleReader)
-      finally consoleReader.close()
+      //finally consoleReader.close()
     }
     private def waitForKey(): Unit = {
       withConsoleReader { consoleReader =>

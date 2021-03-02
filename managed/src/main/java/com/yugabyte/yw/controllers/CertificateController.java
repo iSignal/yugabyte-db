@@ -26,6 +26,11 @@ import java.util.List;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
+import io.swagger.annotations.Api;
+import io.swagger.annotations.ApiOperation;
+
+
+@Api
 public class CertificateController extends AuthenticatedController {
   public static final Logger LOG = LoggerFactory.getLogger(CertificateController.class);
 
@@ -35,6 +40,7 @@ public class CertificateController extends AuthenticatedController {
   @Inject
   FormFactory formFactory;
 
+  @ApiOperation(value="upload", response=UUID.class)
   public Result upload(UUID customerUUID) {
     Form<CertificateParams> formData = formFactory.form(CertificateParams.class)
                                                   .bindFromRequest();
@@ -79,6 +85,8 @@ public class CertificateController extends AuthenticatedController {
     }
   }
 
+
+  @io.swagger.annotations.ApiOperation(value="foo")
   public Result getClientCert(UUID customerUUID, UUID rootCA) {
     Form<ClientCertParams> formData = formFactory.form(ClientCertParams.class)
                                                  .bindFromRequest();
@@ -105,6 +113,7 @@ public class CertificateController extends AuthenticatedController {
       );
       return ApiResponse.error(INTERNAL_SERVER_ERROR, "Couldn't generate client cert.");
     }
+
   }
 
   public Result getRootCert(UUID customerUUID, UUID rootCA) {
@@ -167,6 +176,7 @@ public class CertificateController extends AuthenticatedController {
     }
   }
 
+  @ApiOperation(value="update empty certs", response=CertificateInfo.class)
   public Result updateEmptyCustomCert(UUID customerUUID, UUID rootCA) {
     Form<CertificateParams> formData = formFactory.form(CertificateParams.class)
         .bindFromRequest();

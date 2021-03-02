@@ -31,7 +31,12 @@ import play.data.FormFactory;
 import play.libs.Json;
 import play.mvc.Result;
 
+import io.swagger.annotations.Api;
+import io.swagger.annotations.ApiImplicitParam;
+import io.swagger.annotations.ApiImplicitParams;
+import io.swagger.annotations.ApiOperation;
 
+@Api
 public class RegionController extends AuthenticatedController {
   @Inject
   FormFactory formFactory;
@@ -52,6 +57,7 @@ public class RegionController extends AuthenticatedController {
    * GET endpoint for listing regions
    * @return JSON response with region's
    */
+  @ApiOperation(value="listRegion", response = Region.class, responseContainer = "List")
   public Result list(UUID customerUUID, UUID providerUUID) {
     List<Region> regionList = null;
 
@@ -69,6 +75,8 @@ public class RegionController extends AuthenticatedController {
    * GET endpoint for listing all regions across all providers
    * @return JSON response with RegionList joined with provider Name, uuid, code
    */
+  @ApiOperation(value="listAllRegions", response = Region.class, responseContainer = "List")
+  // todo: include provider field in response
   public Result listAllRegions(UUID customerUUID) {
     List<Provider> providerList = Provider.getAll(customerUUID);
     ArrayNode resultArray = Json.newArray();
@@ -87,6 +95,16 @@ public class RegionController extends AuthenticatedController {
    * POST endpoint for creating new region
    * @return JSON response of newly created region
    */
+  @ApiOperation(value="createRegion", response = Region.class)
+  @ApiImplicitParams(
+    @ApiImplicitParam(
+      name = "regionFormData",
+      value = "region form data",
+      paramType = "body",
+      dataType = "com.yugabyte.yw.forms.RegionFormData",
+      required = true
+    )
+  )
   public Result create(UUID customerUUID, UUID providerUUID) {
     Form<RegionFormData> formData = formFactory.form(RegionFormData.class).bindFromRequest();
     if (formData.hasErrors()) {
@@ -175,6 +193,7 @@ public class RegionController extends AuthenticatedController {
    * @param regionUUID Region UUID
    * @return JSON response on whether or not delete region was sucessful or not.
      */
+  @ApiOperation(value="listRegion", response = Object.class)
   public Result delete(UUID customerUUID, UUID providerUUID, UUID regionUUID) {
     Region region = Region.get(customerUUID, providerUUID, regionUUID);
 

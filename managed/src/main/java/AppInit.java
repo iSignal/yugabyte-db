@@ -9,6 +9,7 @@ import java.util.UUID;
 import com.yugabyte.yw.commissioner.TaskGarbageCollector;
 import com.yugabyte.yw.common.*;
 import com.yugabyte.yw.common.ha.PlatformReplicationManager;
+import com.yugabyte.yw.common.swagger.YWModelConverter;
 import com.yugabyte.yw.models.*;
 import io.ebean.Ebean;
 import com.google.common.collect.ImmutableMap;
@@ -69,6 +70,7 @@ public class AppInit {
           throw new RuntimeException(("yb.storage.path is not set in application.conf"));
         }
       }
+
 
       // TODO: Version added to Yugaware metadata, now slowly decomission SoftwareVersion property
       String version = yaml.load(environment.resourceAsStream("version.txt"),
@@ -131,6 +133,14 @@ public class AppInit {
 
       // Add checksums for all certificates that don't have a checksum.
       CertificateHelper.createChecksums();
+
+      /*ModelConverters.getInstance().addClassToSkip("play.mvc.Result");
+      ModelConverters.getInstance().addPackageToSkip("play.mvc");
+      ModelConverters.getInstance().addPackageToSkip("io.ebean");
+      ModelConverters.getInstance().addPackageToSkip("io.ebean.*");
+      ModelConverters.getInstance().addPackageToSkip("play.mvc.*");
+*/
+
 
       Logger.info("AppInit completed");
    }

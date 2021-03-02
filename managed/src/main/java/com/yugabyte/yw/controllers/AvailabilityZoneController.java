@@ -25,6 +25,12 @@ import play.data.FormFactory;
 import play.libs.Json;
 import play.mvc.Result;
 
+import io.swagger.annotations.Api;
+import io.swagger.annotations.ApiImplicitParam;
+import io.swagger.annotations.ApiImplicitParams;
+import io.swagger.annotations.ApiOperation;
+
+@Api
 public class AvailabilityZoneController extends AuthenticatedController {
 
   public static final Logger LOG = LoggerFactory.getLogger(AvailabilityZoneController.class);
@@ -36,6 +42,7 @@ public class AvailabilityZoneController extends AuthenticatedController {
    * GET endpoint for listing availability zones
    * @return JSON response with availability zone's
    */
+  @ApiOperation(value="listAZ", response = AvailabilityZone.class, responseContainer = "List")
   public Result list(UUID customerUUID, UUID providerUUID, UUID regionUUID) {
     Region region = Region.get(customerUUID, providerUUID, regionUUID);
 
@@ -59,6 +66,16 @@ public class AvailabilityZoneController extends AuthenticatedController {
    * POST endpoint for creating new region(s)
    * @return JSON response of newly created region(s)
    */
+  @ApiOperation(value="createAZ", response = AvailabilityZone.class, responseContainer = "Map")
+  @ApiImplicitParams(
+    @ApiImplicitParam(
+      name = "azFormData",
+      value = "az form data",
+      paramType = "body",
+      dataType = "com.yugabyte.yw.forms.AvailabilityZoneFormData",
+      required = true
+    )
+  )
   public Result create(UUID customerUUID, UUID providerUUID, UUID regionUUID) {
     Form<AvailabilityZoneFormData> formData = formFactory.form(AvailabilityZoneFormData.class)
                                                          .bindFromRequest();
@@ -95,6 +112,7 @@ public class AvailabilityZoneController extends AuthenticatedController {
    * @param azUUID AvailabilityZone UUID
    * @return JSON response on whether or not delete region was successful or not.
    */
+  @ApiOperation(value="deleteAZ", response = Object.class)
   public Result delete(UUID customerUUID, UUID providerUUID, UUID regionUUID, UUID azUUID) {
     Region region = Region.get(customerUUID, providerUUID, regionUUID);
 

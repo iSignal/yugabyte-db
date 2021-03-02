@@ -36,6 +36,12 @@ import java.util.*;
 import static com.yugabyte.yw.common.ConfigHelper.ConfigType.DockerInstanceTypeMetadata;
 import static com.yugabyte.yw.common.ConfigHelper.ConfigType.DockerRegionMetadata;
 
+import io.swagger.annotations.Api;
+import io.swagger.annotations.ApiImplicitParam;
+import io.swagger.annotations.ApiImplicitParams;
+import io.swagger.annotations.ApiOperation;
+
+@Api
 public class CloudProviderController extends AuthenticatedController {
   private final Config config;
 
@@ -89,6 +95,7 @@ public class CloudProviderController extends AuthenticatedController {
    * GET endpoint for listing providers
    * @return JSON response with provider's
    */
+  @ApiOperation(value="listProvider", response = Provider.class, responseContainer = "List")
   public Result list(UUID customerUUID) {
     List<Provider> providerList = Provider.getAll(customerUUID);
     ArrayNode providers = Json.newArray();
@@ -102,6 +109,7 @@ public class CloudProviderController extends AuthenticatedController {
 
   // This endpoint we are using only for deleting provider for integration test purpose. our
   // UI should call cleanup endpoint.
+  @ApiOperation(value="deleteProvider")
   public Result delete(UUID customerUUID, UUID providerUUID) {
     Provider provider = Provider.get(customerUUID, providerUUID);
 
@@ -140,6 +148,16 @@ public class CloudProviderController extends AuthenticatedController {
    * POST endpoint for creating new providers
    * @return JSON response of newly created provider
    */
+  @ApiOperation(value="createProvider", response = Provider.class)
+  @ApiImplicitParams(
+    @ApiImplicitParam(
+      name = "providerFormData",
+      value = "provider form data",
+      paramType = "body",
+      dataType = "com.yugabyte.yw.forms.CloudProviderFormData",
+      required = true
+    )
+  )
   public Result create(UUID customerUUID) throws IOException {
     Form<CloudProviderFormData> formData = formFactory.form(CloudProviderFormData.class).bindFromRequest();
 
@@ -468,6 +486,15 @@ public class CloudProviderController extends AuthenticatedController {
     return awsInitializer.initialize(customerUUID, providerUUID);
   }
 
+  @ApiOperation(value="bootstrap", response = Object.class)
+  @ApiImplicitParams(
+    @ApiImplicitParam(
+      value = "bootstrap params",
+      dataType = "com.yugabyte.yw.commissioner.tasks.CloudBootstrap.Params",
+      paramType = "body",
+      required = true
+    )
+  )
   public Result bootstrap(UUID customerUUID, UUID providerUUID) {
     // TODO(bogdan): Need to manually parse maps, maybe add try/catch on parse?
     JsonNode requestBody = request().body().asJson();
@@ -555,6 +582,16 @@ public class CloudProviderController extends AuthenticatedController {
     */
   }
 
+  @ApiOperation(value = "editProvider", response = Provider.class)
+  @ApiImplicitParams(
+    @ApiImplicitParam(
+      value = "edit provider form data",
+      name = "editProviderFormData",
+      dataType = "Object",
+      required = true,
+      paramType = "body"
+    )
+  )
   public Result edit(UUID customerUUID, UUID providerUUID) {
     Customer customer = Customer.get(customerUUID);
     if (customer == null) {

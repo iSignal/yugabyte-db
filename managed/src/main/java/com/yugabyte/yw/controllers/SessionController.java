@@ -63,6 +63,12 @@ import java.util.regex.Pattern;
 import static com.yugabyte.yw.common.ConfigHelper.ConfigType.Security;
 import static com.yugabyte.yw.models.Users.Role;
 
+import io.swagger.annotations.Api;
+import io.swagger.annotations.ApiImplicitParams;
+import io.swagger.annotations.ApiImplicitParam;
+import io.swagger.annotations.ApiOperation;
+
+@Api
 public class SessionController extends Controller {
   public static final Logger LOG = LoggerFactory.getLogger(SessionController.class);
 
@@ -104,6 +110,16 @@ public class SessionController extends Controller {
     return profileManager.get(true).get();
   }
 
+  @ApiOperation(value = "login", response = Object.class)
+  @ApiImplicitParams(
+    @ApiImplicitParam(
+      name = "loginFormData",
+      dataType = "com.yugabyte.yw.forms.CustomerLoginFormData",
+      required = true,
+      paramType = "body",
+      value = "login form data"
+    )
+  )
   public Result login() {
     ObjectNode responseJson = Json.newObject();
     boolean useOAuth = appConfig.getBoolean("yb.security.use_oauth", false);
@@ -184,6 +200,7 @@ public class SessionController extends Controller {
     }
   }
 
+  @ApiOperation(value = "insecureLogin", response = Object.class)
   public Result insecure_login() {
     ObjectNode responseJson = Json.newObject();
     List<Customer> allCustomers = Customer.getAll();
@@ -259,6 +276,7 @@ public class SessionController extends Controller {
   }
 
   @With(TokenAuthenticator.class)
+  @ApiOperation(value = "apiToken", response = Object.class)
   public Result api_token(UUID customerUUID) {
     Users user = (Users) Http.Context.current().args.get("user");
 

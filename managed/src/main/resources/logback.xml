@@ -42,6 +42,7 @@
   <logger name="application" level="DEBUG" />
   <logger name="org.yb" level="INFO" />
   <logger name="com.yugabyte.yw" level="DEBUG" />
+   <logger name="io.swagger" level="DEBUG" />
 
   <!-- Off these ones as they are annoying, and anyway we manage configuration ourselves -->
   <logger name="com.gargoylesoftware.htmlunit.javascript" level="OFF" />

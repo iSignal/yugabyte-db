@@ -1,4 +1,6 @@
+
 import scala.sys.process.Process
+
 
 /**
   * UI Build Tasks like clean node modules, npm install and npm run build

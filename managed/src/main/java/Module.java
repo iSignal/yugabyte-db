@@ -28,6 +28,9 @@ import org.pac4j.play.store.PlaySessionStore;
 import play.Configuration;
 import play.Environment;
 
+import io.swagger.converter.ModelConverters;
+import com.yugabyte.yw.common.swagger.YWModelConverter;
+
 /**
  * This class is a Guice module that tells Guice to bind different types
  *
@@ -48,6 +51,9 @@ public class Module extends AbstractModule {
     bind(RuntimeConfigFactory.class).to(SettableRuntimeConfigFactory.class).asEagerSingleton();
     // TODO: other clouds
     install(new AWSCloudModule());
+
+    //Logger.info("adding model conveter");
+    ModelConverters.getInstance().addConverter(new YWModelConverter());
 
     // Bind Application Initializer
     bind(AppInit.class).asEagerSingleton();
