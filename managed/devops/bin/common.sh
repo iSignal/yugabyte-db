@@ -100,8 +100,10 @@ readonly yb_script_name=${0##*/}
 readonly yb_script_name_no_extension=${yb_script_name%.sh}
 
 readonly yb_devops_home=$( cd "${BASH_SOURCE%/*}"/.. && pwd )
+echo "$yb_devops_home"
 if [[ ! -d $yb_devops_home/roles ]]; then
-  fatal "No 'roles' subdirectory found inside yb_devops_home ('$yb_devops_home')"
+  echo "No 'roles' subdirectory found inside yb_devops_home ('$yb_devops_home')"
+  exit
 fi
 
 # We need to export yb_devops_home because we rely on it in ansible.cfg.

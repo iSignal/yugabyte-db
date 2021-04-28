@@ -71,7 +71,6 @@ public class AppInit {
         }
       }
 
-
       // TODO: Version added to Yugaware metadata, now slowly decomission SoftwareVersion property
       String version = yaml.load(environment.resourceAsStream("version.txt"),
                                   application.classloader());

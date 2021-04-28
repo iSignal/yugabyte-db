@@ -16,4 +16,4 @@ addSbtPlugin("com.github.sbt" % "sbt-jacoco" % "3.0.3")
 
 addSbtPlugin("com.typesafe.sbteclipse" % "sbteclipse-plugin" % "5.2.4")
 
-addSbtPlugin("com.hootsuite" %% "sbt-swagger" % "1.0.0")
+//addSbtPlugin("com.hootsuite" %% "sbt-swagger" % "1.0.0")

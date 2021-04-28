@@ -1538,7 +1538,7 @@ public class UniverseController extends AuthenticatedController {
    * @return result of the universe status operation.
    */
   @ApiOperation(value = "foo1", response=Object.class)
-  public Result status(UUID customerUUID, UUID universeUUID) {
+  public Result status1(UUID customerUUID, UUID universeUUID) {
     Customer customer = Customer.getOrBadRequest(customerUUID);
     Universe universe = Universe.getValidUniverseOrBadRequest(universeUUID, customer);
 

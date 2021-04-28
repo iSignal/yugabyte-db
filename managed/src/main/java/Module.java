@@ -53,7 +53,7 @@ public class Module extends AbstractModule {
     install(new AWSCloudModule());
 
     //Logger.info("adding model conveter");
-    ModelConverters.getInstance().addConverter(new YWModelConverter());
+    //ModelConverters.getInstance().addConverter(new YWModelConverter());
 
     // Bind Application Initializer
     bind(AppInit.class).asEagerSingleton();

@@ -24,8 +24,6 @@ import java.util.stream.Collectors;
 
 import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiOperation;
-import io.swagger.annotations.ApiResponse;
-import io.swagger.annotations.ApiResponses;
 import io.swagger.annotations.SwaggerDefinition;
 import io.swagger.annotations.Info;
 import io.swagger.annotations.Contact;
@@ -107,7 +105,7 @@ public class CustomerController extends AuthenticatedController {
     return ok(responseJson);
   }
 
-  @ApiOperation(value="getCustomer", response=Customer.class)
+  @ApiOperation(value="getCustomer", response=Object.class)
   public Result index(UUID customerUUID) {
     Customer customer = Customer.get(customerUUID);
     if (customer == null) {
@@ -198,9 +196,7 @@ public class CustomerController extends AuthenticatedController {
   public Result delete(UUID customerUUID) {
     Customer customer = Customer.getOrBadRequest(customerUUID);
 
-    if (customer == null) {
-      return com.yugabyte.yw.common.ApiResponse.error(BAD_REQUEST, "Invalid Customer UUID:" + customerUUID);
-    }
+    List<Users> users = Users.getAll(customerUUID);
     for (Users user : users) {
       user.delete();
     }
@@ -209,19 +205,14 @@ public class CustomerController extends AuthenticatedController {
       ObjectNode responseJson = Json.newObject();
       Audit.createAuditEntry(ctx(), request());
       responseJson.put("success", true);
-      return com.yugabyte.yw.common.ApiResponse.success(responseJson);
-    } else {
-      return com.yugabyte.yw.common.ApiResponse.error(INTERNAL_SERVER_ERROR, "Unable to delete Customer UUID: " + customerUUID);
+      return ApiResponse.success(responseJson);
     }
     throw new YWServiceException(
       INTERNAL_SERVER_ERROR, "Unable to delete Customer UUID: " + customerUUID);
   }
 
   public Result upsertFeatures(UUID customerUUID) {
-    Customer customer = Customer.get(customerUUID);
-    if (customer == null) {
-      return com.yugabyte.yw.common.ApiResponse.error(BAD_REQUEST, "Invalid Customer UUID:" + customerUUID);
-    }
+    Customer customer = Customer.getOrBadRequest(customerUUID);
 
     JsonNode requestBody = request().body().asJson();
     ObjectMapper mapper = new ObjectMapper();
@@ -229,33 +220,21 @@ public class CustomerController extends AuthenticatedController {
     try {
       formData = mapper.treeToValue(requestBody, FeatureUpdateFormData.class);
     } catch (RuntimeException | JsonProcessingException e) {
-
-      return com.yugabyte.yw.common.ApiResponse.error(BAD_REQUEST, "Invalid JSON");
+      throw new YWServiceException(BAD_REQUEST, "Invalid JSON");
     }
 
-    try {
       customer.upsertFeatures(formData.features);
-    } catch (RuntimeException e) {
-      return com.yugabyte.yw.common.ApiResponse.error(BAD_REQUEST, "Failed to update features: " + e.getMessage());
-    }
 
     Audit.createAuditEntry(ctx(), request(), requestBody);
     return ok(customer.getFeatures());
   }
 
   public Result metrics(UUID customerUUID) {
-    Customer customer = Customer.get(customerUUID);
-
-    if (customer == null) {
-      return com.yugabyte.yw.common.ApiResponse.error(BAD_REQUEST, "Invalid Customer UUID:" + customerUUID);
-    }
+    Customer customer = Customer.getOrBadRequest(customerUUID);
 
     Form<MetricQueryParams> formData = formFactory.getFormDataOrBadRequest(MetricQueryParams.class);
 
-    if (formData.hasErrors()) {
-      return com.yugabyte.yw.common.ApiResponse.error(BAD_REQUEST, formData.errorsAsJson());
-    }
-    Map<String, String> params = formData.data();
+    Map<String, String> params = new HashMap<>(formData.rawData());
     HashMap<String, Map<String, String>> filterOverrides = new HashMap<>();
     // Given we have a limitation on not being able to rename the pod labels in
     // kubernetes cadvisor metrics, we try to see if the metric being queried is for
@@ -313,14 +292,10 @@ public class CustomerController extends AuthenticatedController {
       filterJson.put("table_name", params.remove("tableName"));
     }
     params.put("filters", Json.stringify(filterJson));
-    try {
-      JsonNode response = metricQueryHelper.query(formData.get().metrics, params, filterOverrides);
-      if (response.has("error")) {
-        return com.yugabyte.yw.common.ApiResponse.error(BAD_REQUEST, response.get("error"));
-      }
-      return com.yugabyte.yw.common.ApiResponse.success(response);
-    } catch (RuntimeException e) {
-      return com.yugabyte.yw.common.ApiResponse.error(BAD_REQUEST, e.getMessage());
+    JsonNode response = metricQueryHelper.query(
+      formData.get().getMetrics(), params, filterOverrides);
+    if (response.has("error")) {
+      throw new YWServiceException(BAD_REQUEST, response.get("error"));
     }
     return ApiResponse.success(response);
   }
@@ -366,10 +341,7 @@ public class CustomerController extends AuthenticatedController {
   }
 
   public Result getHostInfo(UUID customerUUID) {
-    Customer customer = Customer.get(customerUUID);
-    if (customer == null) {
-      return com.yugabyte.yw.common.ApiResponse.error(BAD_REQUEST, "Invalid Customer UUID: " + customerUUID);
-    }
+    Customer.getOrBadRequest(customerUUID);
     ObjectNode hostInfo = Json.newObject();
     hostInfo.put(
       Common.CloudType.aws.name(),
@@ -379,7 +351,7 @@ public class CustomerController extends AuthenticatedController {
     hostInfo.put(
       Common.CloudType.gcp.name(), cloudQueryHelper.currentHostInfo(Common.CloudType.gcp, null));
 
-    return com.yugabyte.yw.common.ApiResponse.success(hostInfo);
+    return ApiResponse.success(hostInfo);
   }
 
   private HashMap<String, HashMap<String, String>> getFilterOverrides(
