@@ -214,6 +214,18 @@ public enum TaskType {
   RunExternalScript("subtasks.RunExternalScript"),
 
   // Tasks belonging to subtasks.xcluster classpath
+  BootstrapProducer("subtasks.xcluster.BootstrapProducer"),
+
+  CheckBootstrapRequired("subtasks.xcluster.CheckBootstrapRequired"),
+
+  DeleteBootstrapIds("subtasks.xcluster.DeleteBootstrapIds"),
+
+  DeleteReplication("subtasks.xcluster.DeleteReplication"),
+
+  DeleteXClusterConfigFromDb("subtasks.xcluster.DeleteXClusterConfigFromDb"),
+
+  SetRestoreTime("subtasks.xcluster.SetRestoreTime"),
+
   XClusterConfigSetup("subtasks.xcluster.XClusterConfigSetup"),
 
   XClusterConfigSetStatus("subtasks.xcluster.XClusterConfigSetStatus"),
@@ -221,8 +233,6 @@ public enum TaskType {
   XClusterConfigModifyTables("subtasks.xcluster.XClusterConfigModifyTables"),
 
   XClusterConfigRename("subtasks.xcluster.XClusterConfigRename"),
-
-  XClusterConfigDelete("subtasks.xcluster.XClusterConfigDelete"),
 
   XClusterConfigSync("subtasks.xcluster.XClusterConfigSync"),
 

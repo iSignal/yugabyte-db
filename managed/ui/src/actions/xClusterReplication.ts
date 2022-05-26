@@ -30,7 +30,15 @@ export function createXClusterReplication(
     sourceUniverseUUID,
     targetUniverseUUID,
     name,
-    tables
+    tables,
+    bootstrapParams: {
+      isBootstrapRequiredPerTable: [true, false], //new Array(tables.length).fill(true),
+      backupRequestParams: {
+        storageConfigUUID: "cb5e0444-3f36-486d-aa07-20e10c37b382",
+        sse: false,
+        parallelism: 8,
+      }
+    }
   });
 }
 
@@ -84,7 +92,7 @@ export function queryLagMetricsForUniverse(nodePrefix: string | undefined, repli
     metrics: ['tserver_async_replication_lag_micros'],
     xClusterConfigUuid: replicationUUID
   };
-  
+
   const customerUUID = localStorage.getItem('customerId');
   return axios.post(`${ROOT_URL}/customers/${customerUUID}/metrics`, DEFAULT_GRAPH_FILTER);
 }

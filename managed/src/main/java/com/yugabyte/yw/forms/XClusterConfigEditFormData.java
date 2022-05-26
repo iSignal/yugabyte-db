@@ -2,7 +2,7 @@ package com.yugabyte.yw.forms;
 
 import io.swagger.annotations.ApiModel;
 import io.swagger.annotations.ApiModelProperty;
-import java.util.Set;
+import java.util.List;
 import play.data.validation.Constraints.MaxLength;
 import play.data.validation.Constraints.Pattern;
 
@@ -20,5 +20,5 @@ public class XClusterConfigEditFormData {
   @ApiModelProperty(
       value = "Source Universe table IDs",
       example = "[000033df000030008000000000004006, 000033df00003000800000000000400b]")
-  public Set<String> tables;
+  public List<String> tables;
 }

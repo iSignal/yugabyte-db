@@ -13,6 +13,7 @@
 package org.yb.client;
 
 import com.google.protobuf.Message;
+import java.util.List;
 import java.util.Set;
 import org.jboss.netty.buffer.ChannelBuffer;
 import org.yb.CommonNet;
@@ -24,18 +25,23 @@ import org.yb.util.Pair;
 public class SetupUniverseReplicationRequest extends YRpc<SetupUniverseReplicationResponse> {
 
   private final String replicationGroupName;
-  private final Set<String> sourceTableIDs;
   private final Set<CommonNet.HostPortPB> sourceMasterAddresses;
+  // List is used because order of table ids matters.
+  private final List<String> sourceTableIds;
+  // An optional list of bootstrap ids. Each id corresponds to a table in the sourceTableIds list.
+  private final List<String> sourceBootstrapIds;
 
   SetupUniverseReplicationRequest(
     YBTable table,
     String replicationGroupName,
-    Set<String> sourceTableIDs,
-    Set<HostPortPB> sourceMasterAddresses) {
+    List<String> sourceTableIds,
+    Set<HostPortPB> sourceMasterAddresses,
+    List<String> sourceBootstrapIds) {
     super(table);
     this.replicationGroupName = replicationGroupName;
-    this.sourceTableIDs = sourceTableIDs;
+    this.sourceTableIds = sourceTableIds;
     this.sourceMasterAddresses = sourceMasterAddresses;
+    this.sourceBootstrapIds = sourceBootstrapIds;
   }
 
   @Override
@@ -45,8 +51,11 @@ public class SetupUniverseReplicationRequest extends YRpc<SetupUniverseReplicati
     final MasterReplicationOuterClass.SetupUniverseReplicationRequestPB.Builder builder =
       MasterReplicationOuterClass.SetupUniverseReplicationRequestPB.newBuilder()
         .setProducerId(replicationGroupName)
-        .addAllProducerTableIds(sourceTableIDs)
+        .addAllProducerTableIds(sourceTableIds)
         .addAllProducerMasterAddresses(sourceMasterAddresses);
+    if (sourceBootstrapIds != null) {
+      builder.addAllProducerBootstrapIds(sourceBootstrapIds);
+    }
 
     return toChannelBuffer(header, builder.build());
   }
