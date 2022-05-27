@@ -95,8 +95,7 @@ public class CreateXClusterConfig extends XClusterConfigTaskBase {
 
         // Replication for tables that do NOT need bootstrapping.
         List<String> tableIdsNotNeedBootstrap =
-            getTablesNotNeedBootstrap()
-                .stream()
+            getTablesNotNeedBootstrap().stream()
                 .map(tableConfig -> tableConfig.tableId)
                 .collect(Collectors.toList());
         if (tableIdsNotNeedBootstrap.size() > 0) {
@@ -107,8 +106,7 @@ public class CreateXClusterConfig extends XClusterConfigTaskBase {
 
         // Replication for tables that need bootstrapping.
         List<String> tableIdsNeedBootstrap =
-            getTablesNeedBootstrap()
-                .stream()
+            getTablesNeedBootstrap().stream()
                 .map(tableConfig -> tableConfig.tableId)
                 .collect(Collectors.toList());
         if (tableIdsNeedBootstrap.size() > 0) {
@@ -133,16 +131,14 @@ public class CreateXClusterConfig extends XClusterConfigTaskBase {
           // tables exist, the restore subtask will fail.
           if (tableType == CommonTypes.TableType.YQL_TABLE_TYPE) {
             List<String> tableNamesNeedBootstrap =
-                requestedTablesInfoList
-                    .stream()
+                requestedTablesInfoList.stream()
                     .filter(
                         tableInfo ->
                             tableIdsNeedBootstrap.contains(tableInfo.getId().toStringUtf8()))
                     .map(MasterDdlOuterClass.ListTablesResponsePB.TableInfo::getName)
                     .collect(Collectors.toList());
             List<String> tableNamesToDeleteOnTargetUniverse =
-                getTableInfoList(targetUniverse)
-                    .stream()
+                getTableInfoList(targetUniverse).stream()
                     .filter(
                         tableInfo ->
                             tableNamesNeedBootstrap.contains(tableInfo.getName())
@@ -224,8 +220,7 @@ public class CreateXClusterConfig extends XClusterConfigTaskBase {
     List<MasterDdlOuterClass.ListTablesResponsePB.TableInfo> sourceTablesInfoList =
         getTableInfoList(sourceUniverse);
     List<MasterDdlOuterClass.ListTablesResponsePB.TableInfo> requestedTablesInfoList =
-        sourceTablesInfoList
-            .stream()
+        sourceTablesInfoList.stream()
             .filter(tableInfo -> tableIds.contains(tableInfo.getId().toStringUtf8()))
             .collect(Collectors.toList());
     // All tables are found.
@@ -236,8 +231,7 @@ public class CreateXClusterConfig extends XClusterConfigTaskBase {
               xClusterConfig.sourceUniverseUUID, tableIds.size(), requestedTablesInfoList.size()));
     }
     // All tables have the same type.
-    if (!requestedTablesInfoList
-        .stream()
+    if (!requestedTablesInfoList.stream()
         .allMatch(
             tableInfo ->
                 tableInfo.getTableType().equals(requestedTablesInfoList.get(0).getTableType()))) {
@@ -248,8 +242,7 @@ public class CreateXClusterConfig extends XClusterConfigTaskBase {
     }
     // All tables belong to the same keyspace.
     Set<String> namespaces =
-        requestedTablesInfoList
-            .stream()
+        requestedTablesInfoList.stream()
             .map(tableInfo -> tableInfo.getNamespace().getName())
             .collect(Collectors.toSet());
     if (namespaces.size() != 1) {
@@ -262,8 +255,7 @@ public class CreateXClusterConfig extends XClusterConfigTaskBase {
     MasterTypes.NamespaceIdentifierPB namespace = requestedTablesInfoList.get(0).getNamespace();
     // If table type is YSQL and bootstrap is required, all tables in the keyspace are selected.
     Set<String> tableIdsInKeyspace =
-        sourceTablesInfoList
-            .stream()
+        sourceTablesInfoList.stream()
             .filter(tableInfo -> tableInfo.getNamespace().getId().equals(namespace.getId()))
             .map(tableInfo -> tableInfo.getId().toStringUtf8())
             .collect(Collectors.toSet());
@@ -318,8 +310,8 @@ public class CreateXClusterConfig extends XClusterConfigTaskBase {
     if (backupRequestParams.backupType != CommonTypes.TableType.PGSQL_TABLE_TYPE) {
       keyspaceTable.tableNameList = new ArrayList<>();
       keyspaceTable.tableUUIDList = new ArrayList<>();
-      tablesInfoList
-          .stream()
+      // tablesInoflist -> [ (tablename, tableUUID)] -> [tablename], [tableUUID]
+      tablesInfoList.stream()
           .filter(tableInfo -> tableIdsNeedBootstrap.contains(tableInfo.getId().toStringUtf8()))
           .forEach(
               tableInfo -> {

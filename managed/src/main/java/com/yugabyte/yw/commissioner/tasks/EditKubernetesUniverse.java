@@ -73,7 +73,11 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
 
       // Get requested user intent.
       Cluster primaryCluster = taskParams().getPrimaryCluster();
+
+      // editCluster(cluster);
+
       UserIntent userIntent = primaryCluster.userIntent;
+
       PlacementInfo newPI = primaryCluster.placementInfo;
 
       isMultiAz = PlacementInfoUtil.isMultiAZ(provider);
@@ -88,6 +92,7 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
       PlacementInfo currPI = universeDetails.getPrimaryCluster().placementInfo;
 
       currPlacement = new KubernetesPlacement(currPI);
+      // currRRPlacement, newRRPlacement
 
       Set<NodeDetails> mastersToAdd =
           getPodsToAdd(newPlacement.masters, currPlacement.masters, ServerType.MASTER, isMultiAz);
@@ -157,6 +162,8 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
             universeDetails.communicationPorts.masterRpcPort);
       }
 
+      // new RR tservers to start
+
       // Update the blacklist servers on master leader.
       createPlacementInfoTask(tserversToRemove)
           .setSubTaskGroupType(SubTaskGroupType.WaitForDataMigration);
@@ -168,6 +175,7 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
       // If tservers have been added, we wait for the load to balance.
       if (!tserversToAdd.isEmpty()) {
         createWaitForLoadBalanceTask().setSubTaskGroupType(SubTaskGroupType.WaitForDataMigration);
+        // Also do this for RR tservers
       }
 
       // Now roll all the old pods that haven't been removed and aren't newly added.
@@ -189,6 +197,14 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
             universeDetails.communicationPorts.masterRpcPort,
             false,
             true);
+        // roll remaining RR pods based on primary clsuter master changes
+        updateRemainingPods(
+            ServerType.TSERVER,
+            newRRPI,
+            provider,
+            universeDetails.communicationPorts.masterRpcPort,
+            false,
+            true);
       }
 
       // If tservers have been removed, check if some deployments need to be completely
@@ -203,6 +219,8 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
 
       // Update the universe to the new state.
       createSingleKubernetesExecutorTask(KubernetesCommandExecutor.CommandType.POD_INFO, newPI);
+
+      // edit cluster ends here
 
       // Update the swamper target file.
       createSwamperTargetUpdateTask(false /* removeFile */);
@@ -251,6 +269,7 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
       Provider provider,
       int masterRpcPort) {
     // If starting new masters, we want them to come up in shell-mode.
+    // for read replica, master addrs should be supplied from outside
     String masterAddresses =
         serverType == ServerType.MASTER
             ? ""
@@ -277,6 +296,7 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
       boolean masterChanged,
       boolean tserverChanged) {
 
+    // master addrs needs to come from outside
     String masterAddresses =
         PlacementInfoUtil.computeMasterAddresses(
             newPI, newPlacement.masters, taskParams().nodePrefix, provider, masterRpcPort);
