@@ -11,8 +11,6 @@
 
 package com.yugabyte.yw.common.kms.util;
 
-import java.util.UUID;
-
 import com.azure.core.credential.TokenCredential;
 import com.azure.core.exception.ResourceNotFoundException;
 import com.azure.core.util.polling.PollResponse;
@@ -30,7 +28,7 @@ import com.azure.security.keyvault.keys.models.CreateRsaKeyOptions;
 import com.azure.security.keyvault.keys.models.DeletedKey;
 import com.azure.security.keyvault.keys.models.KeyVaultKey;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-
+import java.util.UUID;
 import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
@@ -51,6 +49,8 @@ public class AzuEARServiceUtil {
             .clientSecret(clientSecret)
             .tenantId(tenantId)
             .build();
+
+    log.info("got past build");
 
     return clientSecretCredential;
   }

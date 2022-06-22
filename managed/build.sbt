@@ -434,7 +434,7 @@ Test / fork := true
 Test / testGrouping := partitionTests( (Test / definedTests).value, testShardSize.value )
 
 javaOptions in Test += "-Dconfig.file=src/main/resources/application.test.conf"
-testOptions += Tests.Argument(TestFrameworks.JUnit, "-v", "-q", "-a")
+testOptions += Tests.Argument(TestFrameworks.JUnit, "-v", "-a")
 
 // Skip packaging javadoc for now
 sources in (Compile, doc) := Seq()
