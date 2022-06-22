@@ -406,7 +406,7 @@ dependencyOverrides += "com.google.guava" % "guava" % "23.0"
 dependencyOverrides += "com.fasterxml.jackson.module" %% "jackson-module-scala" % "2.9.10"
 dependencyOverrides += "com.fasterxml.jackson.dataformat" % "jackson-dataformat-cbor" % "2.9.10"
 dependencyOverrides += "com.fasterxml.jackson.datatype" % "jackson-datatype-jsr310" % "2.9.10"
-dependencyOverrides += "com.fasterxml.jackson.core" % "jackson-databind" % "2.9.10.8"
+dependencyOverrides += "com.fasterxml.jackson.core" % "jackson-databind" % "2.13.2.1"
 
 concurrentRestrictions in Global := Seq(Tags.limitAll(16))
 
