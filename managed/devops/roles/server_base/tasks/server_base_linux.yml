@@ -51,6 +51,7 @@
     dest: "/etc/ssh/sshd_config"
   when: sshd_config_file.stat.exists
 
+# CHECK ulimits
 - name: Allow core dumps
   become: yes
   become_method: sudo
@@ -159,6 +160,7 @@
   - name: Gather package facts
     package_facts:
 
+  # CHECK if these packages are installed
   - name: Install linux packages we need on our YugaByte clusters on CentOS
     become: yes
     become_method: sudo

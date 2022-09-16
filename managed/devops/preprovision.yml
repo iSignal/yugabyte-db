@@ -6,6 +6,9 @@
 #
 # https://github.com/YugaByte/yugabyte-db/blob/master/licenses/POLYFORM-FREE-TRIAL-LICENSE-1.0.0.txt
 
+
+# Check for acceptable python versions (2.7 - 3.9)
+# looks like it is done
 - name: "Install python3 on CentOS 8 machines"
   hosts: "{{ yb_ansible_host }}"
   strategy: linear
@@ -100,6 +103,7 @@
       package_facts:
       tags: yb-prebuilt-ami
 
+    # CHECK: yum list installed | grep policycoreutils
     # Needed to register custom SSH port with SELinux
     - name: Install policycoreutils-python on CentOS 7
       module_defaults:
@@ -113,6 +117,7 @@
         (ansible_os_family == 'RedHat' and ansible_distribution_major_version == '7')
       tags: yb-prebuilt-ami
 
+    # CHECK: yum list installed | grep policycoreutils
     - name: Install policycoreutils-python-utils on CentOS 8
       module_defaults:
         yum:
@@ -138,6 +143,7 @@
             custom_ssh_port != '22'
       tags: yb-prebuilt-ami
 
+    # CHECK: dnf list installed | grep selinux-policy
     - name: install latest version of selinux-policy
       shell:
         cmd: sudo dnf reinstall --refresh -y selinux-policy

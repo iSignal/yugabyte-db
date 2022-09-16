@@ -13,6 +13,8 @@ dependencies:
   - role: mount_ephemeral_drives
     when: cloud_type != "onprem"
 
+  # CHECK that user yugabyte exists and has the appropriate home directory
+  # CHECK that we can ssh in as yugabyte user
   - role: create_user
     create_user:
       name: "{{ user_name }}"
@@ -28,23 +30,33 @@ dependencies:
       sudo_user: "{{ yb_server_ssh_user | default(omit) }}"
       authorized_keys: "{{ cluster_server_vault | get_value('authorized_keys') }}"
 
+  # CHECK that node exporter is running and a systemd service with its name exists
   - role: swamper
     prometheus_components:
       - node_exporter
     tags: yb-prebuilt-ami
 
+   # CHECK that azcopy can be found in path
   - role: install_backup_util
     when: ansible_architecture != "aarch64"
     util:
       name: "azcopy"
     tags: yb-prebuilt-ami
 
+   # CHECK that gsutil can be found in path
   - role: install_backup_util
     util:
       name: "gsutil"
     tags: yb-prebuilt-ami
 
+   # CHECK that s3cmd can be found in path
   - role: install_backup_util
     util:
       name: "s3cmd"
     tags: yb-prebuilt-ami
+
+
+# port checks
+# reachability from platform
+# disk space
+#
