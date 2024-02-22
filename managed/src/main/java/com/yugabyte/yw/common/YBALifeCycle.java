@@ -14,11 +14,14 @@ import com.typesafe.config.Config;
 import com.yugabyte.yw.common.inject.StaticInjectorHolder;
 import com.yugabyte.yw.controllers.handlers.EnvProxySelector;
 import io.ebean.DB;
+import lombok.extern.slf4j.Slf4j;
+
 import java.net.ProxySelector;
 import play.Environment;
 import play.db.ebean.EbeanDynamicEvolutions;
 
 /** Play lifecycle does not give onStartup event */
+@Slf4j
 public class YBALifeCycle {
 
   private final Config config;
@@ -40,6 +43,7 @@ public class YBALifeCycle {
 
   /** This is invoked before any migrations start and first thing after YBA module is loaded. */
   void onStart() {
+    log.info("onStart invoked ++++++++++");
     ProxySelector.setDefault(new EnvProxySelector());
     checkIfDowngrade();
   }

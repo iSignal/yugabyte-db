@@ -210,6 +210,7 @@
     </else>
   </if>
 
+<logger name="com.zaxxer.hikari.HikariConfig" level="TRACE" />
   <!-- Off these ones as they are annoying, and anyway we manage configuration ourselves -->
   <logger name="com.gargoylesoftware.htmlunit.javascript" level="OFF" />
 

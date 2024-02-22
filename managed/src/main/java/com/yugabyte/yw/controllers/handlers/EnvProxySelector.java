@@ -120,11 +120,14 @@ public class EnvProxySelector extends ProxySelector {
 
   @Override
   public List<Proxy> select(URI uri) {
+    log.info("env proxy uri is {}", uri);
     validateUri(uri);
     switch (uri.getScheme()) {
       case "http":
+        
         return selectInternal(uri, httpProxy);
       case "https":
+    
         return selectInternal(uri, httpsProxy);
       default:
         return prevSelector.select(uri);
@@ -132,6 +135,7 @@ public class EnvProxySelector extends ProxySelector {
   }
 
   private static void validateUri(URI uri) {
+    //throw new IllegalArgumentException("URI can't be null.");
     if (uri == null) {
       throw new IllegalArgumentException("URI can't be null.");
     }
