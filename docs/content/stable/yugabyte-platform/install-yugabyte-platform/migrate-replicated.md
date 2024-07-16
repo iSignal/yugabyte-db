@@ -103,7 +103,7 @@ Note that [Replicated configuration](../install-replicated/#set-up-https-optiona
 
 To migrate to a different VM, do the following:
 
-1. [Install and configure YBA Installer](../install-software/installer/#configuration-options) on a new VM.
+1. [Install and configure YBA Installer](../install-software/installer/#configuration-options) on a new VM, choosing the same YBA version as the replicated install.
 1. Disable [high availability](../../administer-yugabyte-platform/high-availability/) (if configured) on the Replicated installation.
 1. Perform a full [backup of YBA](../../administer-yugabyte-platform/back-up-restore-yp/) on the Replicated installation.
 
