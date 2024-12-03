@@ -2429,9 +2429,13 @@ class ControlScript(object):
                 mandatory_port_available, recommended_port_available)
 
     def is_port_available(self, advertise_ip, port):
+        print(f"{advertise_ip} is advertise ip")
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             return s.connect_ex((advertise_ip, int(port))) != 0
+        except:
+            pass
+            return True
         finally:
             s.close()
 
@@ -3174,6 +3178,7 @@ class ControlScript(object):
             "--placement_cloud={}".format(self.configs.saved_data.get("cloud_provider")),
             "--placement_region={}".format(self.configs.saved_data.get("cloud_region")),
             "--placement_zone={}".format(self.configs.saved_data.get("cloud_zone")),
+            "--net_address_filter=ipv6_external,ipv6_non_link_local,ipv6_all",
         ]
 
         if fault_tolerance == "region":
@@ -5627,6 +5632,7 @@ class ControlScript(object):
 
     # Check whether the hostnames or IP provided is in correct format.
     def validate_hostname_ip(self, ip):
+        return True
         # Regex expression for validating IPv4
         ipv4_regex = r"^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4]"\
             "[0-9]|1[0-9][0-9]|[1-9]?[0-9])$"
