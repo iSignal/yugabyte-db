@@ -1669,9 +1669,10 @@ SearchCatCacheInternal(CatCache *cache,
 		}
 		else
 		{
-			CACHE_elog(DEBUG2, "SearchCatCache(%s): found neg entry in bucket %d",
-					   cache->cc_relname, hashIndex);
-
+			if (yb_debug_log_catcache_events) {
+				elog(LOG, "SearchCatCache(%s): found neg entry in bucket %d",
+					cache->cc_relname, hashIndex);
+			}
 #ifdef CATCACHE_STATS
 			cache->cc_neg_hits++;
 #endif
@@ -1752,6 +1753,10 @@ SearchCatCacheMiss(CatCache *cache,
 				   Datum v3,
 				   Datum v4)
 {
+	instr_time start;
+	if (yb_debug_log_catcache_events) {
+		INSTR_TIME_SET_CURRENT(start);
+	}
 	ScanKeyData cur_skey[CATCACHE_MAXKEYS];
 	Relation	relation;
 	SysScanDesc scandesc;
@@ -1812,8 +1817,35 @@ SearchCatCacheMiss(CatCache *cache,
 			YbNumCatalogCacheTableMisses[YbGetCatalogCacheTableIdFromCacheId(cache->id)]++;
 		}
 
+		scandesc = systable_beginscan(relation,
+									  cache->cc_indexoid,
+									  IndexScanOK(cache, cur_skey),
+									  NULL,
+									  nkeys,
+									  cur_skey);
+
+		ct = NULL;
+
+		while (HeapTupleIsValid(ntp = systable_getnext(scandesc)))
+		{
+			ct = CatalogCacheCreateEntry(cache, ntp, arguments,
+										 hashValue, hashIndex,
+										 false);
+			/* immediately set the refcount to 1 */
+			ResourceOwnerEnlargeCatCacheRefs(CurrentResourceOwner);
+			ct->refcount++;
+			ResourceOwnerRememberCatCacheRef(CurrentResourceOwner, &ct->tuple);
+			break;					/* assume only one match */
+		}
+
+		systable_endscan(scandesc);
+		table_close(relation, AccessShareLock);
+
 		if (yb_debug_log_catcache_events)
 		{
+			instr_time duration;
+			INSTR_TIME_SET_CURRENT(duration);
+			INSTR_TIME_SUBTRACT(duration, start);
 			StringInfoData buf;
 			initStringInfo(&buf);
 
@@ -1840,9 +1872,10 @@ SearchCatCacheMiss(CatCache *cache,
 					appendStringInfo(&buf, "typid=%u value=<not logged>", typid);
 			}
 			ereport(LOG,
-					(errmsg("Catalog cache miss on cache with id %d:\n"
+					(errmsg("Catalog cache miss took %ld us on cache with id %d:\n"
 							"Target rel: %s (oid : %d), index oid %d\n"
 							"Search keys: %s",
+							INSTR_TIME_GET_MICROSEC(duration),
 							cache->id,
 							cache->cc_relname,
 							cache->cc_reloid,
@@ -1851,31 +1884,6 @@ SearchCatCacheMiss(CatCache *cache,
 			/* Done, reset catcache logging. */
 			yb_debug_log_catcache_events = true;
 		}
-
-		scandesc = systable_beginscan(relation,
-									  cache->cc_indexoid,
-									  IndexScanOK(cache, cur_skey),
-									  NULL,
-									  nkeys,
-									  cur_skey);
-
-		ct = NULL;
-
-		while (HeapTupleIsValid(ntp = systable_getnext(scandesc)))
-		{
-			ct = CatalogCacheCreateEntry(cache, ntp, arguments,
-										 hashValue, hashIndex,
-										 false);
-			/* immediately set the refcount to 1 */
-			ResourceOwnerEnlargeCatCacheRefs(CurrentResourceOwner);
-			ct->refcount++;
-			ResourceOwnerRememberCatCacheRef(CurrentResourceOwner, &ct->tuple);
-			break;					/* assume only one match */
-		}
-
-		systable_endscan(scandesc);
-
-		table_close(relation, AccessShareLock);
 	}
 
 	/*
@@ -1912,9 +1920,10 @@ SearchCatCacheMiss(CatCache *cache,
 
 		CACHE_elog(DEBUG2, "SearchCatCache(%s): Contains %d/%d tuples",
 				   cache->cc_relname, cache->cc_ntup, CacheHdr->ch_ntup);
-		CACHE_elog(DEBUG2, "SearchCatCache(%s): put neg entry in bucket %d",
+		if (yb_debug_log_catcache_events) {
+			elog(LOG, "SearchCatCache(%s): added neg entry in bucket %d",
 				   cache->cc_relname, hashIndex);
-
+		}
 		/*
 		 * We are not returning the negative entry to the caller, so leave its
 		 * refcount zero.
@@ -1927,7 +1936,6 @@ SearchCatCacheMiss(CatCache *cache,
 			   cache->cc_relname, cache->cc_ntup, CacheHdr->ch_ntup);
 	CACHE_elog(DEBUG2, "SearchCatCache(%s): put in bucket %d",
 			   cache->cc_relname, hashIndex);
-
 #ifdef CATCACHE_STATS
 	cache->cc_newloads++;
 #endif

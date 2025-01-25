@@ -81,3 +81,5 @@ uint64_t yb_read_time = 0;
 bool yb_is_read_time_ht = false;
 
 int yb_read_after_commit_visibility = 0;
+
+int yb_debug_log_catcache_events = 0;

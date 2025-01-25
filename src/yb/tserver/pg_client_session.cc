@@ -1472,6 +1472,8 @@ Status PgClientSession::DoPerform(const DataPtr& data, CoarseTimePoint deadline,
   }
 
   if (options.has_caching_info()) {
+    VLOG_WITH_PREFIX(3) << "Executing read from response cache for session "
+      << data->req.session_id();
     data->cache_setter = VERIFY_RESULT(response_cache_.Get(
         options.mutable_caching_info(), &data->resp, &data->sidecars, deadline));
     if (!data->cache_setter) {
@@ -1522,7 +1524,7 @@ Status PgClientSession::DoPerform(const DataPtr& data, CoarseTimePoint deadline,
       VLOG_WITH_PREFIX(2)
           << "FlushAsync of " << ops_count << " ops completed for non-distributed transaction";
     }
-    VLOG_WITH_PREFIX(5) << "Perform resp: " << data->resp.ShortDebugString();
+          VLOG_WITH_PREFIX(5) << "Perform resp: " << data->resp.ShortDebugString();
   });
   if (setup_session_result.is_plain) {
     const auto& read_point = *session->read_point();

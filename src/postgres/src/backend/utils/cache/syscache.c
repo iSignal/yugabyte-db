@@ -1394,9 +1394,17 @@ YbPreloadCatalogCache(int cache_id, int idx_cache_id)
 											  0  /* nkeys */,
 											  NULL /* key */);
 
+	size_t scanned = 0;
+	instr_time start;
+	if (yb_debug_log_catcache_events)
+	{
+		INSTR_TIME_SET_CURRENT(start);
+	}
 	while (HeapTupleIsValid(ntp = systable_getnext(scandesc)))
 	{
+		scanned++;
 		SetCatCacheTuple(cache, ntp, RelationGetDescr(relation));
+
 		if (idx_cache)
 			SetCatCacheTuple(idx_cache, ntp, RelationGetDescr(relation));
 
@@ -1515,7 +1523,14 @@ YbPreloadCatalogCache(int cache_id, int idx_cache_id)
 			}
 		}
 	}
-
+	if (yb_debug_log_catcache_events)
+	{
+		instr_time duration;
+		INSTR_TIME_SET_CURRENT(duration);
+		INSTR_TIME_SUBTRACT(duration, start);
+		elog(LOG, "YbPreloadCatalogCache: %ld entries added for relation %s took %ld us",
+			scanned, RelationGetRelationName(relation), INSTR_TIME_GET_MICROSEC(duration));
+	}
 	systable_endscan(scandesc);
 
 	table_close(relation, AccessShareLock);

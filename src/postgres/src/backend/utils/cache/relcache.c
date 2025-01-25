@@ -1539,6 +1539,9 @@ YBLoadRelations(YbUpdateRelationCacheState *state)
 		state->has_partitioned_tables |= relation->rd_rel->relkind ==
 										 RELKIND_PARTITIONED_TABLE;
 	}
+	if (yb_debug_log_catcache_events) {
+		elog(LOG, "Inserted %d entries into relcache", num_tuples);
+	}
 
 	systable_endscan(scandesc);
 	table_close(pg_class_desc, AccessShareLock);
@@ -2640,6 +2643,9 @@ static YBCStatus
 YbUpdateRelationCacheImpl(YbUpdateRelationCacheState *state,
 						  YbRunWithPrefetcherContext *ctx)
 {
+	if (yb_debug_log_catcache_events) {
+		elog(LOG, "Updating relcache");
+	}
 	YBLoadRelations(state);
 
 	YbTablePrefetcherState *prefetcher = &ctx->prefetcher;
@@ -3000,6 +3006,10 @@ YbPrefetchRequiredData(bool preload_rel_cache)
 static Relation
 RelationBuildDesc(Oid targetRelId, bool insertIt)
 {
+	instr_time start;
+	if (yb_debug_log_catcache_events) {
+		INSTR_TIME_SET_CURRENT(start);
+	}
 	int			in_progress_offset;
 	Relation	relation;
 	Oid			relid;
@@ -3259,6 +3269,14 @@ retry:
 		MemoryContextDelete(tmpcxt);
 	}
 #endif
+
+	if (yb_debug_log_catcache_events && insertIt) {
+		instr_time duration;
+		INSTR_TIME_SET_CURRENT(duration);
+		INSTR_TIME_SUBTRACT(duration, start);
+		elog(LOG, "Rebuilding relcache entry for %s took %ld us",
+			RelationGetRelationName(relation), INSTR_TIME_GET_MICROSEC(duration));
+	}
 
 	return relation;
 }
@@ -6259,6 +6277,8 @@ RelationCacheInitializePhase3(void)
 			YBCIsInitDbModeEnvVarSet() ||
 			YbNeedAdditionalCatalogTables() ||
 			!*YBCGetGFlags()->ysql_use_relcache_file;
+		elog(WARNING, "preload relcache %d %d %d %d", preload_rel_cache,
+		needNewCacheFile, YbNeedAdditionalCatalogTables(), !*YBCGetGFlags()->ysql_use_relcache_file);
 
 		YbPrefetchRequiredData(preload_rel_cache);
 
@@ -8806,6 +8826,11 @@ load_relcache_init_file(bool shared)
 			YbSharedRelationCacheReinsert(rels[relno]);
 		else
 			RelationCacheInsert(rels[relno], false);
+	}
+
+	if (yb_debug_log_catcache_events)
+	{
+		elog(LOG, "Loaded %d entries from relcache init file", num_rels);
 	}
 
 	pfree(rels);

@@ -211,6 +211,9 @@ extern int yb_reorderbuffer_max_changes_in_memory;
  */
 extern int yb_explicit_row_locking_batch_size;
 
+/* GUC flag: Log cache misses and cache refresh events. */
+extern bool yb_debug_log_catcache_events;
+
 /*
  * Ease transition to YSQL by reducing read restart errors for new apps.
  *

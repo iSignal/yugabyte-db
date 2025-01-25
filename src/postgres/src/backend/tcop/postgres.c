@@ -4180,7 +4180,7 @@ static void YBRefreshCache()
 
 	if (yb_debug_log_catcache_events)
 	{
-		ereport(LOG,(errmsg("Refreshing catalog cache.")));
+		ereport(LOG,(errmsg("Refreshing catalog cache")));
 	}
 
 	/*
@@ -4202,7 +4202,7 @@ static void YBRefreshCache()
 	YBPreloadRelCache();
 
 	/* Also invalidate the pggate cache. */
-	HandleYBStatus(YBCPgInvalidateCache());
+	HandleYBStatus(YBCPgInvalidateCache(YbGetCatalogCacheVersion()));
 
 	yb_need_cache_refresh = false;
 
