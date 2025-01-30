@@ -478,9 +478,12 @@ TEST_F_EX(PgCatalogPerfTest,
   TestAfterCacheRefreshRPCCountOnSelectWithExtStats(/*expected_master_rpc_count=*/ 3);
 }
 
+DECLARE_bool(log_ysql_catalog_versions);
+
 // The test checks number of hits in response cache in case of multiple connections and aggressive
 // sys catalog changes. Which causes catalog cache refresh in each established connection.
 TEST_F_EX(PgCatalogPerfTest, ResponseCacheEfficiency, PgCatalogWithUnlimitedCachePerfTest) {
+  FLAGS_log_ysql_catalog_versions = true;
   auto conn = ASSERT_RESULT(Connect());
   ASSERT_OK(conn.Execute("CREATE TABLE t (r INT PRIMARY KEY)"));
   auto aux_conn = ASSERT_RESULT(Connect());

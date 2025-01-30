@@ -1087,6 +1087,7 @@ void TabletServer::SetYsqlDBCatalogVersions(
     if (row_inserted || row_updated) {
       catalog_changed = true;
       // Set the new catalog version in shared memory at slot shm_index.
+      LOG(INFO) << "Setting shared object of " << db_oid << " to version " << new_version;
       shared_object().SetYsqlDbCatalogVersion(static_cast<size_t>(shm_index), new_version);
       if (FLAGS_log_ysql_catalog_versions) {
         LOG_WITH_FUNC(INFO) << "set db " << db_oid
@@ -1106,6 +1107,7 @@ void TabletServer::SetYsqlDBCatalogVersions(
       // issue.
       if (db_oid == kTemplate1Oid) {
         ysql_catalog_version_ = new_version;
+        LOG(INFO) << "Setting shared object of " << db_oid << " to version " << new_version;
         shared_object().SetYsqlCatalogVersion(new_version);
         ysql_last_breaking_catalog_version_ = new_breaking_version;
       }

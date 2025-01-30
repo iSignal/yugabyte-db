@@ -38,7 +38,7 @@ DEPRECATE_FLAG(bool, enable_pg_savepoints, "04_2024");
 DEFINE_RUNTIME_AUTO_bool(enable_automatic_tablet_splitting, kExternal, false, true,
     "If false, disables automatic tablet splitting driven from the yb-master side.");
 
-DEFINE_UNKNOWN_bool(log_ysql_catalog_versions, false,
+DEFINE_UNKNOWN_bool(log_ysql_catalog_versions, true,
     "Log YSQL catalog events. For debugging purposes.");
 TAG_FLAG(log_ysql_catalog_versions, hidden);
 
