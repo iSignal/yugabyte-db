@@ -13,6 +13,7 @@
 
 #include "yb/rpc/secure_stream.h"
 
+#include <openssl/bio.h>
 #include <openssl/err.h>
 #include <openssl/provider.h>
 #include <openssl/ssl.h>
@@ -101,7 +102,7 @@ Result<BIOPtr> BIOFromSlice(const Slice& data) {
   return std::move(bio);
 }
 
-Result<X509Ptr> X509FromSlice(const Slice& data) {
+Status X509FromSlice(const Slice& data, std::vector<X509Ptr>* certs) {
   ERR_clear_error();
 
   auto bio = VERIFY_RESULT(BIOFromSlice(data));
@@ -110,8 +111,17 @@ Result<X509Ptr> X509FromSlice(const Slice& data) {
   if (!cert) {
     return SSL_STATUS(IOError, "Read cert failed: $0");
   }
+  certs->push_back(std::move(cert));
 
-  return std::move(cert);
+  while (!BIO_eof(bio.get())) {
+    cert.reset(PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr));
+    if (!cert) {
+      break;
+    }
+    certs->push_back(std::move(cert));
+  }
+
+  return Status::OK();
 }
 
 YB_RPC_SSL_TYPE(ASN1_INTEGER);
@@ -498,18 +508,21 @@ class SecureContext::Impl {
   Status UseCertificateKeyPair(
      const std::string& cert_path, const Slice& certificate_data, const Slice& pkey_data) REQUIRES(mutex_);
 
-  Status UseCertificateKeyPair(const std::string& cert_path, X509Ptr&& certificate, EVP_PKEYPtr&& pkey) REQUIRES(mutex_);
+  Status UseCertificateKeyPair(
+    const std::string& cert_path,
+    std::vector<X509Ptr>* certificates,
+    EVP_PKEYPtr&& pkey) REQUIRES(mutex_);
 
   Status AddCertificateAuthority(X509* cert) REQUIRES(mutex_);
 
   Result<SSLPtr> Create(
-      const std::string& cert_path, const X509Ptr& certificate, const EVP_PKEYPtr& pkey,
+      const std::string& cert_path, const std::vector<X509Ptr>& certificates, const EVP_PKEYPtr& pkey,
       rpc::UseCertificateKeyPair use_certificate_key_pair) const REQUIRES_SHARED(mutex_);
 
   mutable rw_spinlock mutex_;
   SSL_CTXPtr context_ GUARDED_BY(mutex_);
   EVP_PKEYPtr pkey_ GUARDED_BY(mutex_);
-  X509Ptr certificate_ GUARDED_BY(mutex_);
+  std::vector<X509Ptr> certificates_ GUARDED_BY(mutex_);
   std::string cert_path_;
 
   RequireClientCertificate require_client_certificate_;
@@ -556,21 +569,29 @@ SecureContext::Impl::Impl(
 Result<SSLPtr> SecureContext::Impl::Create(
     rpc::UseCertificateKeyPair use_certificate_key_pair) const {
   SharedLock<rw_spinlock> lock(mutex_);
-  return Create(cert_path_, certificate_, pkey_, use_certificate_key_pair);
+  return Create(cert_path_, certificates_, pkey_, use_certificate_key_pair);
 }
 
 Result<SSLPtr> SecureContext::Impl::Create(
     const std::string& cert_path,
-    const X509Ptr& certificate, const EVP_PKEYPtr& pkey,
+    const std::vector<X509Ptr>& certificates, const EVP_PKEYPtr& pkey,
     rpc::UseCertificateKeyPair use_certificate_key_pair) const {
   auto ssl = SSLPtr(SSL_new(context_.get()));
   if (use_certificate_key_pair) {
     LOG(INFO) << "using cert chain from file " << cert_path;
-    auto res = SSL_use_certificate_chain_file(ssl.get(), cert_path.c_str());
+    auto res = SSL_use_certificate(ssl.get(), certificates[0].get());
     //auto res = SSL_use_certificate(ssl.get(), certificate.get());
     if (res != 1) {
       return SSL_STATUS(InvalidArgument, "Failed to use certificate: $0");
     }
+    for (size_t i = 1; i < certificates.size(); ++i) {
+      LOG(INFO) << "adding cert chain " << i;
+      auto chain_res = SSL_add1_chain_cert(ssl.get(), certificates[i].get());
+      if (chain_res != 1) {
+        return SSL_STATUS(InvalidArgument, "Failed to add chain certificate: $0");
+      }
+    }
+
     res = SSL_use_PrivateKey(ssl.get(), pkey.get());
     if (res != 1) {
       return SSL_STATUS(InvalidArgument, "Failed to use private key: $0");
@@ -620,7 +641,8 @@ Status SecureContext::Impl::UseCertificateKeyPair(
     const std::string& cert_path,
     const Slice& certificate_data, const Slice& pkey_data) {
   ERR_clear_error();
-  auto certificate = VERIFY_RESULT(X509FromSlice(certificate_data));
+  std::vector<X509Ptr> certificates;
+  RETURN_NOT_OK(X509FromSlice(certificate_data, &certificates));
 
   ERR_clear_error();
   auto bio = VERIFY_RESULT(BIOFromSlice(pkey_data));
@@ -629,15 +651,18 @@ Status SecureContext::Impl::UseCertificateKeyPair(
     return SSL_STATUS(IOError, "Failed to read private key: $0");
   }
 
-  return UseCertificateKeyPair(cert_path, std::move(certificate), EVP_PKEYPtr(pkey));
+  return UseCertificateKeyPair(cert_path, &certificates, EVP_PKEYPtr(pkey));
 }
 
-Status SecureContext::Impl::UseCertificateKeyPair(const std::string& cert_path, X509Ptr&& certificate, EVP_PKEYPtr&& pkey) {
-  RETURN_NOT_OK(Create(cert_path, certificate, pkey, rpc::UseCertificateKeyPair::kTrue));
+Status SecureContext::Impl::UseCertificateKeyPair(
+  const std::string& cert_path,
+  std::vector<X509Ptr>* certificates,
+  EVP_PKEYPtr&& pkey) {
+  RETURN_NOT_OK(Create(cert_path, *certificates, pkey, rpc::UseCertificateKeyPair::kTrue));
 
   cert_path_ = cert_path;
   LOG(INFO) << "cert path set to " << cert_path_;
-  certificate_ = std::move(certificate);
+  certificates_ = std::move(*certificates);
   pkey_ = std::move(pkey);
 
   return Status::OK();
@@ -657,9 +682,12 @@ std::string SecureContext::Impl::GetCertificateDetails() {
   UniqueLock lock(mutex_);
 
   std::stringstream result;
-  if(certificate_) {
-    result << "Node certificate details: \n";
-    result << X509CertToString(certificate_.get());
+  result << "Node certificate details for " << certificates_.size() << " certs \n";
+  for (const auto& certificate : certificates_) {
+    if (certificate) {
+      result << "Single cert details: ";
+      result << X509CertToString(certificate.get());
+    }
   }
 
   // TODO: extend tabletserver to use certificate reloader callback like mechanism
@@ -681,7 +709,9 @@ Status SecureContext::Impl::TEST_GenerateKeys(int bits, const std::string& commo
 
   UniqueLock lock(mutex_);
   RETURN_NOT_OK(AddCertificateAuthority(ca_cert.get()));
-  RETURN_NOT_OK(UseCertificateKeyPair("", std::move(cert), std::move(key)));
+  std::vector<X509Ptr> certs;
+  certs.push_back(std::move(cert));
+  RETURN_NOT_OK(UseCertificateKeyPair("", &certs, std::move(key)));
 
   return Status::OK();
 }
@@ -971,6 +1001,8 @@ Status SecureRefiner::Init() {
 }
 
 int SecureRefiner::VerifyCallback(int preverified, X509_STORE_CTX* store_context) {
+
+  LOG(INFO) << "VerifyCallback " << preverified;
   if (!store_context) {
     return preverified;
   }
