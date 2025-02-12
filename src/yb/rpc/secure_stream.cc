@@ -468,7 +468,7 @@ class SecureContext::Impl {
   Status AddCertificateAuthorityFile(const std::string& file) EXCLUDES(mutex_);
 
   Status UseCertificates(
-      const std::string& ca_cert_file, const Slice& certificate_data,
+      const std::string& ca_cert_file, const std::string& cert_path, const Slice& certificate_data,
       const Slice& pkey_data) EXCLUDES(mutex_);
 
   std::string GetCertificateDetails();
@@ -496,20 +496,21 @@ class SecureContext::Impl {
   Status AddCertificateAuthorityFileUnlocked(const std::string& file) REQUIRES(mutex_);
 
   Status UseCertificateKeyPair(
-      const Slice& certificate_data, const Slice& pkey_data) REQUIRES(mutex_);
+     const std::string& cert_path, const Slice& certificate_data, const Slice& pkey_data) REQUIRES(mutex_);
 
-  Status UseCertificateKeyPair(X509Ptr&& certificate, EVP_PKEYPtr&& pkey) REQUIRES(mutex_);
+  Status UseCertificateKeyPair(const std::string& cert_path, X509Ptr&& certificate, EVP_PKEYPtr&& pkey) REQUIRES(mutex_);
 
   Status AddCertificateAuthority(X509* cert) REQUIRES(mutex_);
 
   Result<SSLPtr> Create(
-      const X509Ptr& certificate, const EVP_PKEYPtr& pkey,
+      const std::string& cert_path, const X509Ptr& certificate, const EVP_PKEYPtr& pkey,
       rpc::UseCertificateKeyPair use_certificate_key_pair) const REQUIRES_SHARED(mutex_);
 
   mutable rw_spinlock mutex_;
   SSL_CTXPtr context_ GUARDED_BY(mutex_);
   EVP_PKEYPtr pkey_ GUARDED_BY(mutex_);
   X509Ptr certificate_ GUARDED_BY(mutex_);
+  std::string cert_path_;
 
   RequireClientCertificate require_client_certificate_;
   UseClientCertificate use_client_certificate_;
@@ -555,15 +556,18 @@ SecureContext::Impl::Impl(
 Result<SSLPtr> SecureContext::Impl::Create(
     rpc::UseCertificateKeyPair use_certificate_key_pair) const {
   SharedLock<rw_spinlock> lock(mutex_);
-  return Create(certificate_, pkey_, use_certificate_key_pair);
+  return Create(cert_path_, certificate_, pkey_, use_certificate_key_pair);
 }
 
 Result<SSLPtr> SecureContext::Impl::Create(
+    const std::string& cert_path,
     const X509Ptr& certificate, const EVP_PKEYPtr& pkey,
     rpc::UseCertificateKeyPair use_certificate_key_pair) const {
   auto ssl = SSLPtr(SSL_new(context_.get()));
   if (use_certificate_key_pair) {
-    auto res = SSL_use_certificate(ssl.get(), certificate.get());
+    LOG(INFO) << "using cert chain from file " << cert_path;
+    auto res = SSL_use_certificate_chain_file(ssl.get(), cert_path.c_str());
+    //auto res = SSL_use_certificate(ssl.get(), certificate.get());
     if (res != 1) {
       return SSL_STATUS(InvalidArgument, "Failed to use certificate: $0");
     }
@@ -613,6 +617,7 @@ Status SecureContext::Impl::AddCertificateAuthority(X509* cert) {
 }
 
 Status SecureContext::Impl::UseCertificateKeyPair(
+    const std::string& cert_path,
     const Slice& certificate_data, const Slice& pkey_data) {
   ERR_clear_error();
   auto certificate = VERIFY_RESULT(X509FromSlice(certificate_data));
@@ -624,12 +629,14 @@ Status SecureContext::Impl::UseCertificateKeyPair(
     return SSL_STATUS(IOError, "Failed to read private key: $0");
   }
 
-  return UseCertificateKeyPair(std::move(certificate), EVP_PKEYPtr(pkey));
+  return UseCertificateKeyPair(cert_path, std::move(certificate), EVP_PKEYPtr(pkey));
 }
 
-Status SecureContext::Impl::UseCertificateKeyPair(X509Ptr&& certificate, EVP_PKEYPtr&& pkey) {
-  RETURN_NOT_OK(Create(certificate, pkey, rpc::UseCertificateKeyPair::kTrue));
+Status SecureContext::Impl::UseCertificateKeyPair(const std::string& cert_path, X509Ptr&& certificate, EVP_PKEYPtr&& pkey) {
+  RETURN_NOT_OK(Create(cert_path, certificate, pkey, rpc::UseCertificateKeyPair::kTrue));
 
+  cert_path_ = cert_path;
+  LOG(INFO) << "cert path set to " << cert_path_;
   certificate_ = std::move(certificate);
   pkey_ = std::move(pkey);
 
@@ -637,11 +644,11 @@ Status SecureContext::Impl::UseCertificateKeyPair(X509Ptr&& certificate, EVP_PKE
 }
 
 Status SecureContext::Impl::UseCertificates(
-    const std::string& ca_cert_file, const Slice& certificate_data, const Slice& pkey_data) {
+    const std::string& ca_cert_file, const std::string& cert_path, const Slice& certificate_data, const Slice& pkey_data) {
   UniqueLock lock(mutex_);
 
   RETURN_NOT_OK(AddCertificateAuthorityFileUnlocked(ca_cert_file));
-  RETURN_NOT_OK(UseCertificateKeyPair(certificate_data, pkey_data));
+  RETURN_NOT_OK(UseCertificateKeyPair(cert_path, certificate_data, pkey_data));
 
   return Status::OK();
 }
@@ -674,7 +681,7 @@ Status SecureContext::Impl::TEST_GenerateKeys(int bits, const std::string& commo
 
   UniqueLock lock(mutex_);
   RETURN_NOT_OK(AddCertificateAuthority(ca_cert.get()));
-  RETURN_NOT_OK(UseCertificateKeyPair(std::move(cert), std::move(key)));
+  RETURN_NOT_OK(UseCertificateKeyPair("", std::move(cert), std::move(key)));
 
   return Status::OK();
 }
@@ -692,8 +699,8 @@ Status SecureContext::AddCertificateAuthorityFile(const std::string& file) {
 }
 
 Status SecureContext::UseCertificates(
-    const std::string& ca_cert_file, const Slice& certificate_data, const Slice& pkey_data) {
-  return impl_->UseCertificates(ca_cert_file, certificate_data, pkey_data);
+    const std::string& ca_cert_file, const std::string& cert_path, const Slice& certificate_data, const Slice& pkey_data) {
+  return impl_->UseCertificates(ca_cert_file, cert_path, certificate_data, pkey_data);
 }
 
 std::string SecureContext::GetCertificateDetails() {

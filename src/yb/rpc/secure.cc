@@ -194,14 +194,16 @@ Status ReloadSecureContextKeysAndCertificates(
   auto ca_cert_file = JoinPathSegments(certs_dir, "ca.crt");
   if (!node_name.empty()) {
     faststring cert_data, pkey_data;
+    auto cert_path = JoinPathSegments(certs_dir, Format(FLAGS_cert_file_pattern, node_name));
+    LOG(INFO) << "using cert path " << cert_path;
     RETURN_NOT_OK(ReadFileToString(
-        Env::Default(), JoinPathSegments(certs_dir, Format(FLAGS_cert_file_pattern, node_name)),
+        Env::Default(), cert_path,
         &cert_data));
     RETURN_NOT_OK(ReadFileToString(
         Env::Default(), JoinPathSegments(certs_dir, Format(FLAGS_key_file_pattern, node_name)),
         &pkey_data));
 
-    RETURN_NOT_OK(context->UseCertificates(ca_cert_file, cert_data, pkey_data));
+    RETURN_NOT_OK(context->UseCertificates(ca_cert_file, cert_path, cert_data, pkey_data));
   } else {
     RETURN_NOT_OK(context->AddCertificateAuthorityFile(ca_cert_file));
   }

@@ -40,7 +40,7 @@ class SecureContext {
   Status AddCertificateAuthorityFile(const std::string& file);
 
   Status UseCertificates(
-      const std::string& ca_cert_file, const Slice& certificate_data, const Slice& pkey_data);
+      const std::string& ca_cert_file, const std::string& cert_path, const Slice& certificate_data, const Slice& pkey_data);
 
   std::string GetCertificateDetails();
 
