@@ -1461,6 +1461,12 @@ class PgClient::Impl : public BigDataFetcher {
       ash::PggateRPC rpc_enum, rpc::RpcController* controller) {
     AshMetadataToPB(req);
     auto watcher = wait_event_watcher_(ash::WaitStateCode::kWaitingOnTServer, rpc_enum);
+    if (yb_debug_log_docdb_requests) {
+      // This allows us to log DDL RPCs
+      LOG(INFO) << "Performing PG to tserver "
+        << boost::typeindex::type_id<Req>().pretty_name()
+        << " RPC. Request details: \n" << req.DebugString();
+    }
     return (proxy_.get()->*func)(req, &resp, controller);
   }
 

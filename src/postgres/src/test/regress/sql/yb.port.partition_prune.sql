@@ -859,7 +859,6 @@ drop table pp_lp;
 -- Ensure enable_partition_prune does not affect non-partitioned tables.
 create table inh_lp (a int, value int);
 create table inh_lp1 (a int, value int, check(a = 1)) inherits (inh_lp);
-/*
 create table inh_lp2 (a int, value int, check(a = 2)) inherits (inh_lp);
 
 set constraint_exclusion = 'partition';
@@ -873,10 +872,8 @@ explain (costs off) delete from inh_lp where a = 1;
 -- inheritance children
 explain (costs off) update inh_lp1 set value = 10 where a = 2;
 
-\set VERBOSITY terse    \\ -- suppress cascade details
 drop table inh_lp cascade;
-\set VERBOSITY default
-*/
+
 reset enable_partition_pruning;
 reset constraint_exclusion;
 

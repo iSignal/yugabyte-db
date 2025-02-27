@@ -117,4 +117,5 @@ extern void ResourceOwnerRememberYbPgInheritsRef(ResourceOwner owner,
 extern void ResourceOwnerForgetYbPgInheritsRef(ResourceOwner owner,
 											   YbPgInheritsCacheEntry entry);
 
+
 #endif							/* RESOWNER_PRIVATE_H */
