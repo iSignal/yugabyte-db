@@ -1713,6 +1713,38 @@ SearchCatCacheInternal(CatCache *cache,
 	return SearchCatCacheMiss(cache, nkeys, hashValue, hashIndex, v1, v2, v3, v4);
 }
 
+static HTAB* yb_additional_neg_cache_ids = NULL;
+static void YbSetAdditionalNegCacheIds(List *neg_cache_ids) 
+{
+	if (yb_additional_neg_cache_ids != NULL)
+	{
+		hash_destroy(yb_additional_neg_cache_ids);
+		yb_additional_neg_cache_ids = NULL;
+	}
+	HASHCTL		hash_ctl;
+	hash_ctl.keysize = sizeof(uint32_t);
+	hash_ctl.entrysize = sizeof(uint32_t);
+	hash_ctl.hcxt = CacheMemoryContext;
+	yb_additional_neg_cache_ids = hash_create("Addnl neg cache ids",
+									4,
+									&hash_ctl,
+									HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	if (yb_additional_neg_cache_ids == NULL)
+	{
+		elog(ERROR, "Failed to alloc neg cache id hash");
+	}
+
+	ListCell* lc = NULL;
+	foreach(lc, neg_cache_ids)
+	{
+		int neg_cache_id = lfirst_int(lc);
+		bool found;
+		elog(LOG, "Adding %d to negative cache list", neg_cache_id);
+		hash_search(yb_additional_neg_cache_ids, &neg_cache_id, HASH_ENTER, &found);
+		Assert (!found);
+	}
+}
+
 /*
 * Function returns true in some special cases where we allow negative caches:
 * 1. pg_cast (CASTSOURCETARGET) to avoid master lookups during parsing.
@@ -1771,6 +1803,16 @@ YbAllowNegativeCacheEntries(int cache_id,
 			return (IsCatalogNamespace(namespace_id) &&
 					!YBCIsInitDbModeEnvVarSet());
 	}
+
+	if (yb_additional_neg_cache_ids != NULL)
+	{
+		bool found = false;
+		hash_search(yb_additional_neg_cache_ids,
+			&cache_id, HASH_FIND, &found);
+		if (found)
+			return true;
+	}
+
 	return isTempOrTempToastNamespace(namespace_id);
 }
 
