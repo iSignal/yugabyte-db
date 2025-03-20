@@ -116,3 +116,4 @@ bool yb_upgrade_to_pg15_completed = true;
 bool yb_disable_auto_analyze = false;
 
 bool yb_extension_upgrade = false;
+bool yb_debug_log_catcache_events = false;

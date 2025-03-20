@@ -254,6 +254,8 @@ extern int yb_major_version_upgrade_compatibility;
 
 extern bool yb_upgrade_to_pg15_completed;
 
+extern bool yb_debug_log_catcache_events;
+
 extern bool yb_extension_upgrade;
 
 // Should be in sync with YsqlSamplingAlgorithm protobuf.

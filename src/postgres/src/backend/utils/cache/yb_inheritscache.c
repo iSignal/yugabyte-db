@@ -190,7 +190,7 @@ YbInitPgInheritsCache()
 void
 YbPreloadPgInheritsCache()
 {
-	elog(DEBUG3, "preload pg inherits cache");
+	elog(yb_debug_log_catcache_events ? LOG : DEBUG3, "YbPgInheritsCache: Preload started.");
 	Assert(YbPgInheritsCacheByParent);
 	Assert(YbPgInheritsCacheByChild);
 	Relation	relation = table_open(InheritsRelationId, AccessShareLock);
@@ -248,8 +248,8 @@ YbPreloadPgInheritsCache()
 	}
 	systable_endscan(scan);
 	table_close(relation, AccessShareLock);
-	elog(DEBUG3,
-		 "Preload complete. Parent cache has %ld entries, "
+	elog(yb_debug_log_catcache_events ? LOG : DEBUG3,
+		 "YbPgInheritsCache Preload complete. Parent cache has %ld entries, "
 		 " child cache has %ld entries.",
 		 hash_get_num_entries(YbPgInheritsCacheByParent),
 		 hash_get_num_entries(YbPgInheritsCacheByChild));
@@ -266,7 +266,8 @@ GetYbPgInheritsCacheEntryByParent(Oid parentOid)
 
 	if (!found)
 	{
-		elog(DEBUG3, "YbPgInheritsCacheByParent miss for parent %d", parentOid);
+		elog(yb_debug_log_catcache_events ? LOG : DEBUG3,
+			"YbPgInheritsCacheByParent miss for parent %d", parentOid);
 		entry->oid = parentOid;
 		FindChildren(parentOid, &entry->tuples);
 		entry->refcount = 1;
@@ -291,7 +292,8 @@ GetYbPgInheritsCacheEntryByChild(Oid relid)
 
 	if (!found)
 	{
-		elog(DEBUG3, "YbPgInheritsCacheByChild miss for oid %d", relid);
+		elog(yb_debug_log_catcache_events ? LOG : DEBUG3,
+				"YbPgInheritsCacheByChild miss for oid %d", relid);
 		GetChildCacheEntryMiss(relid, entry);
 	}
 	else

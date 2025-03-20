@@ -255,6 +255,7 @@ extern bool RelationSupportsSysCache(Oid relid);
 
 extern uint32 YbSysCacheComputeHashValue(int cache_id, Datum v1, Datum v2, Datum v3, Datum v4);
 extern void YbCopyCacheInfoToValues(int cache_id, Datum *values);
+extern void YbSetAdditionalNegCacheIds(List *neg_cache_ids);
 
 /*
  * The use of the macros below rather than direct calls to the corresponding

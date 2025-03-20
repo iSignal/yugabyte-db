@@ -110,6 +110,7 @@
 #include "utils/queryjumble.h"
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 #include "utils/tzparser.h"
 #include "utils/inval.h"
 #include "utils/varlena.h"
@@ -164,7 +165,7 @@ extern bool optimize_bounded_sort;
 static double yb_transaction_priority_lower_bound = 0.0;
 static double yb_transaction_priority_upper_bound = 1.0;
 static double yb_transaction_priority = 0.0;
-static int yb_tcmalloc_sample_period = 1024 * 1024; /* 1MB */
+static int	yb_tcmalloc_sample_period = 1024 * 1024;	/* 1MB */
 
 static int	GUC_check_errcode_value;
 
@@ -201,6 +202,9 @@ static void assign_wal_consistency_checking(const char *newval, void *extra);
 
 static bool check_default_replica_identity(char **newval, void **extra,
 										   GucSource source);
+static bool yb_check_neg_catcache_ids(char **newval, void **extra,
+									  GucSource source);
+static void yb_set_neg_catcache_ids(const char *newval, void *extra);
 
 #ifdef HAVE_SYSLOG
 static int	syslog_facility = LOG_LOCAL0;
@@ -780,6 +784,8 @@ static char *recovery_target_xid_string;
 static char *recovery_target_name_string;
 static char *recovery_target_lsn_string;
 static char *restrict_nonsystem_relation_kind_string;
+static char *yb_neg_catcache_ids_string;
+
 
 static char *yb_effective_transaction_isolation_level_string;
 static char *yb_xcluster_consistency_level_string;
@@ -2563,7 +2569,7 @@ static struct config_bool ConfigureNamesBool[] =
 	{
 		{"yb_enable_consistent_replication_from_hash_range", PGC_SUSET, DEVELOPER_OPTIONS,
 			gettext_noop("Enable replication slot consumption of consistent changes "
-			"from a hash range of table."),
+						 "from a hash range of table."),
 			NULL,
 			GUC_NOT_IN_SAMPLE
 		},
@@ -5132,16 +5138,16 @@ static struct config_int ConfigureNamesInt[] =
 	},
 
 	{{"yb_tcmalloc_sample_period", PGC_SUSET, STATS_MONITORING,
-	  gettext_noop("TCMalloc sample interval in bytes, i.e. approximately "
-				   "how many bytes between sampling allocation call stacks"), NULL,
-	  GUC_UNIT_BYTE},
-	 &yb_tcmalloc_sample_period,
-	 1024 * 1024, /* 1MB */
-	 0,
-	 INT_MAX,
-	 NULL,
-	 assign_tcmalloc_sample_period,
-	 show_tcmalloc_sample_period},
+			gettext_noop("TCMalloc sample interval in bytes, i.e. approximately "
+						 "how many bytes between sampling allocation call stacks"), NULL,
+	GUC_UNIT_BYTE},
+	&yb_tcmalloc_sample_period,
+	1024 * 1024,				/* 1MB */
+	0,
+	INT_MAX,
+	NULL,
+	assign_tcmalloc_sample_period,
+	show_tcmalloc_sample_period},
 
 	{
 		{"yb_test_delay_after_applying_inval_message_ms", PGC_USERSET, DEVELOPER_OPTIONS,
@@ -6392,6 +6398,19 @@ static struct config_string ConfigureNamesString[] =
 		&yb_default_replica_identity,
 		"CHANGE",
 		check_default_replica_identity, NULL, NULL
+	},
+
+	{
+		{"yb_neg_catcache_ids", PGC_SUSET, RESOURCES_MEM,
+			gettext_noop("Comma separated list of additional sys cache ids"
+						 " that are allowed to be negatively cached."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&yb_neg_catcache_ids_string,
+		"",
+		yb_check_neg_catcache_ids,
+		yb_set_neg_catcache_ids, NULL
 	},
 
 	/* End-of-list marker */
@@ -8760,10 +8779,10 @@ ReportGUCOption(struct config_generic *record)
 		 * 2. If GUC_REPORT is enabled, but the previous value is the
 		 * same as the current value.
 		 */
-		bool guc_report_not_enabled = !(record->flags & GUC_REPORT);
-		bool guc_report_enabled_same_value = (record->flags & GUC_REPORT) &&
-			record->last_reported &&
-			strcmp(val, record->last_reported) == 0;
+		bool		guc_report_not_enabled = !(record->flags & GUC_REPORT);
+		bool		guc_report_enabled_same_value = (record->flags & GUC_REPORT) &&
+		record->last_reported &&
+		strcmp(val, record->last_reported) == 0;
 
 		if (YbIsClientYsqlConnMgr() && (guc_report_not_enabled || guc_report_enabled_same_value))
 			pq_beginmessage(&msgbuf, 'r');
@@ -15549,6 +15568,7 @@ static const char *
 show_tcmalloc_sample_period(void)
 {
 	static char nbuf[32];
+
 	snprintf(nbuf, sizeof(nbuf), "%" PRId64, YBCGetTCMallocSamplingPeriod());
 	return nbuf;
 }
@@ -15570,12 +15590,77 @@ yb_disable_auto_analyze_check_hook(bool *newval, void **extra, GucSource source)
 	if (source == PGC_S_DEFAULT || source == PGC_S_TEST)
 		return true;
 
-  if (source != PGC_S_DATABASE)
+	if (source != PGC_S_DATABASE)
 	{
 		GUC_check_errmsg("Can only be set on a database level using ALTER DATABASE SET. Current source: %s", GucSource_Names[source]);
-	  return false;
+		return false;
 	}
 	return true;
+}
+
+
+static List *
+yb_neg_catcache_ids_to_list(const char *cache_ids_str)
+{
+
+
+
+	char	   *rawstring = pstrdup(cache_ids_str);
+	List	   *elemlist = NIL;
+
+	if (!SplitIdentifierString(rawstring, ',', &elemlist))
+	{
+		/* syntax error in list */
+		GUC_check_errdetail("Expecting a comma separated string.");
+		pfree(rawstring);
+		list_free(elemlist);
+		return false;
+	}
+	pfree(rawstring);
+
+	List	   *neg_cache_ids_list = NIL;
+	ListCell   *l;
+
+	foreach(l, elemlist)
+	{
+		long int	cache_id = strtol((char *) lfirst(l), NULL, 10);
+
+		if (cache_id < 0 || cache_id > SysCacheSize)
+		{
+			list_free(elemlist);
+			list_free(neg_cache_ids_list);
+			return NIL;
+		}
+		neg_cache_ids_list = lappend_int(neg_cache_ids_list, cache_id);
+	}
+
+	return neg_cache_ids_list;
+}
+
+static bool
+yb_check_neg_catcache_ids(char **newval, void **extra, GucSource source)
+{
+	elog(LOG, "yb_check_neg_cagtcache ids");
+	if (newval == NULL || *newval == NULL || strlen(*newval) == 0)
+		return true;
+	List	   *neg_cache_ids_list = yb_neg_catcache_ids_to_list(*newval);
+
+	if (neg_cache_ids_list == NIL)
+		return false;
+	list_free(neg_cache_ids_list);
+	return true;
+}
+
+static void
+yb_set_neg_catcache_ids(const char *newval, void *extra)
+{
+	List	   *neg_cache_ids_list = yb_neg_catcache_ids_to_list(newval);
+
+	if (neg_cache_ids_list != NIL)
+	{
+		YbSetAdditionalNegCacheIds(neg_cache_ids_list);
+		list_free(neg_cache_ids_list);
+	}
 }
 
 #include "guc-file.c"
