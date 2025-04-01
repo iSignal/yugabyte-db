@@ -1279,6 +1279,8 @@ InitPostgresImpl(const char *in_dbname, Oid dboid,
 
 	RelationCacheInitializePhase3();
 
+	YbEnsureSysTablePrefetchingStopped();
+
 	/*
 	 * Also cache whether the database is colocated for optimization purposes.
 	 */
