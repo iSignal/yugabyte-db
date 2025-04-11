@@ -111,13 +111,14 @@ Result<ReplicationInfoPB> TablespaceParser::FromJson(
   for (rapidjson::SizeType i = 0; i < pb.Size(); ++i) {
     const rapidjson::Value& placement = pb[i];
     if (!placement.HasMember("cloud") || !placement.HasMember("region") ||
-        !placement.HasMember("zone") || !placement.HasMember("min_num_replicas")) {
+         !placement.HasMember("min_num_replicas")) {
       return STATUS_FORMAT(
           Corruption, "Missing required key (cloud/region/zone/min_num_replicas) in placement "
           "block. Placement policy: $0", placement_str);
     }
     if (!placement["cloud"].IsString() || !placement["region"].IsString() ||
-        !placement["zone"].IsString() || !placement["min_num_replicas"].IsInt()) {
+        (placement.HasMember("zone") && !placement["zone"].IsString()) || 
+        !placement["min_num_replicas"].IsInt()) {
       return STATUS_FORMAT(
           Corruption, "Invalid type/value for some key in placement block. Placement policy: $0",
           placement_str);
@@ -129,7 +130,8 @@ Result<ReplicationInfoPB> TablespaceParser::FromJson(
     auto* cloud_info = placement_block->mutable_cloud_info();
     cloud_info->set_placement_cloud(placement["cloud"].GetString());
     cloud_info->set_placement_region(placement["region"].GetString());
-    cloud_info->set_placement_zone(placement["zone"].GetString());
+    if (placement.HasMember("zone"))
+      cloud_info->set_placement_zone(placement["zone"].GetString());
 
     // Add zones until we have at least leader_preference zones.
     if (placement.HasMember("leader_preference")) {

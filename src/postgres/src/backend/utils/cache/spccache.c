@@ -271,9 +271,9 @@ get_tablespace_distance(Oid spcid)
 			continue;
 
 		YbGeolocationDistance current_dist;
-		const char *tsp_cloud;
-		const char *tsp_region;
-		const char *tsp_zone;
+		const char *tsp_cloud = NULL;
+		const char *tsp_region = NULL;
+		const char *tsp_zone = NULL;
 
 		tsp_cloud =
 			text_to_cstring(json_get_denormalized_value(json_element,
@@ -281,9 +281,9 @@ get_tablespace_distance(Oid spcid)
 		tsp_region =
 			text_to_cstring(json_get_denormalized_value(json_element,
 														regionKey));
-		tsp_zone =
-			text_to_cstring(json_get_denormalized_value(json_element,
-														zoneKey));
+		text *zone_txt = json_get_denormalized_value(json_element, zoneKey);
+		if (zone_txt)
+			tsp_zone = text_to_cstring(zone_txt);
 
 
 		/* are the current cloud and the given cloud the same */
@@ -293,7 +293,9 @@ get_tablespace_distance(Oid spcid)
 			if (strcmp(tsp_region, current_region) == 0)
 			{
 				/* are the current cloud and the given zone the same */
-				if (strcmp(tsp_zone, current_zone) == 0)
+				/* If the table placement does not include a zone, we assume only
+				   regional distance because the actual zone can change over time */
+				if (tsp_zone != NULL && strcmp(tsp_zone, current_zone) == 0)
 				{
 					current_dist = ZONE_LOCAL;
 				}
