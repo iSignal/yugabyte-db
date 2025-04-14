@@ -103,7 +103,11 @@ MiniTabletServer::MiniTabletServer(const std::vector<std::string>& wal_paths,
     rpc_port) };
   opts_.webserver_opts.port = 0;
   opts_.webserver_opts.bind_interface = rpc_host;
+  LOG(INFO) << "starting tablet server " << index_;
   if (!opts_.has_placement_cloud()) {
+    LOG(INFO) << "set placement to " << Format("cloud$0", (index_ + 1) / FLAGS_TEST_nodes_per_cloud)
+    << ", " << Format("rack$0", index_) 
+    << ", " << "zone";
     opts_.SetPlacement(Format("cloud$0", (index_ + 1) / FLAGS_TEST_nodes_per_cloud),
                        Format("rack$0", index_), "zone");
   }

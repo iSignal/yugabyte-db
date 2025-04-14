@@ -32,6 +32,8 @@ DEFINE_RUNTIME_bool(enable_tablespace_validation, true, "Whether to enable exten
 
 namespace yb {
 
+static const std::string kWildcardPlacement = "*";
+
 // TODO(#26671): When we start using this for the yb-admin APIs as well, we should take into
 // account prefix placements (wildcards).
 // TODO(#12180): Support read replica validation.
@@ -117,7 +119,7 @@ Result<ReplicationInfoPB> TablespaceParser::FromJson(
           "block. Placement policy: $0", placement_str);
     }
     if (!placement["cloud"].IsString() || !placement["region"].IsString() ||
-        (placement.HasMember("zone") && !placement["zone"].IsString()) || 
+        !placement["zone"].IsString() || 
         !placement["min_num_replicas"].IsInt()) {
       return STATUS_FORMAT(
           Corruption, "Invalid type/value for some key in placement block. Placement policy: $0",
@@ -128,11 +130,33 @@ Result<ReplicationInfoPB> TablespaceParser::FromJson(
     placement_block->set_min_num_replicas(placement["min_num_replicas"].GetInt());
 
     auto* cloud_info = placement_block->mutable_cloud_info();
-    cloud_info->set_placement_cloud(placement["cloud"].GetString());
-    cloud_info->set_placement_region(placement["region"].GetString());
-    if (placement.HasMember("zone"))
-      cloud_info->set_placement_zone(placement["zone"].GetString());
+    // The special value '*' is allowed for a placement to indicate no specific cloud/region/zone
+    // TODO: disallow cloud = *, region = real value etc
+    bool in_wildcard = false;
+    if (placement["cloud"].GetString() != kWildcardPlacement) {
+      cloud_info->set_placement_cloud(placement["cloud"].GetString());
+    } else {
+      in_wildcard = true;
+    }
+      
+    if (placement["region"].GetString() != kWildcardPlacement) {
+      if (in_wildcard)
+        return STATUS_FORMAT(Corruption, 
+        "A wildcard '*' at cloud/region level should be followed by a wildcard at "
+          "subsequent levels");
+      cloud_info->set_placement_region(placement["region"].GetString());
+    } else {
+      in_wildcard = true;
+    }
+      
+    if (placement["zone"].GetString() != kWildcardPlacement) {
+      if (in_wildcard)
+        return STATUS_FORMAT(Corruption, 
+        "A wildcard '*' at cloud/region level should be followed by a wildcard at "
+          "subsequent levels");
 
+      cloud_info->set_placement_zone(placement["zone"].GetString());
+    }
     // Add zones until we have at least leader_preference zones.
     if (placement.HasMember("leader_preference")) {
       if (!placement["leader_preference"].IsInt() || placement["leader_preference"].GetInt() <= 0) {

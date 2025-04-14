@@ -46,6 +46,8 @@ const auto kWaitLeaderDistributionTimeout = MonoDelta::FromMilliseconds(270000);
 
 } // namespace
 
+enum class WildCardTestOption { kCloud, kRegion, kZone };
+
 class PlacementBlock {
  public:
     std::string cloud;
@@ -59,7 +61,9 @@ class PlacementBlock {
     PlacementBlock(std::string cloud, std::string region, std::string zone, size_t minNumReplicas,
                    std::optional<size_t> leaderPreference = std::nullopt)
         : cloud(std::move(cloud)), region(std::move(region)), zone(std::move(zone)),
-          minNumReplicas(minNumReplicas), leaderPreference(leaderPreference) {}
+          minNumReplicas(minNumReplicas), leaderPreference(leaderPreference) {
+            json = generateJson();
+          }
 
     // Creates a placement block with the given region ID. For the purposes of this test, the cloud
     // is always "cloud0" and the zone is always "zone". The region is "rack<regionId>".
@@ -72,14 +76,16 @@ class PlacementBlock {
     }
 
   const std::string& toJson() const {
+    LOG(INFO) << "json is " << json;
     return json;
   }
 
   // Checks if the cloud, region, and zone match those of a CloudInfo protobuf.
   bool MatchesReplica(const CloudInfoPB& replica_cloud_info) const {
-    return replica_cloud_info.placement_cloud() == cloud &&
-           replica_cloud_info.placement_region() == region &&
-           replica_cloud_info.placement_zone() == zone;
+    LOG(INFO) << "MatchesReplica: placement cloud info pb " << replica_cloud_info.DebugString();
+    return (replica_cloud_info.placement_cloud() == cloud || cloud == "*") &&
+           (replica_cloud_info.placement_region() == region || region == "*") &&
+           (replica_cloud_info.placement_zone() == zone || zone == "*");
   }
 
  private:
@@ -157,6 +163,7 @@ class Tablespace {
         os << "{\"num_replicas\":" << numReplicas << ",\"placement_blocks\":[";
 
         for (size_t i = 0; i < placementBlocks.size(); ++i) {
+          LOG(INFO) << "index " << i;
             os << placementBlocks[i].toJson();
             if (i < placementBlocks.size() - 1) {
                 os << ",";
@@ -256,6 +263,69 @@ class PgTablespacesTest : public GeoTransactionsTestBase {
     VerifyMinNumReplicas(kTablePrefix + "_tbl", placement_blocks);
     VerifyMinNumReplicas(kTablePrefix + "_idx", placement_blocks);
     VerifyMinNumReplicas(kTablePrefix + "_mv", placement_blocks);
+  }
+
+
+  void createWildcardTablespace(const std::string& ts_name, WildCardTestOption wildcard_opt, int num_replicas, std::vector<PlacementBlock>* placement_blocks) {
+    placement_blocks->clear();
+    switch (wildcard_opt) {
+      case WildCardTestOption::kCloud:
+        placement_blocks->push_back(PlacementBlock("*", "*", "*", num_replicas));
+        break;
+
+      case WildCardTestOption::kRegion:
+        placement_blocks->push_back(PlacementBlock("cloud0", "*", "*", num_replicas));
+        break;
+
+      case WildCardTestOption::kZone:
+        placement_blocks->push_back(PlacementBlock("cloud0", "rack1", "*", 2));
+        if (num_replicas > 2)
+          placement_blocks->push_back(PlacementBlock("cloud0", "rack2", "*", 1)); 
+        break;
+    };
+
+    Tablespace tablespace(ts_name, num_replicas, *placement_blocks);
+
+    auto conn = ASSERT_RESULT(Connect());
+    ASSERT_OK(conn.Execute(tablespace.getCreateCmd()));
+
+  }
+
+  void testWildcardPlacement(WildCardTestOption wildcard_opt) {
+    // minicluster creates tservers with 
+    // (cloud0, rack1, zone), 
+    // (cloud0, rack2, zone), 
+    // (cloud0, rack3, zone)
+    // we are adding
+    // (cloud0, rack1, zone1|zone2)
+    auto options = EXPECT_RESULT(tserver::TabletServerOptions::CreateTabletServerOptions());
+    options.SetPlacement("cloud0", "rack1", "zone1");
+    ASSERT_OK(cluster_->AddTabletServer(options));
+
+    options.SetPlacement("cloud0", "rack1", "zone2");
+    ASSERT_OK(cluster_->AddTabletServer(options));
+
+    // make tablespace list
+    static constexpr auto kTableName = "test_table";
+    static constexpr auto kTablespace1 = "ts1";
+    static constexpr auto kTablespace2 = "ts2";
+
+    std::vector<PlacementBlock> placement_blocks;
+    createWildcardTablespace(kTablespace1, wildcard_opt, 2, &placement_blocks);
+    auto conn = ASSERT_RESULT(Connect());
+    ASSERT_OK(conn.ExecuteFormat(
+      "CREATE TABLE $0 (k INT) TABLESPACE $1", kTableName, kTablespace1));
+
+    VerifyMinNumReplicas(kTableName, placement_blocks);
+
+    placement_blocks.clear();
+    createWildcardTablespace(kTablespace2, wildcard_opt, 2, &placement_blocks);
+    ASSERT_OK(conn.ExecuteFormat(
+      "ALTER TABLE $0 SET TABLESPACE $1", kTableName, kTablespace2));
+
+    WaitForLoadBalanceCompletion();
+
+    VerifyMinNumReplicas(kTableName, placement_blocks);
   }
 };
 
@@ -479,6 +549,47 @@ TEST_F(PgTablespacesTest, TombstonedTabletInYbLocalTablets) {
       conn.FetchRow<std::string>(tablet_state_query));
   ASSERT_STR_EQ(new_tablet_state, "TABLET_DATA_TOMBSTONED");
 }
+
+
+TEST_F(PgTablespacesTest, TestWildcardCloud) {
+
+  testWildcardPlacement(WildCardTestOption::kCloud);
+
+}
+
+TEST_F(PgTablespacesTest, TestWildcardRegion) {
+
+  testWildcardPlacement(WildCardTestOption::kRegion);
+
+}
+TEST_F(PgTablespacesTest, TestWildcardZone) {
+
+  testWildcardPlacement(WildCardTestOption::kZone);
+
+  // auto options = EXPECT_RESULT(tserver::TabletServerOptions::CreateTabletServerOptions());
+  // options.SetPlacement("cloud0", "rack1", "zone1");
+  // ASSERT_OK(cluster_->AddTabletServer(options));
+
+  // static constexpr auto kTableName = "test_table";
+  // static constexpr auto kTablespace1 = "ts1";
+
+  // std::vector<PlacementBlock> placement_blocks = {
+  //   PlacementBlock("cloud0", "rack1", "*", 2)
+  // };
+  // Tablespace tablespace1(kTablespace1, 2, placement_blocks);
+
+  // auto conn = ASSERT_RESULT(Connect());
+  // ASSERT_OK(conn.Execute(tablespace1.getCreateCmd()));
+  // ASSERT_OK(conn.ExecuteFormat(
+  //   "CREATE TABLE $0 (k INT) TABLESPACE $1", kTableName, kTablespace1));
+
+  //   //WaitForLoadBalanceCompletion();
+  //   //sleep(20);
+
+  //   VerifyMinNumReplicas(kTableName, placement_blocks);
+}
+
+
 
 } // namespace client
 } // namespace yb

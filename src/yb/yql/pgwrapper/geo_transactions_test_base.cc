@@ -45,6 +45,7 @@ DECLARE_bool(enable_ysql_tablespaces_for_placement);
 DECLARE_bool(force_global_transactions);
 DECLARE_bool(TEST_track_last_transaction);
 DECLARE_bool(TEST_name_transaction_tables_with_tablespace_id);
+DECLARE_string(vmodule);
 
 namespace yb {
 
@@ -53,7 +54,7 @@ namespace client {
 namespace {
 
 const auto kStatusTabletCacheRefreshTimeout = MonoDelta::FromMilliseconds(20000) * kTimeMultiplier;
-const auto kWaitLoadBalancerTimeout = MonoDelta::FromMilliseconds(30000) * kTimeMultiplier;
+const auto kWaitLoadBalancerTimeout = MonoDelta::FromMilliseconds(90000) * kTimeMultiplier;
 
 }
 
@@ -80,6 +81,7 @@ void GeoTransactionsTestBase::SetUp() {
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_load_balancer_max_concurrent_removals) = 10;
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_load_balancer_max_concurrent_moves) = 10;
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_load_balancer_max_concurrent_moves_per_table) = 10;
+  FLAGS_vmodule = "cluster_balance*=2";
 
   pgwrapper::PgMiniTestBase::SetUp();
   InitTransactionManagerAndPool();

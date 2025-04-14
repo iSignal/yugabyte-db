@@ -11263,6 +11263,7 @@ Status CatalogManager::SelectReplicasForTablet(
   VLOG_WITH_FUNC(3) << "Committed consensus state: " << AsString(cstate);
   consensus::RaftConfigPB* config = cstate->mutable_config();
 
+  LOG(INFO) << "repl info for tablet " << tablet->tablet_id() << " : " << replication_info.DebugString();
   RETURN_NOT_OK(HandlePlacementUsingReplicationInfo(
       replication_info, ts_descs, config, per_table_state, global_state));
 

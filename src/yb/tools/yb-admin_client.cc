@@ -202,6 +202,7 @@ namespace {
 static constexpr const char* kRpcHostPortHeading = "RPC Host/Port";
 static constexpr const char* kBroadcastHeading = "Broadcast Host/Port";
 static constexpr const char* kTableIDPrefix = "tableid";
+static const std::string kWildcardPlacement = "*";
 
 string FormatFirstHostPort(
     const RepeatedPtrField<HostPortPB>& rpc_addresses) {
@@ -2099,15 +2100,36 @@ Status ClusterAdminClient::FillPlacementInfo(
     std::vector<std::string> blocks = strings::Split(placement_block, ".",
                                                     strings::AllowEmpty());
     auto* pb = placement_info_pb->add_placement_blocks();
-    if (blocks.size() > 0 && !blocks[0].empty()) {
+
+    if (blocks.size() == 0) {
+      LOG(INFO) << "Did you mean to set the placement to any node? "
+      << " If so, set the cloud, region and zone to the special value '*' instead of leaving it empty. "
+      << "Support for the empty cloud/region/zone syntax in yb-admin will be deprecated soon.";
+    }
+
+
+    if (blocks.size() > 0 && !blocks[0].empty() && blocks[0] != kWildcardPlacement) {
       pb->mutable_cloud_info()->set_placement_cloud(blocks[0]);
     }
 
-    if (blocks.size() > 1 && !blocks[1].empty()) {
+    if (blocks.size() == 1) {
+      LOG(INFO) << "Did you mean to set the placement to any region in the cloud? "
+      << " If so, set the region to the special value '*' instead of leaving it empty. "
+      << "Support for the empty cloud/region/zone syntax in yb-admin will be deprecated soon.";
+    }
+
+
+    if (blocks.size() > 1 && !blocks[1].empty() && blocks[1] != kWildcardPlacement) {
       pb->mutable_cloud_info()->set_placement_region(blocks[1]);
     }
 
-    if (blocks.size() > 2 && !blocks[2].empty()) {
+    if (blocks.size() == 2) {
+      LOG(INFO) << "Did you mean to set the placement to any zone in the region? "
+      << " If so, set the zone to the special value '*' instead of leaving it empty. "
+      << "Support for the empty zone syntax in yb-admin will be deprecated soon.";
+    }
+
+    if (blocks.size() > 2 && !blocks[2].empty() && blocks[2] != kWildcardPlacement) {
       pb->mutable_cloud_info()->set_placement_zone(blocks[2]);
     }
 

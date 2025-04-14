@@ -281,10 +281,8 @@ get_tablespace_distance(Oid spcid)
 		tsp_region =
 			text_to_cstring(json_get_denormalized_value(json_element,
 														regionKey));
-		text *zone_txt = json_get_denormalized_value(json_element, zoneKey);
-		if (zone_txt)
-			tsp_zone = text_to_cstring(zone_txt);
-
+		tsp_zone = 
+			text_to_cstring(json_get_denormalized_value(json_element, zoneKey));
 
 		/* are the current cloud and the given cloud the same */
 		if (strcmp(tsp_cloud, current_cloud) == 0)
@@ -293,9 +291,10 @@ get_tablespace_distance(Oid spcid)
 			if (strcmp(tsp_region, current_region) == 0)
 			{
 				/* are the current cloud and the given zone the same */
-				/* If the table placement does not include a zone, we assume only
-				   regional distance because the actual zone can change over time */
-				if (tsp_zone != NULL && strcmp(tsp_zone, current_zone) == 0)
+				/* the zone may be set to '*' allowing placement in any zone */
+				/* in this case, it will be treated as region local because the */
+				/* actual zone may change over time. */
+				if (strcmp(tsp_zone, current_zone) == 0)
 				{
 					current_dist = ZONE_LOCAL;
 				}
