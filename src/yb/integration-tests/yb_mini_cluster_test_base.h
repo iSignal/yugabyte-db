@@ -64,6 +64,8 @@ class MiniClusterTestWithClient : public YBMiniClusterTestBase<T> {
  protected:
   virtual Status CreateClient();
 
+  Result<std::string> RunYbAdminCommand(const std::string& cmd);
+
   // Creates the client only if it has not been created before.
   virtual Status EnsureClientCreated();
 

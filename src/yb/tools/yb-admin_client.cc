@@ -2099,38 +2099,36 @@ Status ClusterAdminClient::FillPlacementInfo(
   for (auto& [placement_block, min_replicas] : placement_to_min_replicas) {
     std::vector<std::string> blocks = strings::Split(placement_block, ".",
                                                     strings::AllowEmpty());
+    // a.b.c:3,...
+    // a:3,...
+    //     ideally needs to be a.*.*:3,....
+    // :3, - is this allowed
     auto* pb = placement_info_pb->add_placement_blocks();
 
-    if (blocks.size() == 0) {
-      LOG(INFO) << "Did you mean to set the placement to any node? "
-      << " If so, set the cloud, region and zone to the special value '*' instead of leaving it empty. "
-      << "Support for the empty cloud/region/zone syntax in yb-admin will be deprecated soon.";
+    constexpr auto kDeprecationWarning = "Use * instead of omitting cloud/region/zone";
+  
+    LOG_IF(WARNING, blocks.size() < 3) << kDeprecationWarning;
+
+    if (blocks.size() > 0 && blocks[0] != kWildcardPlacement) {
+      LOG_IF(WARNING, blocks[0].empty()) << kDeprecationWarning;
+      if (!blocks[0].empty()) {
+        pb->mutable_cloud_info()->set_placement_cloud(blocks[0]);
+      }
     }
 
 
-    if (blocks.size() > 0 && !blocks[0].empty() && blocks[0] != kWildcardPlacement) {
-      pb->mutable_cloud_info()->set_placement_cloud(blocks[0]);
+    if (blocks.size() > 1 && blocks[1] != kWildcardPlacement) {
+      LOG_IF(WARNING, blocks[1].empty()) << kDeprecationWarning;
+      if (!blocks[1].empty()) {
+        pb->mutable_cloud_info()->set_placement_region(blocks[1]);
+      }
     }
 
-    if (blocks.size() == 1) {
-      LOG(INFO) << "Did you mean to set the placement to any region in the cloud? "
-      << " If so, set the region to the special value '*' instead of leaving it empty. "
-      << "Support for the empty cloud/region/zone syntax in yb-admin will be deprecated soon.";
-    }
-
-
-    if (blocks.size() > 1 && !blocks[1].empty() && blocks[1] != kWildcardPlacement) {
-      pb->mutable_cloud_info()->set_placement_region(blocks[1]);
-    }
-
-    if (blocks.size() == 2) {
-      LOG(INFO) << "Did you mean to set the placement to any zone in the region? "
-      << " If so, set the zone to the special value '*' instead of leaving it empty. "
-      << "Support for the empty zone syntax in yb-admin will be deprecated soon.";
-    }
-
-    if (blocks.size() > 2 && !blocks[2].empty() && blocks[2] != kWildcardPlacement) {
-      pb->mutable_cloud_info()->set_placement_zone(blocks[2]);
+    if (blocks.size() > 2 && blocks[2] != kWildcardPlacement) {
+      LOG_IF(WARNING, blocks[2].empty()) << kDeprecationWarning;
+      if (!blocks[2].empty()) {
+        pb->mutable_cloud_info()->set_placement_zone(blocks[2]);
+      }
     }
 
     pb->set_min_num_replicas(min_replicas);

@@ -106,6 +106,30 @@ TEST(TablespaceParserTest, TestTablespaceJsonProcessing) {
   options.emplace_back(invalid_json_option);
   ASSERT_NOK(TablespaceParser::FromQLValue(options));
 
+  // 8.1 Missing keys in placement blocks.
+  options.clear();
+  invalid_json_option =
+      "replica_placement={\"num_replicas\":1,\"placement_blocks\":"
+      "[{\"cloud\":\"c1\",\"region\":\"r1\",\"min_num_replicas\":1}]}";
+  options.emplace_back(invalid_json_option);
+  ASSERT_NOK(TablespaceParser::FromQLValue(options));
+
+  // 8.2 Missing keys in placement blocks.
+  options.clear();
+  invalid_json_option =
+      "replica_placement={\"num_replicas\":1,\"placement_blocks\":"
+      "[{\"cloud\":\"c1\",\"zone\":\"z1\",\"min_num_replicas\":1}]}";
+  options.emplace_back(invalid_json_option);
+  ASSERT_NOK(TablespaceParser::FromQLValue(options));
+
+  // 8.3 Missing keys in placement blocks.
+  options.clear();
+  invalid_json_option =
+      "replica_placement={\"num_replicas\":1,\"placement_blocks\":"
+      "[{\"region\":\"r1\",\"zone\":\"z1\",\"min_num_replicas\":1}]}";
+  options.emplace_back(invalid_json_option);
+  ASSERT_NOK(TablespaceParser::FromQLValue(options));
+
   // 9. Invalid format for "min_num_replicas".
   options.clear();
   invalid_json_option =
@@ -142,6 +166,30 @@ TEST(TablespaceParserTest, TestTablespaceJsonProcessing) {
     ASSERT_EQ(placement_block.cloud_info().placement_zone(), "z2");
     ASSERT_EQ(placement_block.min_num_replicas(), 1);
   }
+
+  // Wildcards have to be specified at all levels that follow
+  options.clear();
+  invalid_json_option =
+      "replica_placement={\"num_replicas\":1,\"placement_blocks\":"
+      "[{\"cloud\":\"*\",\"min_num_replicas\":1}]}";
+  options.emplace_back(invalid_json_option);
+  ASSERT_NOK(TablespaceParser::FromQLValue(options));
+
+  // Wildcards have to be specified at all levels that follow
+  options.clear();
+  invalid_json_option =
+      "replica_placement={\"num_replicas\":1,\"placement_blocks\":"
+      "[{\"cloud\":\"cloud1\",\"region\":\"*\",\"min_num_replicas\":1}]}";
+  options.emplace_back(invalid_json_option);
+  ASSERT_NOK(TablespaceParser::FromQLValue(options));
+
+  // Wildcards have to be specified at all levels that follow
+  options.clear();
+  invalid_json_option =
+      "replica_placement={\"num_replicas\":1,\"placement_blocks\":"
+      "[{\"cloud\":\"cloud1\",\"region\":\"*\",\"zone\":\"*\",\"min_num_replicas\":1}]}";
+  options.emplace_back(invalid_json_option);
+  ASSERT_OK(TablespaceParser::FromQLValue(options));
 }
 
 // Test the tablespace preferred zone info parsing.

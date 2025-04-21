@@ -265,8 +265,9 @@ class PgTablespacesTest : public GeoTransactionsTestBase {
     VerifyMinNumReplicas(kTablePrefix + "_mv", placement_blocks);
   }
 
-
-  void createWildcardTablespace(const std::string& ts_name, WildCardTestOption wildcard_opt, int num_replicas, std::vector<PlacementBlock>* placement_blocks) {
+  void generatePlacementBlocks(
+      WildCardTestOption wildcard_opt, int num_replicas,
+      std::vector<PlacementBlock>* placement_blocks) {
     placement_blocks->clear();
     switch (wildcard_opt) {
       case WildCardTestOption::kCloud:
@@ -283,15 +284,32 @@ class PgTablespacesTest : public GeoTransactionsTestBase {
           placement_blocks->push_back(PlacementBlock("cloud0", "rack2", "*", 1)); 
         break;
     };
-
+  }
+  void createWildcardTablespace(
+      const std::string& ts_name, WildCardTestOption wildcard_opt, int num_replicas,
+      std::vector<PlacementBlock>* placement_blocks) {
     Tablespace tablespace(ts_name, num_replicas, *placement_blocks);
 
     auto conn = ASSERT_RESULT(Connect());
     ASSERT_OK(conn.Execute(tablespace.getCreateCmd()));
-
   }
 
-  void testWildcardPlacement(WildCardTestOption wildcard_opt) {
+  std::string getWildcardPlacementConfig(
+      const std::vector<PlacementBlock>& placement_blocks, int rf) {
+    std::stringstream ss;
+    ss << "modify_placement_info '";
+    for (size_t i = 0; i < placement_blocks.size(); ++i) {
+      ss << placement_blocks[i].cloud << "." << placement_blocks[i].region << "."
+         << placement_blocks[i].zone << ":" << placement_blocks[i].minNumReplicas;
+      if (i < placement_blocks.size() - 1) {
+        ss << ",";
+      }
+    }
+    ss << "' " << rf;
+    return ss.str();
+  }
+
+  void testWildcardPlacement(bool use_yb_admin, WildCardTestOption wildcard_opt) {
     // minicluster creates tservers with 
     // (cloud0, rack1, zone), 
     // (cloud0, rack2, zone), 
@@ -311,21 +329,49 @@ class PgTablespacesTest : public GeoTransactionsTestBase {
     static constexpr auto kTablespace2 = "ts2";
 
     std::vector<PlacementBlock> placement_blocks;
-    createWildcardTablespace(kTablespace1, wildcard_opt, 2, &placement_blocks);
+    int num_replicas = 2;
+    generatePlacementBlocks(wildcard_opt, num_replicas, &placement_blocks);
+    if (!use_yb_admin) {
+      Tablespace tablespace(kTablespace1, num_replicas, placement_blocks);
+      auto conn = ASSERT_RESULT(Connect());
+      ASSERT_OK(conn.Execute(tablespace.getCreateCmd()));
+    } else {
+      auto output = ASSERT_RESULT(
+          RunYbAdminCommand(getWildcardPlacementConfig(placement_blocks, num_replicas)));
+      LOG(INFO) << "modify_placement_info command output: " << output;
+    }
     auto conn = ASSERT_RESULT(Connect());
     ASSERT_OK(conn.ExecuteFormat(
-      "CREATE TABLE $0 (k INT) TABLESPACE $1", kTableName, kTablespace1));
+        "CREATE TABLE $0 (k INT PRIMARY KEY) $1 $2", kTableName,
+        (use_yb_admin ? "" : "TABLESPACE "), (use_yb_admin ? "" : kTablespace1)));
 
     VerifyMinNumReplicas(kTableName, placement_blocks);
 
-    placement_blocks.clear();
-    createWildcardTablespace(kTablespace2, wildcard_opt, 2, &placement_blocks);
-    ASSERT_OK(conn.ExecuteFormat(
-      "ALTER TABLE $0 SET TABLESPACE $1", kTableName, kTablespace2));
+    ASSERT_OK(conn.ExecuteFormat("INSERT INTO TABLE $0 VALUES (1)", kTableName));
+    auto rows = ASSERT_RESULT(
+        conn.FetchRows<int32_t>(yb::Format("SELECT k FROM TABLE $0 ORDER BY k", kTableName)));
+    ASSERT_EQ(rows, std::vector({1}));
 
+    num_replicas = 3;
+    generatePlacementBlocks(wildcard_opt, num_replicas, &placement_blocks);
+    if (!use_yb_admin) {
+      Tablespace tablespace(kTablespace2, num_replicas, placement_blocks);
+      auto conn = ASSERT_RESULT(Connect());
+      ASSERT_OK(conn.Execute(tablespace.getCreateCmd()));
+      ASSERT_OK(conn.ExecuteFormat("ALTER TABLE $0 SET TABLESPACE $1", kTableName, kTablespace2));
+    } else {
+      auto output = ASSERT_RESULT(
+          RunYbAdminCommand(getWildcardPlacementConfig(placement_blocks, num_replicas)));
+      LOG(INFO) << "modify_placement_info command output: " << output;
+    }
     WaitForLoadBalanceCompletion();
 
     VerifyMinNumReplicas(kTableName, placement_blocks);
+
+    ASSERT_OK(conn.ExecuteFormat("INSERT INTO TABLE $0 VALUES (2)", kTableName));
+    rows = ASSERT_RESULT(
+        conn.FetchRows<int32_t>(yb::Format("SELECT k FROM TABLE $0 ORDER BY k", kTableName)));
+    ASSERT_EQ(rows, std::vector({1, 2}));
   }
 };
 
@@ -550,21 +596,22 @@ TEST_F(PgTablespacesTest, TombstonedTabletInYbLocalTablets) {
   ASSERT_STR_EQ(new_tablet_state, "TABLET_DATA_TOMBSTONED");
 }
 
-
-TEST_F(PgTablespacesTest, TestWildcardCloud) {
-
-  testWildcardPlacement(WildCardTestOption::kCloud);
-
+TEST_F(PgTablespacesTest, TestWildcardCloudTablespace) {
+  testWildcardPlacement(false, WildCardTestOption::kCloud);
 }
 
-TEST_F(PgTablespacesTest, TestWildcardRegion) {
-
-  testWildcardPlacement(WildCardTestOption::kRegion);
-
+TEST_F(PgTablespacesTest, TestWildcardRegionTablespace) {
+  testWildcardPlacement(false, WildCardTestOption::kRegion);
 }
-TEST_F(PgTablespacesTest, TestWildcardZone) {
 
-  testWildcardPlacement(WildCardTestOption::kZone);
+TEST_F(PgTablespacesTest, TestWildcardZoneYbAdmin) {
+  testWildcardPlacement(true, WildCardTestOption::kZone);
+}
+
+// test some invalid tablespace configs too
+
+TEST_F(PgTablespacesTest, TestWildcardZoneTablespace) {
+  testWildcardPlacement(false, WildCardTestOption::kZone);
 
   // auto options = EXPECT_RESULT(tserver::TabletServerOptions::CreateTabletServerOptions());
   // options.SetPlacement("cloud0", "rack1", "zone1");
@@ -588,8 +635,6 @@ TEST_F(PgTablespacesTest, TestWildcardZone) {
 
   //   VerifyMinNumReplicas(kTableName, placement_blocks);
 }
-
-
 
 } // namespace client
 } // namespace yb

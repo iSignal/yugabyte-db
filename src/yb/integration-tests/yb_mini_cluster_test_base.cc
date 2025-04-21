@@ -21,6 +21,7 @@
 #include "yb/integration-tests/mini_cluster.h"
 
 #include "yb/util/result.h"
+#include "yb/util/os-util.h"
 
 using namespace std::literals;
 
@@ -133,6 +134,17 @@ template <class T>
 client::YBSessionPtr MiniClusterTestWithClient<T>::NewSession() {
   auto session = client_->NewSession(60s);
   return session;
+}
+
+template <class T>
+Result<std::string> MiniClusterTestWithClient<T>::RunYbAdminCommand(
+  const std::string& cmd) {
+  const auto yb_admin = "yb-admin"s;
+  auto command = GetToolPath(yb_admin) +
+    " --master_addresses " + YBMiniClusterTestBase<T>::cluster_->GetMasterAddresses() +
+    " " + cmd;
+  LOG(INFO) << "Running " << command;
+  return RunShellProcess(command);
 }
 
 // Instantiate explicitly to avoid recompilation of a lot of dependent test classes due to template
