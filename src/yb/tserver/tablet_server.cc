@@ -1309,7 +1309,7 @@ void TabletServer::ResetCatalogVersionsFingerprint() {
 }
 
 void TabletServer::SetYsqlDBCatalogInvalMessages(
-  const master::DBCatalogInvalMessagesDataPB& db_catalog_inval_messages_data) {
+  const tserver::DBCatalogInvalMessagesDataPB& db_catalog_inval_messages_data) {
   if (db_catalog_inval_messages_data.db_catalog_inval_messages_size() == 0) {
     return;
   }

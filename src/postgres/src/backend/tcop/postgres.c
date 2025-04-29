@@ -4346,7 +4346,7 @@ YBRefreshCache()
 	finish_xact_command();
 }
 
-static void
+void
 YBRefreshCacheWrapper(uint64_t catalog_master_version)
 {
 	uint64_t shared_catalog_version = YbGetSharedCatalogVersion();

@@ -259,8 +259,8 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   void SetYsqlDBCatalogVersions(const tserver::DBCatalogVersionDataPB& db_catalog_version_data)
       EXCLUDES(lock_) override;
   void SetYsqlDBCatalogInvalMessages(
-      const master::DBCatalogInvalMessagesDataPB& db_catalog_inval_messages_data)
-      EXCLUDES(lock_);
+      const tserver::DBCatalogInvalMessagesDataPB& db_catalog_inval_messages_data)
+      EXCLUDES(lock_) override;
   void ResetCatalogVersionsFingerprint() EXCLUDES(lock_);
 
   uint32_t get_oid_cache_invalidations_count() const override {

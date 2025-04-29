@@ -26,6 +26,7 @@
 
 using namespace std::literals;
 DECLARE_bool(dump_lock_keys);
+DECLARE_bool(ysql_yb_enable_invalidation_messages);
 
 namespace yb::tserver {
 
@@ -142,6 +143,10 @@ class TSLocalLockManager::Impl {
     if (req.has_db_catalog_version_data()) {
       server_->SetYsqlDBCatalogVersions(req.db_catalog_version_data());
     }
+    if (FLAGS_ysql_yb_enable_invalidation_messages && req.has_db_catalog_inval_messages_data()) {
+        server_->SetYsqlDBCatalogInvalMessages(req.db_catalog_inval_messages_data());
+    }
+
     object_lock_manager_.Unlock(object_lock_owner);
     return Status::OK();
   }

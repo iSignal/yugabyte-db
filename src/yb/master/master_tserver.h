@@ -120,6 +120,9 @@ class MasterTabletServer : public tserver::TabletServerIf,
 
   void SetYsqlDBCatalogVersions(
       const tserver::DBCatalogVersionDataPB& db_catalog_version_data) override {}
+  
+  void SetYsqlDBCatalogVersions(
+        const tserver::DBCatalogVersionDataPB& db_catalog_version_data) override {}
 
   Result<tserver::GetYSQLLeaseInfoResponsePB> GetYSQLLeaseInfo() const override;
 

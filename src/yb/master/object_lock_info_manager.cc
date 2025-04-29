@@ -707,6 +707,21 @@ void ObjectLockInfoManager::Impl::PopulateDbCatalogVersionCache(ReleaseObjectLoc
     catalog_version_pb->set_current_version(it.second.current_version);
     catalog_version_pb->set_last_breaking_version(it.second.last_breaking_version);
   }
+  Result<DbOidVersionToMessageListMap> inval_messages = catalog_manager_->GetYsqlCatalogInvalationMessages(false/*use_cache*/);
+  if (!inval_messages.ok()) {
+    LOG(WARNING) << "Couldn't populate inval messages " << s;
+    return;
+  }
+  auto* const mutable_messages_data = req.mutable_db_catalog_inval_messages_data();
+  for (auto& [db_oid_version, message_list] : *inval_messages) {
+    auto* const db_inval_messages = mutable_messages_data->add_db_catalog_inval_messages();
+    db_inval_messages->set_db_oid(db_oid_version.first);
+    db_inval_messages->set_current_version(db_oid_version.second);
+    if (message_list.has_value()) {
+      db_inval_messages->set_message_list(std::move(*message_list));
+    }
+  }
+
 }
 
 void ObjectLockInfoManager::Impl::UnlockObject(

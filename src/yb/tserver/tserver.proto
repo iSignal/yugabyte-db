@@ -444,6 +444,22 @@ message DBCatalogVersionDataPB {
   repeated YsqlCatalogVersionPB db_catalog_versions = 1;
 }
 
+// This matches a row in pg_yb_invalidation_messages table, which has a composite primary
+// key of (db_oid, current_version). For each pair of (db_oid, current_version), there is
+// a list of invalidation messages. The table pg_yb_invalidation_messages also has a message
+// time column that is used to delete old messages from pg_yb_invalidation_messages, but it is
+// not needed by tserver so it is skipped here.
+message YsqlCatalogInvalMessagesPB {
+  optional uint32 db_oid = 1;
+  optional uint64 current_version = 2;
+  // Serialized/encoded message list related to PG catalog cache invalidation.
+  optional bytes message_list = 3;
+}
+
+message DBCatalogInvalMessagesDataPB {
+  repeated YsqlCatalogInvalMessagesPB db_catalog_inval_messages = 1;
+}
+
 message ReleaseObjectLockRequestPB {
   optional bytes txn_id = 1;
   // When set, only locks owned by the given subtxn id are released. If unset, releases
@@ -462,6 +478,7 @@ message ReleaseObjectLockRequestPB {
   optional fixed64 propagated_hybrid_time = 6;
 
   optional DBCatalogVersionDataPB db_catalog_version_data = 7;
+  optional DBCatalogInvalMessagesDataPB db_catalog_inval_messages_data = 8;
 }
 
 message ReleaseObjectLockResponsePB {

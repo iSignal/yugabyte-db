@@ -137,6 +137,7 @@ LockRelationOid(Oid relid, LOCKMODE lockmode)
 	 */
 	if (res != LOCKACQUIRE_ALREADY_CLEAR)
 	{
+		YBRefreshCacheWrapper(YbGetSharedCatalogVersion());
 		AcceptInvalidationMessages();
 		MarkLockClear(locallock);
 	}
