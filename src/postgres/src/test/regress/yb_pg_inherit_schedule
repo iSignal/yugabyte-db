@@ -6,3 +6,4 @@
 
 test: yb.port.test_setup
 test: yb.port.inherit
+test: yb.orig.inherit
