@@ -414,15 +414,13 @@ INSERT INTO ucchild values(100, 'hundred');
 SELECT * FROM uctest;
 
 BEGIN;
--- Disable 'FOR UPDATE' due to github #9915
--- DECLARE c1 CURSOR FOR SELECT * FROM uctest FOR UPDATE;
-DECLARE c1 CURSOR FOR SELECT * FROM uctest;
+DECLARE c1 CURSOR FOR SELECT * FROM uctest FOR UPDATE;
 FETCH 1 FROM c1;
-UPDATE uctest SET f1 = f1 + 10 WHERE CURRENT OF c1;
+-- UPDATE uctest SET f1 = f1 + 10 WHERE CURRENT OF c1; -- YB: CURRENT OF is not supported #737
 FETCH 1 FROM c1;
-UPDATE uctest SET f1 = f1 + 10 WHERE CURRENT OF c1;
+-- UPDATE uctest SET f1 = f1 + 10 WHERE CURRENT OF c1; -- YB: CURRENT OF is not supported #737
 FETCH 1 FROM c1;
-UPDATE uctest SET f1 = f1 + 10 WHERE CURRENT OF c1;
+-- UPDATE uctest SET f1 = f1 + 10 WHERE CURRENT OF c1; -- YB: CURRENT OF is not supported #737
 FETCH 1 FROM c1;
 COMMIT;
 SELECT * FROM uctest;
@@ -509,15 +507,17 @@ INSERT INTO current_check_2 SELECT i, 'P' || i FROM generate_series(10,19) i;
 
 DECLARE c1 SCROLL CURSOR FOR SELECT * FROM current_check;
 
+/* YB: FETCH ABSOLUTE, DELETE .. WHERE CURRENT OF not supported #737 #6514
 -- This tests the fetch-backwards code path
--- FETCH ABSOLUTE 12 FROM c1;
--- FETCH ABSOLUTE 8 FROM c1;
+FETCH ABSOLUTE 12 FROM c1;
+FETCH ABSOLUTE 8 FROM c1;
 DELETE FROM current_check WHERE CURRENT OF c1 RETURNING *;
 
 -- This tests the ExecutorRewind code path
--- FETCH ABSOLUTE 13 FROM c1;
--- FETCH ABSOLUTE 1 FROM c1;
+FETCH ABSOLUTE 13 FROM c1;
+FETCH ABSOLUTE 1 FROM c1;
 DELETE FROM current_check WHERE CURRENT OF c1 RETURNING *;
+*/ -- YB
 
 SELECT * FROM current_check;
 ROLLBACK;
