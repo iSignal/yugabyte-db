@@ -519,7 +519,7 @@ FETCH ABSOLUTE 1 FROM c1;
 DELETE FROM current_check WHERE CURRENT OF c1 RETURNING *;
 */ -- YB
 
-SELECT * FROM current_check;
+SELECT * FROM current_check ORDER BY currentid; -- YB: make order match PG results
 ROLLBACK;
 
 -- Make sure snapshot management works okay, per bug report in

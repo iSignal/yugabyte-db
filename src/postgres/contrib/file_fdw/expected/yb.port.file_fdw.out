@@ -326,7 +326,7 @@ ERROR:  cannot update foreign table "agg_csv"
 DELETE FROM agg WHERE a = 100;
 ERROR:  cannot delete from foreign table "agg_csv"
 -- but this should be allowed
--- SELECT tableoid::regclass, * FROM agg FOR UPDATE;  -- YB: triggers a crash #27105
+--SELECT tableoid::regclass, * FROM agg FOR UPDATE;  -- YB: triggers a crash #27105
 ALTER FOREIGN TABLE agg_csv NO INHERIT agg;
 DROP TABLE agg;
 -- declarative partitioning tests
