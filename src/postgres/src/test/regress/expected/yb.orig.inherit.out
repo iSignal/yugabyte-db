@@ -11,8 +11,8 @@ ALTER TABLE parent ADD CONSTRAINT parent_uniq_c1 UNIQUE(c1);
  id     | integer |           | not null |         | plain   |              | 
  c1     | integer |           |          |         | plain   |              | 
 Indexes:
-    "parent_pkey" PRIMARY KEY, lsm (id HASH)
-    "parent_uniq_c1" UNIQUE CONSTRAINT, lsm (c1 HASH)
+    "parent_pkey" PRIMARY KEY, lsm (id ASC)
+    "parent_uniq_c1" UNIQUE CONSTRAINT, lsm (c1 ASC)
 Child tables: child
 
 \d+ child
@@ -35,7 +35,7 @@ HINT:  See https://github.com/yugabyte/yugabyte-db/issues/19860. Set 'ysql_suppr
  id     | integer |           | not null |         | plain   |              | 
  c1     | integer |           |          |         | plain   |              | 
 Indexes:
-    "parent_uniq_c1" UNIQUE CONSTRAINT, lsm (c1 HASH)
+    "parent_uniq_c1" UNIQUE CONSTRAINT, lsm (c1 ASC)
 Child tables: child
 
 \d+ child
