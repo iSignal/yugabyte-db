@@ -207,7 +207,7 @@ SELECT tableoid::regclass, * FROM ONLY agg;
 UPDATE agg SET a = 1;
 DELETE FROM agg WHERE a = 100;
 -- but this should be allowed
--- SELECT tableoid::regclass, * FROM agg FOR UPDATE;  -- YB: triggers a crash #27105
+--SELECT tableoid::regclass, * FROM agg FOR UPDATE;  -- YB: triggers a crash #27105
 ALTER FOREIGN TABLE agg_csv NO INHERIT agg;
 DROP TABLE agg;
 
