@@ -388,3 +388,15 @@ CREATE OR REPLACE VIEW pg_stat_statements AS
   SELECT * FROM pg_stat_statements(true);
 
 GRANT SELECT ON pg_stat_statements TO PUBLIC;
+
+/***
+
+create table yb_stat_tmp(
+userid oid, dbid oid, queryid bigint, query text, plans bigint, total_plan_time double precision, calls bigint, max_exec_time double precision, 
+server_uuid uuid);
+
+create table yb_stat_statements(
+userid oid, dbid oid, queryid bigint, query text, plans bigint, total_plan_time double precision, calls bigint, max_exec_time double precision);
+
+
+*/

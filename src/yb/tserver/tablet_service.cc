@@ -3681,14 +3681,17 @@ void TabletServiceImpl::AdminExecutePgsql(
     const auto& deadline = context.GetClientDeadline();
     auto pg_conn = VERIFY_RESULT(server->CreateInternalPGConn(req->database_name(), deadline));
     for (const auto& stmt : req->pgsql_statements()) {
+      LOG(INFO) << "about to execute " << stmt;
       SCHECK_LT(
           CoarseMonoClock::Now(), deadline, TimedOut, "Timed out while executing Ysql statements");
       RETURN_NOT_OK(pg_conn.Execute(stmt));
+      LOG(INFO) << "done executing " << stmt;
     }
     return Status::OK();
   };
 
   auto status = execute_pg_sql();
+  LOG(INFO) << "execute returned status " << status.ToString();
   if (!status.ok()) {
     SetupErrorAndRespond(resp->mutable_error(), status, &context);
   } else {
