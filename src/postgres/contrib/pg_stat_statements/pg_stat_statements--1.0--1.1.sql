@@ -40,34 +40,3 @@ CREATE VIEW pg_stat_statements AS
   SELECT * FROM pg_stat_statements();
 
 GRANT SELECT ON pg_stat_statements TO PUBLIC;
-
-/***
-
-CREATE TABLE yb_stat_statements(
-    userid oid,
-    dbid oid,
-    queryid bigint,
-    query text,
-    calls int8,
-    total_time float8,
-    min_time float8,
-    max_time float8,
-    mean_time float8,
-    stddev_time float8,
-    rows int8,
-    shared_blks_hit int8,
-    shared_blks_read int8,
-    shared_blks_dirtied int8,
-    shared_blks_written int8,
-    local_blks_hit int8,
-    local_blks_read int8,
-    local_blks_dirtied int8,
-    local_blks_written int8,
-    temp_blks_read int8,
-    temp_blks_written int8,
-    blk_read_time float8,
-    blk_write_time float8,
-    yb_latency_histogram jsonb
-);
-
-**/

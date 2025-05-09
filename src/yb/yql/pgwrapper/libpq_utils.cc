@@ -434,7 +434,7 @@ void PGConn::Reset() {
 }
 
 Status PGConn::Execute(const std::string& command, bool show_query_in_error) {
-  LOG(INFO) << __func__ << " " << command;
+  VLOG(1) << __func__ << " " << command;
   PGResultPtr res(PQexec(impl_.get(), command.c_str()));
   auto status = PQresultStatus(res.get());
   if (ExecStatusType::PGRES_COMMAND_OK != status) {
@@ -444,7 +444,6 @@ Status PGConn::Execute(const std::string& command, bool show_query_in_error) {
                            show_query_in_error ? Format(" of '$0'", command) : "");
     }
     auto msg = GetPQErrorMessage(res.get());
-    LOG(INFO) << "error " << msg << " status " << status;
     return STATUS(NetworkError,
                   Format("Execute$0 failed: $1, message: $2",
                          show_query_in_error ? Format(" of '$0'", command) : "",
