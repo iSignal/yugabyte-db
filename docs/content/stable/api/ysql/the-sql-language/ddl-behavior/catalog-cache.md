@@ -14,10 +14,10 @@ There is a tradeoff between the latency of loading these entries from a remote y
 ### Scenarios
 
 1. **Initial queries on a new connection are slow.** The effect on slow initial queries during cache warmup may be particularly significant on multi-region clusters (where the master leader is far away from the postgres backend) or when the client does not have a steady pool of connections that are being reused.   
-   1. To confirm that catalog caching is the cause of this, see the section [Confirming that catalog cache misses are a root cause of latency / load](#confirming-that-catalog-cache-misses-are-a-root-cause-of-latency-/-load)  
+   1. To confirm that catalog caching is the cause of this, see the section [Confirming that catalog cache misses are a root cause of latency](#confirming-that-catalog-cache-misses-are-a-root-cause-of-latency)  
    2. See [Connection pooling](#connection-pooling) and [Preload additional system tables](#preload-additional-system-tables) for possible solutions.  
 2. **High CPU load on yb-master leader**. If the client does not have a steady pool of connections, the resulting connection churn may cause load on the yb-master leader as these caches are warmed up repeatedly on each new postgres connection.  
-   1. To confirm that catalog caching is the cause of this, see the section [Confirming that catalog cache misses are a root cause of latency / load](#confirming-that-catalog-cache-misses-are-a-root-cause-of-latency-/-load).  
+   1. To confirm that catalog caching is the cause of this, see the section [Confirming that catalog cache misses are a root cause of latency](#confirming-that-catalog-cache-misses-are-a-root-cause-of-latency).  
    2. See [Connection pooling](#connection-pooling), [Tserver response cache](#tserver-response-cache) and [Preload additional system tables](#preload-additional-system-tables) for possible solutions.  
 3. On the flip side, preloading of caches after a DDL change may cause **memory spikes on postgres backends or out of memory (OOM) events**.   
    1. To confirm that catalog caching is the cause of this, correlate the time when DDLs were run ([Write RPCs on yb-master](../../../../launch-and-manage/monitor-and-alert/metrics/ybmaster/#:~:text=handler_latency_yb_tserver_TabletServerService_Write)) to the time of the OOM event or a spike in [postgres RSS metrics](../../../../preview/yugabyte-platform/alerts-monitoring/anywhere-metrics/#per-process).  
@@ -34,7 +34,7 @@ There is a tradeoff between the latency of loading these entries from a remote y
 
 ## Using the knobs 
 
-### Confirming that catalog cache misses are a root cause of latency / load {#confirming-that-catalog-cache-misses-are-a-root-cause-of-latency-/-load}
+### Confirming that catalog cache misses are a root cause of latency
 
 To confirm that catalog cache misses are a cause, use these techniques
 
@@ -44,14 +44,14 @@ To confirm that catalog cache misses are a cause, use these techniques
 4. [Manually collect logs](#manually-collecting-logs-for-catalog-reads).
 
 
-### Identify the specific tables to be preloaded {#identify-the-specific-tables-to-be-preloaded}
+### Identify the specific tables to be preloaded
 
 From the [Catalog Cache Misses](../../../../yugabyte-platform/alerts-monitoring/anywhere-metrics/#ysql-ops-and-latency:~:text=on%20other%20metrics.-,Catalog%20Cache%20Misses,-During%20YSQL%20query) metrics dashboard, identify the Postgres catalog table names that are causing the highest misses. You can do this manually or by using the “Outlier Tables” view on the dashboard. Once the top N catalog tables are identified, add them one by one to the gflag until the first conn latency is acceptable to the gflag `--ysql_catalog_preload_additional_table_list`. It might be sufficient to just set `--ysql_catalog_preload_additional_tables=true` [as appropriate](#key-knobs). 
 
 If there are still a significant number of misses to these tables after preloading them, [manually collect logs](#manually-collecting-logs-for-catalog-reads) and share them to Yugabyte Support.
 
 
-### Manually collecting logs for catalog reads {#manually-collecting-logs-for-catalog-reads}
+### Manually collecting logs for catalog reads
 
 If the catalog reads can be traced to a specific query, set the following GUCs and run [EXPLAIN (ANALYZE, DIST) \<query\>](../../../../explore/query-1-performance/explain-analyze/#:~:text=Distributed%20Storage%20Counters)
 
