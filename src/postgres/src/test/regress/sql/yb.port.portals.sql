@@ -359,8 +359,7 @@ SELECT * FROM uctest;
 
 -- Check UPDATE WHERE CURRENT; this time use FOR UPDATE
 BEGIN;
--- Disable 'FOR UPDATE' due to github #9915
--- DECLARE c1 CURSOR FOR SELECT * FROM uctest FOR UPDATE;
+-- DECLARE c1 CURSOR FOR SELECT * FROM uctest FOR UPDATE; -- YB: Disable 'FOR UPDATE' due to github #27149
 DECLARE c1 CURSOR FOR SELECT * FROM uctest;
 FETCH c1;
 UPDATE uctest SET f1 = 8 WHERE CURRENT OF c1;
@@ -389,8 +388,7 @@ ROLLBACK;
 SELECT * FROM uctest;
 
 BEGIN;
--- Disable 'FOR UPDATE' due to github #9915
--- DECLARE c1 CURSOR FOR SELECT * FROM uctest FOR UPDATE;
+-- DECLARE c1 CURSOR FOR SELECT * FROM uctest FOR UPDATE; -- YB: Disable 'FOR UPDATE' due to github #27149
 DECLARE c1 CURSOR FOR SELECT * FROM uctest;
 FETCH c1;
 UPDATE uctest SET f1 = f1 + 10 WHERE CURRENT OF c1;
@@ -414,7 +412,8 @@ INSERT INTO ucchild values(100, 'hundred');
 SELECT * FROM uctest;
 
 BEGIN;
-DECLARE c1 CURSOR FOR SELECT * FROM uctest FOR UPDATE;
+-- DECLARE c1 CURSOR FOR SELECT * FROM uctest FOR UPDATE; -- YB: Disable 'FOR UPDATE' due to #27149
+DECLARE c1 CURSOR FOR SELECT * FROM uctest;
 FETCH 1 FROM c1;
 -- UPDATE uctest SET f1 = f1 + 10 WHERE CURRENT OF c1; -- YB: CURRENT OF is not supported #737
 FETCH 1 FROM c1;
@@ -432,8 +431,7 @@ FETCH 1 FROM c1;
 UPDATE uctest SET f1 = f1 + 10 WHERE CURRENT OF c1;  -- fail
 ROLLBACK;
 BEGIN;
--- Disable 'FOR UPDATE' due to github #9915
--- DECLARE c1 CURSOR FOR SELECT * FROM uctest a, uctest b WHERE a.f1 = b.f1 + 5 FOR UPDATE;
+-- DECLARE c1 CURSOR FOR SELECT * FROM uctest a, uctest b WHERE a.f1 = b.f1 + 5 FOR UPDATE;  -- YB: Disable 'FOR UPDATE' due to github #27149
 DECLARE c1 CURSOR FOR SELECT * FROM uctest a, uctest b WHERE a.f1 = b.f1 + 5;
 FETCH 1 FROM c1;
 UPDATE uctest SET f1 = f1 + 10 WHERE CURRENT OF c1;  -- fail
@@ -471,8 +469,8 @@ DECLARE c1 CURSOR FOR SELECT * FROM uctest;
 DELETE FROM uctest WHERE CURRENT OF c1; -- fail, no current row
 ROLLBACK;
 BEGIN;
--- DISABLE 'FOR UPDATE' due to github #9915
--- DECLARE c1 CURSOR FOR SELECT MIN(f1) FROM uctest FOR UPDATE;
+-- DECLARE c1 CURSOR FOR SELECT MIN(f1) FROM uctest FOR UPDATE;  -- YB: Disable 'FOR UPDATE' due to github #27149
+DECLARE c1 CURSOR FOR SELECT MIN(f1) FROM uctest;
 ROLLBACK;
 
 -- WHERE CURRENT OF may someday work with views, but today is not that day.
@@ -528,8 +526,7 @@ ROLLBACK;
 BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 CREATE TABLE cursor (a int);
 INSERT INTO cursor VALUES (1);
--- DISABLE 'FOR UPDATE' due to github #9915
--- DECLARE c1 NO SCROLL CURSOR FOR SELECT * FROM cursor FOR UPDATE;
+-- DECLARE c1 NO SCROLL CURSOR FOR SELECT * FROM cursor FOR UPDATE;  -- YB: github #27149
 -- UPDATE cursor SET a = 2;
 FETCH ALL FROM c1;
 COMMIT;

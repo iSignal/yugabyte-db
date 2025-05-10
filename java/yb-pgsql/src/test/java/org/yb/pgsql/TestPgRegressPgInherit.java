@@ -19,7 +19,7 @@ import org.junit.runner.RunWith;
 import org.yb.YBTestRunner;
 
 @RunWith(value=YBTestRunner.class)
-public class TestPgRegressInherit0 extends BasePgRegressTestPorted {
+public class TestPgRegressPgInherit extends BasePgRegressTestPorted {
 
   @Test
   public void testPgRegressInherit() throws Exception {

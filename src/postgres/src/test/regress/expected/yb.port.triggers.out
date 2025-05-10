@@ -2738,7 +2738,7 @@ ERROR:  REFERENCING clause (transition tables) not supported yet
 LINE 2:   after insert on parent referencing new table as new_table
                                  ^
 HINT:  See https://github.com/yugabyte/yugabyte-db/issues/1668. React with thumbs up to raise its priority
-/* YB: Transition tables (REFERENCING clause) are not supported 
+/* YB: Transition tables (REFERENCING clause) are not supported
 create trigger parent_update_trig
   after update on parent referencing old table as old_table new table as new_table
   for each statement execute procedure dump_update();
