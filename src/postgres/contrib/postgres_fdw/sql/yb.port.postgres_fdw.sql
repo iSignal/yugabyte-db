@@ -1722,7 +1722,7 @@ ALTER TABLE loct SET (autovacuum_enabled = 'false');
 CREATE FOREIGN TABLE b (bb TEXT) INHERITS (a)
   SERVER loopback OPTIONS (table_name 'loct');
 
-/* YB note: ERROR:  INHERITS not supported yet, reenable when fixed, see issue #5956
+-- YB note: ERROR:  INHERITS not supported yet, reenable when fixed, see issue #5956
 INSERT INTO a(aa) VALUES('aaa');
 INSERT INTO a(aa) VALUES('aaaa');
 INSERT INTO a(aa) VALUES('aaaaa');
@@ -1758,13 +1758,12 @@ DELETE FROM a;
 SELECT tableoid::regclass, * FROM a;
 SELECT tableoid::regclass, * FROM b;
 SELECT tableoid::regclass, * FROM ONLY a;
-*/ -- YB
+-- YB
 
 DROP TABLE a CASCADE;
 DROP TABLE loct;
 
 -- Check SELECT FOR UPDATE/SHARE with an inherited source table
-/* YB note: See above
 create table loct1 (f1 int, f2 int, f3 int);
 create table loct2 (f1 int, f2 int, f3 int);
 
@@ -1799,7 +1798,7 @@ select * from bar where f1 in (select f1 from foo) for update;
 explain (verbose, costs off)
 select * from bar where f1 in (select f1 from foo) for share;
 select * from bar where f1 in (select f1 from foo) for share;
-*/ -- YB
+
 
 -- Check UPDATE with inherited target and an inherited source table
 /* YB note: See above
