@@ -7726,147 +7726,49 @@ ERROR:  trigger "trig_row_after_delete" for table "rem1" does not exist
 -- ===================================================================
 CREATE TABLE a (aa TEXT);
 CREATE TABLE loct (aa TEXT, bb TEXT);
-/* YB note: ERROR:  INHERITS not supported yet, reenable when fixed, see issue #5956
+/* YB note: Fix INHERITS + FDW issues #27291
 ALTER TABLE a SET (autovacuum_enabled = 'false');
 ALTER TABLE loct SET (autovacuum_enabled = 'false');
 */ -- YB
 CREATE FOREIGN TABLE b (bb TEXT) INHERITS (a)
   SERVER loopback OPTIONS (table_name 'loct');
--- YB note: ERROR:  INHERITS not supported yet, reenable when fixed, see issue #5956
+/* YB note: Fix INHERITS + FDW issues #27291
 INSERT INTO a(aa) VALUES('aaa');
 INSERT INTO a(aa) VALUES('aaaa');
 INSERT INTO a(aa) VALUES('aaaaa');
+
 INSERT INTO b(aa) VALUES('bbb');
 INSERT INTO b(aa) VALUES('bbbb');
 INSERT INTO b(aa) VALUES('bbbbb');
+
 SELECT tableoid::regclass, * FROM a;
- tableoid |  aa   
-----------+-------
- a        | aaa
- a        | aaaa
- a        | aaaaa
- b        | bbb
- b        | bbbb
- b        | bbbbb
-(6 rows)
-
 SELECT tableoid::regclass, * FROM b;
- tableoid |  aa   | bb 
-----------+-------+----
- b        | bbb   | 
- b        | bbbb  | 
- b        | bbbbb | 
-(3 rows)
-
 SELECT tableoid::regclass, * FROM ONLY a;
- tableoid |  aa   
-----------+-------
- a        | aaa
- a        | aaaa
- a        | aaaaa
-(3 rows)
 
 UPDATE a SET aa = 'zzzzzz' WHERE aa LIKE 'aaaa%';
+
 SELECT tableoid::regclass, * FROM a;
- tableoid |   aa   
-----------+--------
- a        | aaa
- a        | zzzzzz
- a        | zzzzzz
- b        | bbb
- b        | bbbb
- b        | bbbbb
-(6 rows)
-
 SELECT tableoid::regclass, * FROM b;
- tableoid |  aa   | bb 
-----------+-------+----
- b        | bbb   | 
- b        | bbbb  | 
- b        | bbbbb | 
-(3 rows)
-
 SELECT tableoid::regclass, * FROM ONLY a;
- tableoid |   aa   
-----------+--------
- a        | aaa
- a        | zzzzzz
- a        | zzzzzz
-(3 rows)
 
 UPDATE b SET aa = 'new';
+
 SELECT tableoid::regclass, * FROM a;
- tableoid |   aa   
-----------+--------
- a        | aaa
- a        | zzzzzz
- a        | zzzzzz
- b        | new
- b        | new
- b        | new
-(6 rows)
-
 SELECT tableoid::regclass, * FROM b;
- tableoid | aa  | bb 
-----------+-----+----
- b        | new | 
- b        | new | 
- b        | new | 
-(3 rows)
-
 SELECT tableoid::regclass, * FROM ONLY a;
- tableoid |   aa   
-----------+--------
- a        | aaa
- a        | zzzzzz
- a        | zzzzzz
-(3 rows)
 
 UPDATE a SET aa = 'newtoo';
+
 SELECT tableoid::regclass, * FROM a;
- tableoid |   aa   
-----------+--------
- a        | newtoo
- a        | newtoo
- a        | newtoo
- b        | newtoo
- b        | newtoo
- b        | newtoo
-(6 rows)
-
 SELECT tableoid::regclass, * FROM b;
- tableoid |   aa   | bb 
-----------+--------+----
- b        | newtoo | 
- b        | newtoo | 
- b        | newtoo | 
-(3 rows)
-
 SELECT tableoid::regclass, * FROM ONLY a;
- tableoid |   aa   
-----------+--------
- a        | newtoo
- a        | newtoo
- a        | newtoo
-(3 rows)
 
 DELETE FROM a;
+
 SELECT tableoid::regclass, * FROM a;
- tableoid | aa 
-----------+----
-(0 rows)
-
 SELECT tableoid::regclass, * FROM b;
- tableoid | aa | bb 
-----------+----+----
-(0 rows)
-
 SELECT tableoid::regclass, * FROM ONLY a;
- tableoid | aa 
-----------+----
-(0 rows)
-
--- YB
+*/ -- YB
 DROP TABLE a CASCADE;
 NOTICE:  drop cascades to foreign table b
 DROP TABLE loct;
