@@ -130,6 +130,8 @@ class PgDdlAtomicityTest : public PgDdlAtomicityTestBase {
       SleepFor(5s);
     }
   }
+
+
 };
 
 TEST_F(PgDdlAtomicityTest, TestDatabaseGC) {
@@ -1916,6 +1918,92 @@ TEST_F(PgDdlAtomicityTest, TestPollTransactionFuilure) {
   // Now a new DDL on table foo can succeed.
   ASSERT_OK(conn.Execute("ALTER TABLE foo ADD COLUMN id3 INT"));
 }
+
+// Test that the schema verification works correctly for inheritance hierarchy.
+TEST_F(PgDdlAtomicityTest, TestInheritedTableSchemaVerification) {
+
+  auto conn = ASSERT_RESULT(Connect());
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  // Set report_ysql_ddl_txn_status_to_master to false, so that we can test the schema verification
+  // codepaths on master.
+  ASSERT_OK(cluster_->SetFlagOnTServers(
+      "report_ysql_ddl_txn_status_to_master", "false"));
+
+  ASSERT_OK(conn.ExecuteFormat(
+      "CREATE TABLE test_grandparent (gc1 INT, gc2 TEXT, gc3 real, gc4 SERIAL); "
+              "CREATE INDEX test_gp_gc4_idx ON test_grandparent (gc1, gc4);"
+              "CREATE TABLE test_parent(pc1 INT primary key) INHERITS (test_grandparent);"
+              "CREATE INDEX test_p_gc4_idx ON test_parent (gc1, gc4);"
+              "CREATE TABLE test_child(c1 INT primary key) INHERITS (test_parent);"
+              "CREATE INDEX test_gc4_idx ON test_child (gc1, gc4);"
+              "INSERT INTO test_child VALUES(1,'1','1.0', DEFAULT, 1, 1);"));
+
+
+  // Perform one of below w/ fail flag set
+  //    drop col from grandpar, add col to grandpar, alter col on grandpar
+  // verify old query still succeeds
+  // actually perform the query succesfully
+  // verify new schema works in query
+  ASSERT_OK(cluster_->SetFlagOnMasters("TEST_pause_ddl_rollback", "true"));
+  ASSERT_OK(conn.ExecuteFormat("SET yb_test_fail_next_ddl=true"));
+  // failed drop col
+  ASSERT_NOK(conn.ExecuteFormat("ALTER TABLE test_grandparent DROP COLUMN gc4"));
+
+  // index tables should still be around
+  ASSERT_EQ(ASSERT_RESULT(client->ListTables("test_gc4_idx")).size(), 1);
+  ASSERT_EQ(ASSERT_RESULT(client->ListTables("test_gp_gc4_idx")).size(), 1);
+  ASSERT_EQ(ASSERT_RESULT(client->ListTables("test_p_gc4_idx")).size(), 1);
+
+  // can still query for dropped col
+  auto result = conn.FetchRows<int32_t>("SELECT gc4 FROM test_grandparent");
+  ASSERT_NOK(result);
+  ASSERT_TRUE(HasSubstring(result.status().ToString(), "marked for deletion in table"));
+
+  ASSERT_OK(cluster_->SetFlagOnMasters("TEST_pause_ddl_rollback", "false"));
+
+  // Wait for rollback to complete
+  SleepFor(10 * 1s);
+  auto rows = ASSERT_RESULT(conn.FetchRows<int32_t>("SELECT gc4 FROM test_grandparent"));
+  ASSERT_EQ(rows.size(), 1);
+  ASSERT_EQ(rows[0], 1);
+
+  // actually drop col now
+  ASSERT_OK(conn.ExecuteFormat("ALTER TABLE test_grandparent DROP COLUMN gc4"));
+  result = conn.FetchRows<int32_t>("SELECT gc4 FROM test_grandparent");
+  ASSERT_NOK(result);
+  ASSERT_TRUE(HasSubstring(result.status().ToString(), "marked for deletion in table"));
+
+
+
+
+  // // Perform an unsuccessful alter table operation.
+  // ASSERT_OK(conn.TestFailDdl("ALTER TABLE test_parent DROP COLUMN value"));
+  // ASSERT_OK(cluster_->SetFlagOnMasters("TEST_pause_ddl_rollback", "true"));
+  // ASSERT_OK(conn.ExecuteFormat("SET yb_test_fail_next_ddl=true"));
+  // // Perform an unsuccessful alter table rewrite operation.
+  // ASSERT_NOK(conn.ExecuteFormat("ALTER TABLE test_parent ADD PRIMARY KEY (key)"));
+
+  // // Verify that the failed alter table rewrite operation created orphaned tables.
+  // ASSERT_EQ(ASSERT_RESULT(client->ListTables("test_parent")).size(), 2);
+  // ASSERT_EQ(ASSERT_RESULT(client->ListTables("test_child")).size(), 2);
+  // ASSERT_OK(cluster_->SetFlagOnMasters("TEST_pause_ddl_rollback", "false"));
+  // ASSERT_OK(LoggedWaitFor([&]() -> Result<bool> {
+  //     return VERIFY_RESULT(client->ListTables("test_child")).size() == 1 &&
+  //       VERIFY_RESULT(client->ListTables("test_parent")).size() == 1;
+  // }, MonoDelta::FromSeconds(60), "Wait for orphaned child table to be cleaned up."));
+
+  // // Perform a successful alter table operation.
+  // ASSERT_OK(conn.ExecuteFormat("ALTER TABLE test_parent ADD COLUMN col1 int"));
+  // // Perform successful alter table rewrite operations.
+  // ASSERT_OK(conn.ExecuteFormat("ALTER TABLE test_parent ADD PRIMARY KEY (key)"));
+  // ASSERT_OK(conn.ExecuteFormat("ALTER TABLE test_parent ADD COLUMN col2 SERIAL"));
+
+  // // Perform a successful drop table operation.
+  // ASSERT_OK(conn.ExecuteFormat("DROP TABLE test_parent"));
+  // ASSERT_EQ(ASSERT_RESULT(client->ListTables("test_parent")).size(), 0);
+  // ASSERT_EQ(ASSERT_RESULT(client->ListTables("test_child")).size(), 0);
+}
+
 
 } // namespace pgwrapper
 } // namespace yb
