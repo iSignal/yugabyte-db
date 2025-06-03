@@ -121,7 +121,7 @@ DEFINE_NON_RUNTIME_int32(ysql_conn_mgr_wait_timeout_ms, 10000,
 
 // This gflag should be deprecated but kept to avoid breaking some customer
 // clusters using it. Use ysql_catalog_preload_additional_table_list if possible.
-DEFINE_NON_RUNTIME_bool(ysql_catalog_preload_additional_tables, false,
+DEFINE_NON_RUNTIME_bool(ysql_catalog_preload_additional_tables, true,
     "If true, YB catalog preloads a default set of tables upon connection "
     "creation and cache refresh: pg_am,pg_amproc,pg_cast,pg_cast,pg_inherits,"
     "pg_policy,pg_proc,pg_tablespace,pg_trigger.");
@@ -141,7 +141,7 @@ DEFINE_NON_RUNTIME_bool(ysql_disable_global_impact_ddl_statements, false,
 DEPRECATE_FLAG(bool, ysql_disable_per_tuple_memory_context_in_update_relattrs, "06_2023");
 
 DEFINE_NON_RUNTIME_bool(
-    ysql_minimal_catalog_caches_preload, false,
+    ysql_minimal_catalog_caches_preload, true,
     "Fill postgres' caches with system items only");
 
 DEFINE_RUNTIME_PREVIEW_bool(

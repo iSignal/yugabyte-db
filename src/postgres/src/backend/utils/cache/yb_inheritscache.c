@@ -250,7 +250,7 @@ YbPreloadPgInheritsCache()
 	systable_endscan(scan);
 	table_close(relation, AccessShareLock);
 
-	fully_loaded = true;
+	fully_loaded = false;
 
 	elog(yb_debug_log_catcache_events ? LOG : DEBUG3,
 		 "YbPgInheritsCache: preload complete. Parent cache has %ld entries, "
