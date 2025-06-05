@@ -80,3 +80,33 @@
  underflow | Z         | 16662 |             2
 (50 rows)
 
+ parc1 | parc2 | parc3 | parc4 | parc5 | chc1  | parc9 | parc10 
+-------+-------+-------+-------+-------+-------+-------+--------
+     1 | FOO   |     6 |   1.1 |       | fooch |   2.2 |      5
+(1 row)
+
+                                Table "public.par"
+ Column |  Type   | Collation | Nullable |                Default                 
+--------+---------+-----------+----------+----------------------------------------
+ parc1  | integer |           |          | 
+ parc2  | text    |           |          | 'def'::text
+ parc3  | integer |           |          | generated always as (parc1 + 5) stored
+ parc4  | real    |           | not null | 
+ parc5  | text    |           |          | 
+ parc9  | real    |           | not null | 
+ parc10 | integer |           |          | 5
+Number of child tables: 1 (Use \d+ to list them.)
+
+                                Table "public.ch"
+ Column |  Type   | Collation | Nullable |                Default                 
+--------+---------+-----------+----------+----------------------------------------
+ parc1  | integer |           |          | 
+ parc2  | text    |           |          | 'def'::text
+ parc3  | integer |           |          | generated always as (parc1 + 5) stored
+ parc4  | real    |           | not null | 
+ parc5  | text    |           |          | 
+ chc1   | text    |           |          | 
+ parc9  | real    |           | not null | 
+ parc10 | integer |           |          | 5
+Inherits: par
+

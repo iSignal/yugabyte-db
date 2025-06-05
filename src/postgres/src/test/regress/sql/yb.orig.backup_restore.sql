@@ -276,3 +276,12 @@ ALTER TYPE underflow ADD VALUE 'F' BEFORE 'G';
 ALTER TYPE underflow ADD VALUE 'E' BEFORE 'F';
 ALTER TYPE underflow ADD VALUE 'D' BEFORE 'E';
 ALTER TYPE underflow ADD VALUE 'C' BEFORE 'D';
+
+-- Test inheritance with different col order in child
+CREATE TABLE par(parc1 INT, parc2 TEXT DEFAULT 'def', parc25 int, parc3 INT GENERATED ALWAYS AS (parc1 + 5) STORED, parc4 REAL NOT NULL, parc5 TEXT DEFAULT NULL);
+CREATE TABLE ch(chc1 TEXT, chc2 int, parc4 REAL, parc5 TEXT) INHERITS (par);
+ALTER TABLE par ADD COLUMN parc9 REAL NOT NULL;
+ALTER TABLE par ADD COLUMN parc10 INT DEFAULT 5;
+ALTER TABLE par DROP COLUMN parc25;
+ALTER TABLE ch DROP COLUMN chc2;
+INSERT INTO ch VALUES (1, 'FOO', DEFAULT, 1.1, NULL, 'fooch', 2.2);

@@ -12,3 +12,9 @@ SELECT tableoid::regclass, * from level1_1 ORDER by c1;
 -- enum type sortorder
 SELECT typname, enumlabel, pg_enum.oid, enumsortorder FROM pg_enum
     JOIN pg_type ON pg_enum.enumtypid = pg_type.oid ORDER BY typname, enumlabel ASC;
+
+
+-- Test inheritance with different col order in child
+SELECT * FROM ch;
+\d par
+\d ch
