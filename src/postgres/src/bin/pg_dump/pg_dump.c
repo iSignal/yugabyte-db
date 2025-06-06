@@ -17021,6 +17021,10 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 			{
 				if (tbinfo->attisdropped[j])
 				{
+					/*
+					 * For YB backups, we don't need to recreate dropped cols because
+					 * docdb snapshot import can handle such gaps in the col order.
+					 */
 					if (!dopt->include_yb_metadata)
 					{
 						appendPQExpBufferStr(q, "\n-- For binary upgrade, recreate dropped column.\n");
