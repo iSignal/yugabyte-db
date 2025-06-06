@@ -1202,21 +1202,24 @@ tserver_change_config:
       type: "date"
 
 tserver_remote_bootstraps:
-  metric: "rpc_latency_count"
-  function: "sum"
+  metric: ""
+  function: "rate|sum"
+  range: true
+  operator: "/ (1024 * 1024)"
+  group_by: "saved_name"
   filters:
     export_type: "tserver_export"
-    server_type: "yb_consensus"
-    service_type: "ConsensusService"
-    service_method: "StartRemoteBootstrap"
+    saved_name: "proxy_response_bytes_yb_tserver_RemoteBootstrapService_FetchData|service_response_bytes_yb_tserver_RemoteBootstrapService_FetchData"
   panel_group: "Tablet Server"
   layout:
     title: "Remote Bootstraps"
     xaxis:
       type: "date"
     yaxis:
+      ticksuffix: "&nbsp;MB/s"
       alias:
-        rpc_latency_count: "Remote Bootstraps"
+        "proxy_response_bytes_yb_tserver_RemoteBootstrapService_FetchData":  "Client bandwidth"
+        "service_response_bytes_yb_tserver_RemoteBootstrapService_FetchData":  "Server bandwidth"
 
 tserver_consensus_rpcs_latency:
   metric: "rpc_latency.avg"
@@ -2816,7 +2819,7 @@ master_load_balancer_stats:
   panel_group: "Master"
   group_by: "saved_name"
   layout:
-    title: "Master load balancer statistics"
+    title: "Cluster load balancer statistics"
     xaxis:
       type: "date"
     yaxis:
