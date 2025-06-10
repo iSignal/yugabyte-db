@@ -555,6 +555,7 @@ TEST_F_EX(PgCatalogPerfTest,
 //   - PgResponseCache doesn't have cached responses for further requests with read time T1 and
 //     send read request to a Master
 //   - Master responds with 'Snapshot too old' error on attempt to read at really old read time T1
+// TODO: check how this is passing
 TEST_F_EX(PgCatalogPerfTest,
           ResponseCacheWithTooOldSnapshot,
           PgCatalogWithStaleResponseCacheTest) {

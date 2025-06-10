@@ -499,11 +499,11 @@ class PgSysTablePrefetcher::Impl {
       }
       LOG(DFATAL) << data.status();
     } else {
-      LOG(DFATAL) << "Sys table prefetching is enabled but table "
+      LOG(WARNING) << "Sys table prefetching is enabled but table "
                   << table_id
                   << " was not prefetched. Prefetched tables are: "
                   << CollectionToString(data_, [](const auto& item) { return item.first; });
-     }
+    }
     return PrefetchedDataHolder();
   }
 

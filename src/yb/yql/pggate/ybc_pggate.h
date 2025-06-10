@@ -896,6 +896,12 @@ void YBCStartSysTablePrefetching(
     YbcPgSysTablePrefetcherCacheMode cache_mode);
 
 void YBCStopSysTablePrefetching();
+void YBCPauseSysTablePrefetching();
+void YBCResumeSysTablePrefetching();
+
+void YBCPauseSysTablePrefetching();
+
+void YBCResumeSysTablePrefetching();
 
 bool YBCIsSysTablePrefetchingStarted();
 

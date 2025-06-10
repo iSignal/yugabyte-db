@@ -253,7 +253,9 @@ ApplySetting(Snapshot snapshot, Oid databaseid, Oid roleid,
 			 * right to insert an option into pg_db_role_setting was checked
 			 * when it was inserted.
 			 */
+			YBCPauseSysTablePrefetching();
 			ProcessGUCArray(a, PGC_SUSET, source, GUC_ACTION_SET);
+			YBCPauseSysTablePrefetching();
 		}
 	}
 

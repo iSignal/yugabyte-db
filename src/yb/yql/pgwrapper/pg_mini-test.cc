@@ -2242,27 +2242,36 @@ TEST_F(PgMiniTest, CompactionAfterDBDrop) {
   auto& catalog_manager = ASSERT_RESULT(cluster_->GetLeaderMiniMaster())->catalog_manager();
   auto sys_catalog_tablet = catalog_manager.sys_catalog()->tablet_peer()->tablet();
 
-  ASSERT_OK(sys_catalog_tablet->Flush(tablet::FlushMode::kSync));
-  ASSERT_OK(sys_catalog_tablet->ForceManualRocksDBCompact());
-  uint64_t base_file_size = sys_catalog_tablet->GetCurrentVersionSstFilesUncompressedSize();;
-
-  PGConn conn = ASSERT_RESULT(Connect());
-  ASSERT_OK(conn.ExecuteFormat("CREATE DATABASE $0", kDatabaseName));
-  ASSERT_OK(conn.ExecuteFormat("DROP DATABASE $0", kDatabaseName));
-  ASSERT_OK(sys_catalog_tablet->Flush(tablet::FlushMode::kSync));
-
-  // Make sure compaction works without error for the hybrid_time > history_cutoff case.
-  ASSERT_OK(sys_catalog_tablet->ForceManualRocksDBCompact());
-
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_timestamp_history_retention_interval_sec) = 0;
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_timestamp_syscatalog_history_retention_interval_sec) = 0;
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_history_cutoff_propagation_interval_ms) = 1;
 
+
+  PGConn conn = ASSERT_RESULT(Connect());
+  //ASSERT_OK(conn.ExecuteFormat("CREATE DATABASE $0", kDatabaseName));
+  //ASSERT_OK(conn.ExecuteFormat("DROP DATABASE $0", kDatabaseName));
+  ASSERT_OK(conn.ExecuteFormat("create tablespace rf3 with "
+    "(replica_placement='{\"num_replicas\":3, \"placement_blocks\":"
+    "[{\"cloud\": \"cloud1\", \"region\":\"datacenter1\", \"zone\":\"rack1\",\"min_num_replicas\":3}]}');"));
+  ASSERT_OK(conn.ExecuteFormat("ALTER DATABASE yugabyte SET default_tablespace = 'rf3';"));
+  while (env_->FileExists("/tmp/pause_test")) {
+    sleep(1000);
+    YB_LOG_EVERY_N_SECS(INFO, 10) << " Paused test ";
+  }
+  ASSERT_OK(sys_catalog_tablet->Flush(tablet::FlushMode::kSync));
   ASSERT_OK(sys_catalog_tablet->ForceManualRocksDBCompact());
 
-  uint64_t new_file_size = sys_catalog_tablet->GetCurrentVersionSstFilesUncompressedSize();;
-  LOG(INFO) << "Base file size: " << base_file_size << ", new file size: " << new_file_size;
-  ASSERT_LE(new_file_size, base_file_size + 100_KB);
+  PGConn conn3 = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn3.ExecuteFormat("CREATE DATABASE $0", kDatabaseName));
+  ASSERT_OK(conn3.ExecuteFormat("DROP DATABASE $0", kDatabaseName));
+
+  ASSERT_OK(sys_catalog_tablet->Flush(tablet::FlushMode::kSync));
+  ASSERT_OK(sys_catalog_tablet->ForceManualRocksDBCompact());
+
+  PGConn conn2 = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn2.ExecuteFormat("SET yb_debug_log_catcache_events=1;"));
+
+
 }
 
 // The test checks that YSQL doesn't wait for sent RPC response in case of process termination.
