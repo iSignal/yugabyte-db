@@ -37,7 +37,8 @@ class ScopedWaitingTxnRegistration {
   virtual Status Register(
       const TransactionId& waiting, int64_t request_id,
       std::shared_ptr<ConflictDataManager> blockers, const TabletId& status_tablet,
-      std::optional<PgSessionRequestVersion> pg_session_req_version) = 0;
+      std::optional<PgSessionRequestVersion> pg_session_req_version,
+      const TabletId& conflict_tablet = "") = 0;
   virtual Status RegisterSingleShardWaiter(const TabletId& tablet_id, uint64_t wait_start_us) = 0;
   virtual int64 GetDataUseCount() const = 0;
   virtual Status PruneInactiveBlockerData(const TabletId& status_tablet) = 0;

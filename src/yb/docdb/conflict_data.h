@@ -18,6 +18,7 @@
 #include "yb/common/transaction.h"
 #include "yb/common/transaction.pb.h"
 #include "yb/dockv/intent.h"
+#include "yb/dockv/value_type.h"
 #include "yb/util/kv_util.h"
 #include "yb/util/ref_cnt_buffer.h"
 #include "yb/util/status.h"
@@ -39,6 +40,8 @@ using IntentTypesContainer = std::map<KeyBuffer, IntentData>;
 struct LockInfo {
   const RefCntPrefix doc_path;
   const dockv::IntentTypeSet intent_types;
+  const bool is_object_lock = false;
+  const dockv::KeyEntryType lock_entry_type = dockv::KeyEntryType::kNullLow;
 };
 
 // Represents the conflicts found from a specific subtransaction.

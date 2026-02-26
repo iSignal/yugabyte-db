@@ -216,6 +216,23 @@ std::span<const LockTypeEntry> GetEntriesForLockType(TableLockType lock) {
   return lock_entries[lock];
 }
 
+std::string GetTableLockModeName(dockv::KeyEntryType key_type, dockv::IntentTypeSet intents) {
+  std::string match;
+  for (int i = 1; i < TableLockType_ARRAYSIZE; i++) {
+    auto entries = GetEntriesForLockType(static_cast<TableLockType>(i));
+    for (const auto& [entry_key_type, entry_intents] : entries) {
+      if (entry_key_type == key_type && entry_intents == intents) {
+        if (!match.empty()) {
+          // Ambiguous: multiple lock modes match this single entry.
+          return "";
+        }
+        match = TableLockType_Name(static_cast<TableLockType>(i));
+      }
+    }
+  }
+  return match;
+}
+
 // Returns a DetermineKeysToLockResult object with its lock_batch containing a list of entries with
 // 'key' as <object id, KeyEntry> and 'intent_types' set.
 Result<DetermineKeysToLockResult<ObjectLockManager>> DetermineObjectsToLock(

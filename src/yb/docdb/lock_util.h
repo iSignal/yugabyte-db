@@ -172,6 +172,11 @@ using LockTypeEntry = std::pair<dockv::KeyEntryType, dockv::IntentTypeSet>;
 // the exact same conflict matrix. Refer comments on the function definition for more details.
 std::span<const LockTypeEntry> GetEntriesForLockType(TableLockType lock);
 
+// Reverse-maps a (KeyEntryType, IntentTypeSet) pair from a single lock entry back to the
+// PostgreSQL table lock mode name, if the mapping is unambiguous. Returns empty string if
+// no unique match is found.
+std::string GetTableLockModeName(dockv::KeyEntryType key_type, dockv::IntentTypeSet intents);
+
 // Returns DetermineKeysToLockResult<ObjectLockManager> which can further be passed to
 // ObjectLockManager to acquire locks against the required objects with the given lock type.
 Result<DetermineKeysToLockResult<ObjectLockManager>> DetermineObjectsToLock(

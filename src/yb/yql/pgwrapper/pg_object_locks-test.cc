@@ -1264,6 +1264,111 @@ TEST_F(PgObjectLocksTestRF1, YB_DISABLE_TEST_IN_TSAN(TestDeadlock)) {
   ASSERT_STR_CONTAINS(s.ToString(), "aborted due to a deadlock");
 }
 
+TEST_F(PgObjectLocksTestRF1, YB_DISABLE_TEST_IN_TSAN(TestDeadlockMessageObjectLocks)) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_olm_poll_interval_ms) = kDefaultLockManagerPollIntervalMs;
+  ASSERT_OK(cluster_->RestartSync());
+  Init();
+
+  auto conn1 = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn1.Execute("CREATE TABLE dl_a(k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(conn1.Execute("CREATE TABLE dl_b(k INT PRIMARY KEY, v INT)"));
+  auto conn2 = ASSERT_RESULT(Connect());
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_refresh_waiter_timeout_ms) = 5000;
+
+  ASSERT_OK(conn1.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
+  ASSERT_OK(conn2.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
+
+  ASSERT_OK(conn1.Execute("LOCK TABLE dl_a IN EXCLUSIVE MODE"));
+  ASSERT_OK(conn2.Execute("LOCK TABLE dl_b IN EXCLUSIVE MODE"));
+
+  auto status_future = std::async(std::launch::async, [&]() -> Status {
+    return conn1.Execute("LOCK TABLE dl_b IN EXCLUSIVE MODE");
+  });
+
+  SleepFor(1s);
+  auto s2 = conn2.Execute("LOCK TABLE dl_a IN EXCLUSIVE MODE");
+
+  auto s1 = status_future.get();
+
+  // Either transaction can be the deadlock victim.
+  std::string msg;
+  if (!s1.ok() && s1.ToString().find("deadlock") != std::string::npos) {
+    msg = s1.ToString();
+  } else if (!s2.ok() && s2.ToString().find("deadlock") != std::string::npos) {
+    msg = s2.ToString();
+  } else {
+    FAIL() << "Expected at least one transaction to fail with deadlock. "
+           << "conn1 status: " << s1 << ", conn2 status: " << s2;
+  }
+
+  WARN_NOT_OK(conn1.RollbackTransaction(), "rollback conn1");
+  WARN_NOT_OK(conn2.RollbackTransaction(), "rollback conn2");
+
+  LOG(INFO) << "Object lock deadlock message: " << msg;
+  ASSERT_STR_CONTAINS(msg, "aborted due to a deadlock");
+  ASSERT_STR_CONTAINS(msg, "relation_oid:");
+  ASSERT_STR_CONTAINS(msg, "-[");
+  ASSERT_STR_CONTAINS(msg, " on ");
+  // Object locks should show the PG lock mode name, not raw intent types.
+  ASSERT_STR_CONTAINS(msg, "EXCLUSIVE");
+}
+
+TEST_F(PgObjectLocksTestRF1, YB_DISABLE_TEST_IN_TSAN(TestDeadlockMessageRowLocks)) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_olm_poll_interval_ms) = kDefaultLockManagerPollIntervalMs;
+  ASSERT_OK(cluster_->RestartSync());
+  Init();
+
+  auto conn1 = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn1.Execute("CREATE TABLE dl_r1(k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(conn1.Execute("CREATE TABLE dl_r2(k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(conn1.Execute("INSERT INTO dl_r1 VALUES (1, 0)"));
+  ASSERT_OK(conn1.Execute("INSERT INTO dl_r2 VALUES (1, 0)"));
+  auto conn2 = ASSERT_RESULT(Connect());
+
+  ASSERT_OK(conn1.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
+  ASSERT_OK(conn2.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
+
+  ASSERT_OK(conn1.Execute("UPDATE dl_r1 SET v = 1 WHERE k = 1"));
+  ASSERT_OK(conn2.Execute("UPDATE dl_r2 SET v = 1 WHERE k = 1"));
+
+  auto status_future = std::async(std::launch::async, [&]() -> Status {
+    auto s = conn1.Execute("UPDATE dl_r2 SET v = 2 WHERE k = 1");
+    if (!s.ok()) return s;
+    return conn1.CommitTransaction();
+  });
+
+  SleepFor(1s);
+  auto s2 = conn2.Execute("UPDATE dl_r1 SET v = 2 WHERE k = 1");
+  if (s2.ok()) {
+    s2 = conn2.CommitTransaction();
+  }
+
+  auto s1 = status_future.get();
+
+  // Either transaction can be the deadlock victim.
+  std::string msg;
+  if (!s1.ok() && s1.ToString().find("deadlock") != std::string::npos) {
+    msg = s1.ToString();
+  } else if (!s2.ok() && s2.ToString().find("deadlock") != std::string::npos) {
+    msg = s2.ToString();
+  } else {
+    FAIL() << "Expected at least one transaction to fail with deadlock. "
+           << "conn1 status: " << s1 << ", conn2 status: " << s2;
+  }
+
+  WARN_NOT_OK(conn1.RollbackTransaction(), "rollback conn1");
+  WARN_NOT_OK(conn2.RollbackTransaction(), "rollback conn2");
+
+  LOG(INFO) << "Row lock deadlock message: " << msg;
+  ASSERT_STR_CONTAINS(msg, "aborted due to a deadlock");
+  ASSERT_STR_CONTAINS(msg, "-[");
+  ASSERT_STR_CONTAINS(msg, " on ");
+  // Row locks should not contain object lock entity fields.
+  ASSERT_TRUE(msg.find("relation_oid:") == std::string::npos)
+      << "Row lock deadlock should not contain object lock entity info, got: " << msg;
+}
+
 TEST_F(PgObjectLocksTestRF1, TestShutdownWithWaiters) {
   constexpr auto kNumWaiters = 3;
   auto conn = ASSERT_RESULT(Connect());

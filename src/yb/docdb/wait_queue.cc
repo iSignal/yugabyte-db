@@ -889,7 +889,8 @@ class BlockerData {
         }
         did_find_conflicts = true;
         conflict_info->subtransactions[subtxn_id].locks.emplace_back(
-            LockInfo{.doc_path = doc_path, .intent_types = intent_type_set});
+            LockInfo{.doc_path = doc_path, .intent_types = intent_type_set,
+                     .is_object_lock = false});
       }
     }
     return did_find_conflicts;
@@ -1414,7 +1415,7 @@ class WaitQueue::Impl {
       // latency in deadlock detection, which should be addresed by GHI #21243.
       RETURN_NOT_OK(scoped_reporter->Register(
           waiter_txn_id, request_id, std::move(blockers), status_tablet_id,
-          pg_session_req_version));
+          pg_session_req_version, txn_status_manager_->tablet_id()));
       DCHECK_GE(scoped_reporter->GetDataUseCount(), 1);
     }
 

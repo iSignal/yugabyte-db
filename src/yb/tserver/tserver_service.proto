@@ -423,11 +423,18 @@ message GetOldSingleShardWaitersResponsePB {
   optional fixed64 propagated_hybrid_time = 3;
 }
 
+message WaitForEdgeInfoPB {
+  optional string lock_type = 1;
+  optional string lock_entity = 2;
+  optional bytes conflict_tablet_id = 3;
+}
+
 message UpdateTransactionWaitingForStatusRequestPB {
   message BlockingTransaction {
     optional bytes transaction_id = 1;
     optional bytes status_tablet_id = 2;
     optional SubtxnSetPB subtxn_set = 3;
+    optional WaitForEdgeInfoPB wait_for_edge_info = 4;
   }
   message WaitingTransaction {
     optional bytes transaction_id = 1;
@@ -470,6 +477,8 @@ message ProbeTransactionDeadlockRequestPB {
   optional fixed32 min_probe_num = 7;
 
   optional SubtxnSetPB blocking_subtxn_set = 8;
+
+  optional WaitForEdgeInfoPB wait_for_edge_info = 9;
 }
 
 message ProbeTransactionDeadlockResponsePB {
@@ -494,6 +503,8 @@ message ProbeTransactionDeadlockResponsePB {
     optional bool is_pg_session_txn = 5;
 
     optional uint64 pg_session_req_version = 6;
+
+    optional WaitForEdgeInfoPB wait_for_edge_info = 7;
   }
 
   repeated DeadlockedTxnInfo deadlock = 4;

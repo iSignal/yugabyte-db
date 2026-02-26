@@ -16,6 +16,8 @@
 #include <algorithm>
 #include <memory>
 
+#include "yb/docdb/lock_util.h"
+
 #include <glog/vlog_is_on.h>
 
 #include "yb/common/common_fwd.h"
@@ -73,6 +75,7 @@ struct WaitingTransactionData {
   HybridTime wait_start_time;
   std::optional<PgSessionRequestVersion> pg_session_req_version;
   rpc::Rpcs::Handle rpc_handle;
+  TabletId conflict_tablet;
 };
 
 // Container for metadata corresponding to a single shard waiting transaction that is being tracked.
@@ -97,6 +100,48 @@ struct StatusTabletEntry {
   std::unique_ptr<ThreadPoolToken> thread_pool_token;
 };
 
+std::string SummarizeLockInfo(const TransactionConflictInfo& conflict_info) {
+  for (const auto& [subtxn_id, subtxn_info] : conflict_info.subtransactions) {
+    for (const auto& lock : subtxn_info.locks) {
+      if (lock.is_object_lock) {
+        auto mode = GetTableLockModeName(lock.lock_entry_type, lock.intent_types);
+        if (!mode.empty()) {
+          return mode;
+        }
+      }
+    }
+  }
+  // Fallback: show raw intent types.
+  dockv::IntentTypeSet combined_intents;
+  for (const auto& [subtxn_id, subtxn_info] : conflict_info.subtransactions) {
+    for (const auto& lock : subtxn_info.locks) {
+      combined_intents |= lock.intent_types;
+    }
+  }
+  if (combined_intents.None()) {
+    return "";
+  }
+  std::string result;
+  for (auto intent : combined_intents) {
+    if (!result.empty()) result += ",";
+    result += ToString(intent);
+  }
+  return result;
+}
+
+std::string SummarizeLockEntity(const TransactionConflictInfo& conflict_info) {
+  for (const auto& [subtxn_id, subtxn_info] : conflict_info.subtransactions) {
+    if (!subtxn_info.locks.empty()) {
+      const auto& lock = subtxn_info.locks[0];
+      if (lock.is_object_lock) {
+        return lock.doc_path.as_slice().ToString();
+      }
+      return lock.doc_path.as_slice().ToDebugHexString();
+    }
+  }
+  return "";
+}
+
 void AttachWaitingTransaction(
     const WaitingTransactionData& data, tserver::UpdateTransactionWaitingForStatusRequestPB* req) {
   auto* txn = req->add_waiting_transactions();
@@ -117,6 +162,16 @@ void AttachWaitingTransaction(
           Format("Failed to set index $0 of SubtxnSet", subtxn_id));
     }
     subtxn_set.ToPB(blocking_txn->mutable_subtxn_set()->mutable_set());
+
+    auto lock_type = SummarizeLockInfo(*blocker.conflict_info);
+    if (!lock_type.empty()) {
+      auto* edge = blocking_txn->mutable_wait_for_edge_info();
+      edge->set_lock_type(lock_type);
+      edge->set_lock_entity(SummarizeLockEntity(*blocker.conflict_info));
+      if (!data.conflict_tablet.empty()) {
+        edge->set_conflict_tablet_id(data.conflict_tablet);
+      }
+    }
   }
 }
 
@@ -274,9 +329,11 @@ class LocalWaitingTxnRegistry::Impl {
     Status Register(
         const TransactionId& waiting, int64_t request_id,
         std::shared_ptr<ConflictDataManager> blockers, const TabletId& status_tablet,
-        std::optional<PgSessionRequestVersion> pg_session_req_version) override {
+        std::optional<PgSessionRequestVersion> pg_session_req_version,
+        const TabletId& conflict_tablet = "") override {
       return registry_->RegisterWaitingFor(
-          waiting, request_id, std::move(blockers), status_tablet, pg_session_req_version, this);
+          waiting, request_id, std::move(blockers), status_tablet, pg_session_req_version,
+          conflict_tablet, this);
     }
 
     Status RegisterSingleShardWaiter(
@@ -434,6 +491,7 @@ class LocalWaitingTxnRegistry::Impl {
       const TransactionId& waiting, int64_t request_id,
       std::shared_ptr<ConflictDataManager> blockers, const TabletId& status_tablet_id,
       std::optional<PgSessionRequestVersion> pg_session_req_version,
+      const TabletId& conflict_tablet,
       WaitingTransactionDataWrapper* wrapper) EXCLUDES(mutex_) {
     LOG_IF_WITH_FUNC(DFATAL, status_tablet_id.empty())
         << "Expected non-emoty status tablet for registering wait-for probe";
@@ -447,6 +505,7 @@ class LocalWaitingTxnRegistry::Impl {
         .wait_start_time = clock_->Now(),
         .pg_session_req_version = pg_session_req_version,
         .rpc_handle = rpcs_.InvalidHandle(),
+        .conflict_tablet = conflict_tablet,
     });
 
     // Waiting txn data needs to be attached before submitting a task of type SendPartialUpdateAsync

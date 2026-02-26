@@ -92,6 +92,17 @@ namespace {
 // Master leader retries failed lock requests with code ShutdownInProgress until either the retry
 // attempts are exhausted or the tserver looses it lease. This is the desired behavior as it
 // achieves resiliency for DDL lock requests amidst cluster membership changes.
+dockv::IntentTypeSet LockStateToIntentTypeSet(LockState state) {
+  dockv::IntentTypeSet result;
+  for (auto intent_type : {dockv::IntentType::kWeakRead, dockv::IntentType::kWeakWrite,
+                           dockv::IntentType::kStrongRead, dockv::IntentType::kStrongWrite}) {
+    if (state & IntentTypeMask(intent_type)) {
+      result.Set(intent_type);
+    }
+  }
+  return result;
+}
+
 const Status kShuttingDownError = STATUS(
     ShutdownInProgress, "Object Lock Manager shutting down");
 
@@ -1181,8 +1192,13 @@ void ObjectLockManagerImpl::DoComputeBlockersWithinQueue(
         if (((conflict_types & prev_add) != 0) &&
             item->object_lock_owner() != other->object_lock_owner()) {
           auto conflict_info = std::make_shared<TransactionConflictInfo>();
-          conflict_info->subtransactions.emplace(
-              other->object_lock_owner().subtxn_id, SubTransactionConflictInfo());
+          auto& subtxn_info =
+              conflict_info->subtransactions[other->object_lock_owner().subtxn_id];
+          subtxn_info.locks.emplace_back(
+              LockInfo{.doc_path = RefCntPrefix(key->ToString()),
+                       .intent_types = other->resume_it()->intent_types,
+                       .is_object_lock = true,
+                       .lock_entry_type = key->lock_type});
           item->blockers->AddTransaction(
               other->txn_id(), conflict_info, other->status_tablet());
           other->was_a_blocker = TxnBlockedTableLockRequests::kTrue;
@@ -1214,7 +1230,11 @@ void ObjectLockManagerImpl::DoPopulateLockStateBlockersMap(
           continue;
         }
         if (state_it->first & lock_entry_it->second.state) {
-          conflict_info->subtransactions.emplace(subtxn, SubTransactionConflictInfo());
+          conflict_info->subtransactions[subtxn].locks.emplace_back(
+              LockInfo{.doc_path = RefCntPrefix(key->ToString()),
+                       .intent_types = LockStateToIntentTypeSet(lock_entry_it->second.state),
+                       .is_object_lock = true,
+                       .lock_entry_type = key->lock_type});
         }
       }
       if (conflict_info->subtransactions.size()) {

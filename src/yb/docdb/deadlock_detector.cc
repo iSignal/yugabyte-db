@@ -257,6 +257,13 @@ class LocalProbeProcessor : public std::enable_shared_from_this<LocalProbeProces
     req.set_tablet_id(blocker_status_tablet);
     blocking_subtxn_set->ToPB(req.mutable_blocking_subtxn_set()->mutable_set());
 
+    if (!info.blocker_txn_info.lock_type.empty()) {
+      auto* edge = req.mutable_wait_for_edge_info();
+      edge->set_lock_type(info.blocker_txn_info.lock_type);
+      edge->set_lock_entity(info.blocker_txn_info.lock_entity);
+      edge->set_conflict_tablet_id(info.blocker_txn_info.conflict_tablet);
+    }
+
     VLOG_WITH_PREFIX_AND_FUNC(4)
         << "waiting_txn_id: " << probe_origin_txn_id_ << ", "
         <<  info.ToString() << ", "
@@ -499,17 +506,36 @@ using LocalProbeProcessorPtr = std::shared_ptr<LocalProbeProcessor>;
 
 std::string ConstructDeadlockedMessage(const TransactionId& waiter,
                                        const tserver::ProbeTransactionDeadlockResponsePB& resp) {
+  // Build a lookup from txn ID to edge info from the newer deadlock field.
+  std::unordered_map<TransactionId, const tserver::WaitForEdgeInfoPB*,
+                     TransactionIdHash> edge_info_map;
+  for (const auto& txn_info : resp.deadlock()) {
+    if (txn_info.has_wait_for_edge_info()) {
+      auto id = FullyDecodeTransactionId(txn_info.id());
+      if (id.ok()) {
+        edge_info_map[*id] = &txn_info.wait_for_edge_info();
+      }
+    }
+  }
+
   std::stringstream ss;
   ss << Format("Transaction $0 aborted due to a deadlock.\n$0", waiter.ToString());
   for (auto i = 1 ; i < resp.deadlocked_txn_ids_size() ; i++) {
     auto id_or_status = FullyDecodeTransactionId(resp.deadlocked_txn_ids(i));
     if (!id_or_status.ok()) {
-      ss << Format(" -> [Error decoding txn id: $0]", id_or_status.status());
+      ss << " -> [Error decoding txn id: " << id_or_status.status() << "]";
     } else {
-      ss << Format(" -> $0", *id_or_status);
+      auto edge_it = edge_info_map.find(*id_or_status);
+      if (edge_it != edge_info_map.end()) {
+        ss << " -[" << edge_it->second->lock_type()
+           << " on " << edge_it->second->lock_entity() << "]-> "
+           << *id_or_status;
+      } else {
+        ss << " -> " << *id_or_status;
+      }
     }
   }
-  ss << Format(" -> $0 ", waiter.ToString());
+  ss << " -> " << waiter.ToString();
   return ss.str();
 }
 
@@ -616,7 +642,7 @@ class DeadlockDetector::Impl : public std::enable_shared_from_this<DeadlockDetec
 
         if (remote_resp.deadlock_size() > 0) {
           resp->mutable_deadlock()->CopyFrom(remote_resp.deadlock());
-          detector->AddLocalDeadlock(local_blocking_txn_id, resp);
+          detector->AddLocalDeadlock(local_blocking_txn_id, resp, &req);
         }
 
         callback(Status::OK());
@@ -727,13 +753,20 @@ class DeadlockDetector::Impl : public std::enable_shared_from_this<DeadlockDetec
             continue;
           }
 
-          auto blocking_info = BlockingInfo {
-            BlockerTransactionInfo {
+          auto blocker_txn_info = BlockerTransactionInfo {
               .id = VERIFY_RESULT(FullyDecodeTransactionId(blocker.transaction_id())),
               .status_tablet = blocker.status_tablet_id(),
               .blocking_subtxn_set = std::make_shared<SubtxnSet>(
                   VERIFY_RESULT(SubtxnSet::FromPB(blocker.subtxn_set().set()))),
-            },
+              .lock_type = blocker.has_wait_for_edge_info()
+                  ? blocker.wait_for_edge_info().lock_type() : "",
+              .lock_entity = blocker.has_wait_for_edge_info()
+                  ? blocker.wait_for_edge_info().lock_entity() : "",
+              .conflict_tablet = blocker.has_wait_for_edge_info()
+                  ? blocker.wait_for_edge_info().conflict_tablet_id() : "",
+          };
+          auto blocking_info = BlockingInfo {
+            std::move(blocker_txn_info),
             WaitingRequestsInfo {
               .waiting_requests = {
                 {waiter_request_id, wait_start_time},
@@ -812,7 +845,9 @@ class DeadlockDetector::Impl : public std::enable_shared_from_this<DeadlockDetec
 
  private:
   void AddLocalDeadlock(
-      const TransactionId& local_txn, tserver::ProbeTransactionDeadlockResponsePB* resp) {
+      const TransactionId& local_txn,
+      tserver::ProbeTransactionDeadlockResponsePB* resp,
+      const tserver::ProbeTransactionDeadlockRequestPB* source_req = nullptr) {
     auto local_txn_info = controller_->GetTransactionInfo(local_txn);
     if (!local_txn_info) {
       LOG(WARNING) << "Local transaction committed or aborted after deadlock detected: "
@@ -832,6 +867,9 @@ class DeadlockDetector::Impl : public std::enable_shared_from_this<DeadlockDetec
     }
     new_entry->set_tablet_id(status_tablet_);
     new_entry->set_detector_id(detector_id_.data(), detector_id_.size());
+    if (source_req && source_req->has_wait_for_edge_info()) {
+      new_entry->mutable_wait_for_edge_info()->CopyFrom(source_req->wait_for_edge_info());
+    }
   }
 
   void ResolvePgSessionsDeadlock(
@@ -867,8 +905,15 @@ class DeadlockDetector::Impl : public std::enable_shared_from_this<DeadlockDetec
         continue;
       }
       auto& waiter = *waiter_or_status;
-      auto s = ScopeExit([&waiter, &deadlock_debug_msg]() {
-        deadlock_debug_msg << waiter.ToString() << "->";
+      auto s = ScopeExit([&waiter, &deadlock_debug_msg, &txn_info]() {
+        deadlock_debug_msg << waiter.ToString();
+        if (txn_info.has_wait_for_edge_info()) {
+          const auto& edge = txn_info.wait_for_edge_info();
+          deadlock_debug_msg << " -[" << edge.lock_type()
+                             << " on " << edge.lock_entity() << "]-> ";
+        } else {
+          deadlock_debug_msg << " -> ";
+        }
       });
       if (txn_info.has_is_pg_session_txn() && txn_info.is_pg_session_txn()) {
         // Don't abort session level transactions in order to break a deadlock. If the deadlock
@@ -1093,7 +1138,7 @@ class DeadlockDetector::Impl : public std::enable_shared_from_this<DeadlockDetec
           // TODO: this field should be deprecated in-favor of the deadlock field once it is safe
           // to do so.
           resp->add_deadlocked_txn_ids(local_blocking_txn_id.data(), local_blocking_txn_id.size());
-          AddLocalDeadlock(local_blocking_txn_id, resp);
+          AddLocalDeadlock(local_blocking_txn_id, resp, &req);
 
           return nullptr;
         }

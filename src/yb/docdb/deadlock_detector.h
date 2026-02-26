@@ -36,6 +36,12 @@ struct BlockerTransactionInfo {
   // Using shared ptr here avoids SubtxnSet copy in WaiterInfoEntry::UpdateBlockingData.
   std::shared_ptr<const SubtxnSet> blocking_subtxn_set;
 
+  // Lock info describing the conflicting edge (what the waiter wants, on what entity).
+  // These fields are informational and not part of equality/hash.
+  std::string lock_type;
+  std::string lock_entity;
+  TabletId conflict_tablet;
+
   bool operator==(const BlockerTransactionInfo& rhs) const {
     // Multiple requests of a waiter transaction could be blocked on different subtxn(s) of
     // a blocker transaction. Additionally a blocker transaction could be simultaneously
