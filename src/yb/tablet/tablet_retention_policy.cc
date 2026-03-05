@@ -93,6 +93,8 @@ HistoryCutoff TabletRetentionPolicy::UpdateCommittedHistoryCutoff(HistoryCutoff 
   std::lock_guard lock(mutex_);
   VLOG_WITH_PREFIX(4) << __func__ << "(" << value << ")";
   committed_history_cutoff_information_.MakeAtLeast(value);
+  LOG_WITH_PREFIX(INFO) << "History cutoff advanced via UpdateCommittedHistoryCutoff to "
+                        << committed_history_cutoff_information_;
   return committed_history_cutoff_information_;
 }
 
@@ -109,6 +111,8 @@ HistoryRetentionDirective TabletRetentionPolicy::GetRetentionDirective() {
       committed_history_cutoff_information_.MakeAtLeast(history_cutoff);
     }
   }
+
+  LOG_WITH_PREFIX(INFO) << "GetRetentionDirective using history_cutoff " << history_cutoff;
 
   return { history_cutoff, dockv::TableTTL(*metadata_.schema()),
           docdb::ShouldRetainDeleteMarkersInMajorCompaction(
@@ -233,6 +237,9 @@ HistoryCutoff TabletRetentionPolicy::SanitizeHistoryCutoff(
       allowed_cutoff = ConstructMinCutoff(
           allowed_cutoff, { allowed_from_syscatalog_flag, allowed_from_syscatalog_flag });
     }
+    LOG_WITH_PREFIX(INFO) << "SysCatalog history cutoff: retention_sec="
+                          << syscatalog_history_retention_interval_sec
+                          << ", resulting cutoff=" << allowed_cutoff;
   }
 
   // If cotables_cutoff_ht from provider is invalid then keep it invalid.

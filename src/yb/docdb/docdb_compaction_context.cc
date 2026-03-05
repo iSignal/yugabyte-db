@@ -1505,6 +1505,7 @@ void ManualHistoryRetentionPolicy::SetHistoryCutoff(HybridTime history_cutoff) {
 void ManualHistoryRetentionPolicy::SetHistoryCutoff(HistoryCutoff history_cutoff) {
   std::lock_guard<std::mutex> l(history_cutoff_mutex_);
   history_cutoff_ = history_cutoff;
+  LOG(INFO) << "ManualHistoryRetentionPolicy cutoff set to " << history_cutoff;
 }
 
 void ManualHistoryRetentionPolicy::SetTableTTLForTests(MonoDelta ttl) {

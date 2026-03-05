@@ -45,7 +45,7 @@ Status HistoryCutoffOperation::Apply(int64_t leader_term) {
     .primary_cutoff_ht = HybridTime::FromPB(request()->primary_cutoff_ht())
   };
 
-  VLOG_WITH_PREFIX(2) << "History cutoff replicated " << op_id() << ": " << history_cutoff;
+  LOG_WITH_PREFIX(INFO) << "History cutoff replicated " << op_id() << ": " << history_cutoff;
 
   auto tablet = VERIFY_RESULT(tablet_safe());
   history_cutoff = tablet->RetentionPolicy()->UpdateCommittedHistoryCutoff(history_cutoff);

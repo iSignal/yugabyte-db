@@ -3376,4 +3376,100 @@ TEST_P(PgIndexBackfillColumnProjectionTest, PartitionedTable) {
   ASSERT_OK(ValidateRpcs(rpcs));
 }
 
+class PgIndexBackfillSysCatalogSnapshotTooOld : public PgIndexBackfillTest {
+ public:
+  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
+    PgIndexBackfillTest::UpdateMiniClusterOptions(options);
+    options->extra_tserver_flags.push_back("--ysql_yb_test_block_index_phase=backfill");
+    options->extra_master_flags.push_back(
+        "--timestamp_history_retention_interval_sec=0");
+    options->extra_tserver_flags.push_back(
+        "--timestamp_history_retention_interval_sec=0");
+    options->extra_master_flags.push_back(
+        "--timestamp_syscatalog_history_retention_interval_sec=0");
+    options->extra_tserver_flags.push_back(
+        "--timestamp_syscatalog_history_retention_interval_sec=0");
+    // options->extra_master_flags.push_back("--history_cutoff_propagation_interval_ms=1");
+    //options->extra_tserver_flags.push_back("--history_cutoff_propagation_interval_ms=1");
+    //options->extra_tserver_flags.push_back("--ysql_yb_enable_invalidation_messages=false");
+    //options->extra_tserver_flags.push_back("--ysql_yb_ddl_transaction_block_enabled=false");
+    options->extra_tserver_flags.push_back("--TEST_slowdown_backfill_by_ms=2000");
+  }
+};
+
+INSTANTIATE_TEST_CASE_P(, PgIndexBackfillSysCatalogSnapshotTooOld, ::testing::Values(true));
+
+TEST_P(PgIndexBackfillSysCatalogSnapshotTooOld, SysCatalogSnapshotTooOld) {
+  constexpr auto kOtherDbName = "otherdb";
+
+  ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (i int)", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "INSERT INTO $0 VALUES (generate_series(1, 100))", kTableName));
+
+  ASSERT_OK(conn_->ExecuteFormat("CREATE DATABASE $0", kOtherDbName));
+
+  // Index creation starts blocked at indislive (set in UpdateMiniClusterOptions).
+  std::atomic<bool> index_creation_done{false};
+  Status index_creation_status;
+  thread_holder_.AddThreadFunctor(
+      [this, &index_creation_done, &index_creation_status] {
+    LOG(INFO) << "Begin create index thread";
+    auto create_conn = ASSERT_RESULT(ConnectToDB(kDatabaseName));
+    index_creation_status = create_conn.ExecuteFormat(
+        "CREATE INDEX $0 ON $1 (i)", kIndexName, kTableName);
+    index_creation_done.store(true, std::memory_order_release);
+    LOG(INFO) << "End create index thread, status: " << index_creation_status;
+  });
+
+  // Give the index creation time to reach the indislive block.
+  SleepFor(RegularBuildVsSanitizers(5s, 30s));
+
+  // Background thread: continuously create/drop tables in another DB and flush/compact sys catalog.
+  std::atomic<bool> stop_churn{false};
+  thread_holder_.AddThreadFunctor(
+      [this, &stop_churn] {
+    LOG(INFO) << "Begin sys catalog churn thread";
+    auto churn_conn = ASSERT_RESULT(ConnectToDB(kOtherDbName));
+    int iteration = 0;
+    while (!stop_churn.load(std::memory_order_acquire)) {
+      auto table_name = Format("churn_$0", iteration);
+      auto s = churn_conn.ExecuteFormat("CREATE TABLE $0 (i int)", table_name);
+      if (!s.ok()) {
+        LOG(WARNING) << "Churn CREATE TABLE failed: " << s;
+        break;
+      }
+      s = churn_conn.ExecuteFormat("DROP TABLE $0", table_name);
+      if (!s.ok()) {
+        LOG(WARNING) << "Churn DROP TABLE failed: " << s;
+        break;
+      }
+      s = FlushAndCompactSysCatalog(cluster_.get(), 1min);
+      if (!s.ok()) {
+        LOG(WARNING) << "FlushAndCompactSysCatalog failed: " << s;
+      }
+      ++iteration;
+    }
+    LOG(INFO) << "End sys catalog churn thread after " << iteration << " iterations";
+  });
+
+  // Hold at indislive for 20s while churn runs, then unblock.
+  LOG(INFO) << "Index blocked at indislive, waiting 20s";
+  SleepFor(20s);
+
+  LOG(INFO) << "Unblocking index creation";
+  ASSERT_OK(cluster_->SetFlagOnTServers("ysql_yb_test_block_index_phase", "none"));
+
+  ASSERT_OK(WaitFor(
+      [&index_creation_done]() -> Result<bool> {
+        return index_creation_done.load(std::memory_order_acquire);
+      },
+      120s,
+      "wait for index creation to complete"));
+
+  stop_churn.store(true, std::memory_order_release);
+  thread_holder_.JoinAll();
+
+  ASSERT_OK(index_creation_status);
+}
+
 } // namespace yb::pgwrapper
