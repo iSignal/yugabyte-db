@@ -19,7 +19,7 @@
 //
 // Portions Copyright (c) YugabyteDB, Inc.
 //
-// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+// Li censed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
 //
 // http://www.apache.org/licenses/LICENSE-2.0
@@ -14250,12 +14250,7 @@ Result<TSDescriptorPtr> CatalogManager::LookupTSByUUID(const TabletServerId& tse
 }
 
 bool CatalogManager::SkipCatalogVersionChecks() {
-  // Only skip if we are leader and the major catalog upgrade is in progress.
-  SCOPED_LEADER_SHARED_LOCK(l, this);
-  if (l.IsInitializedAndIsLeader()) {
-    return ysql_manager_->IsMajorUpgradeInProgress();
-  }
-  return false;
+  return true;
 }
 
 void CatalogManager::RemoveNamespaceFromMaps(
