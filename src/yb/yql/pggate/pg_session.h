@@ -147,10 +147,17 @@ class PgSession final : public std::enable_shared_from_this<PgSession> {
     uint32_t key_group;
     std::string key_value;
     std::optional<uint32_t> lifetime_threshold_ms;
+    // Catalog version the key is keyed at (0 for non-versioned/preload-style entries). Lets the
+    // tserver pick a provably-version-consistent population read time (catalog version watermark).
+    uint64_t catalog_version = 0;
+    // The database whose catalog version counter catalog_version belongs to (MyDatabaseId). Differs
+    // from key_group for shared catalogs; the watermark proof is looked up under this db.
+    uint32_t version_db_oid = 0;
   };
 
   Result<PerformFuture> RunAsync(
-      std::span<const PgsqlOpPtr> ops, const PgTableDesc& table, const RunOptions& options = {});
+      std::span<const PgsqlOpPtr> ops, const PgTableDesc& table, const RunOptions& options = {},
+      std::optional<CacheOptions>&& cache_options = std::nullopt);
 
   Result<PerformFuture> RunAsync(
       const OperationGenerator& generator, const RunOptions& options = {});
@@ -214,6 +221,18 @@ class PgSession final : public std::enable_shared_from_this<PgSession> {
   [[nodiscard]] ExplicitRowLockBuffer& explicit_row_lock_buffer() {
     return explicit_row_lock_buffer_;
   }
+
+  // True when the session is executing a DDL. Catcache/relcache miss reads bypass the response
+  // cache in this state so a DDL sees its own uncommitted catalog writes (see BuildCatalogCacheOptions).
+  bool IsDdlMode() const;
+
+  // True once this session has EVER written to a ysql catalog table OUTSIDE DDL mode (e.g. under
+  // yb_non_ddl_txn_for_sys_tables_allowed, large-object metadata writes, ...). Such writes do NOT
+  // bump the catalog version, so version-keyed cached catalog scans can never reflect them; once
+  // latched, catcache/relcache miss reads bypass the response cache for the session's lifetime.
+  // (DDL-mode writes don't latch: a committed DDL bumps the version - cached reads at the new
+  // version are fresh; an aborted DDL rolls its writes back - old-version entries stay correct.)
+  [[nodiscard]] bool HasNonDdlCatalogWrites() const { return has_non_ddl_catalog_writes_; }
 
  private:
   Result<PgTableDescPtr> DoLoadTable(
@@ -292,6 +311,8 @@ class PgSession final : public std::enable_shared_from_this<PgSession> {
   PgOperationBuffer buffer_;
 
   bool has_catalog_write_ops_in_ddl_mode_ = false;
+  // Session-lifetime latch; see HasNonDdlCatalogWrites().
+  bool has_non_ddl_catalog_writes_ = false;
 
   // This session is upgrading to PG15.
   const bool is_major_pg_version_upgrade_;

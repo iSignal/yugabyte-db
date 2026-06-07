@@ -76,8 +76,10 @@ METRIC_DEFINE_gauge_uint32(server, pg_response_cache_entries,
                       yb::MetricUnit::kEntries,
                       "Number of entries in PgClientService response cache");
 
-DEFINE_NON_RUNTIME_uint64(pg_response_cache_capacity, 1024,
-    "PgClientService response cache capacity.");
+DEFINE_NON_RUNTIME_uint64(pg_response_cache_capacity, 3072,
+    "PgClientService response cache capacity. Default raised to 3x the original 1024 to accommodate "
+    "catcache/relcache miss full-scan entries (one per (table, scan-target, catalog_version)) in "
+    "addition to preload entries.");
 
 DEFINE_NON_RUNTIME_uint64(pg_response_cache_size_bytes, 0,
                           "Size in bytes of the PgClientService response cache. "
@@ -403,9 +405,15 @@ class PgResponseCache::Impl : private GarbageCollector {
   Result<Setter> Get(
       LWPgPerformOptionsPB::LWCachingInfoPB* cache_info, CoarseTimePoint deadline,
       const PgResponseCacheWaiterPtr& waiter) EXCLUDES(mutex_) {
+    // Capture key info for logging before GetEntryData moves the key_value out of cache_info.
+    const auto log_group = cache_info->key_group();
+    const auto log_key = VLOG_IS_ON(2)
+        ? Slice(cache_info->key_value()).ToDebugHexString() : std::string();
     auto data = GetEntryData(cache_info, deadline);
     queries_->Increment();
     if (!data) {
+      VLOG(2) << "PgResponseCache DISABLED (no cache) for key_group=" << log_group
+              << " key_value=" << log_key;
       return [](Response&& response) {};
     }
     auto response_opt = data->RegisterWaiter(waiter);
@@ -416,11 +424,15 @@ class PgResponseCache::Impl : private GarbageCollector {
     // 3) *response_opt != nullptr means that response is ready and we could send it.
     if (response_opt) {
       hits_->Increment();
+      VLOG(2) << "PgResponseCache HIT for key_group=" << log_group << " key_value=" << log_key
+              << (*response_opt ? " (response ready)" : " (single-flight waiter)");
       if (*response_opt) {
         waiter->Apply(**response_opt);
       }
       return Setter();
     }
+    VLOG(2) << "PgResponseCache MISS/INSERT (will read from master) for key_group=" << log_group
+            << " key_value=" << log_key;
     return [empty_data = std::move(data)](Response&& response) {
       empty_data->Set(std::move(response));
     };

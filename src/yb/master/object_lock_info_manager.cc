@@ -36,11 +36,13 @@
 #include "yb/master/master_ddl.pb.h"
 #include "yb/master/scoped_leader_shared_lock.h"
 #include "yb/master/sys_catalog.h"
+#include "yb/master/ts_descriptor.h"
 #include "yb/master/ts_manager.h"
 
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/poller.h"
 #include "yb/rpc/rpc_context.h"
+#include "yb/rpc/rpc_controller.h"
 
 #include "yb/tserver/tserver.pb.h"
 #include "yb/tserver/tserver_service.proxy.h"
@@ -196,6 +198,7 @@ class ObjectLockInfoManager::Impl {
       AcquireObjectLockRequestPB&& req, CoarseTimePoint deadline, StdStatusCallback&& callback);
 
   void PopulateDbCatalogVersionCache(ReleaseObjectLockRequestPB& req);
+  Status UpdateTServersWithLatestCatalogVersion(CoarseTimePoint deadline);
   Status UnlockObject(
       ReleaseObjectLockRequestPB&& req, std::optional<StdStatusCallback>&& callback = std::nullopt,
       std::optional<LeaderEpoch> leader_epoch = std::nullopt);
@@ -546,6 +549,7 @@ bool CompareReleaseRequestsIgnoringCatalogFields(
   // Configure fields to ignore
   md.IgnoreField(req1.GetDescriptor()->FindFieldByName("db_catalog_version_data"));
   md.IgnoreField(req1.GetDescriptor()->FindFieldByName("db_catalog_inval_messages_data"));
+  md.IgnoreField(req1.GetDescriptor()->FindFieldByName("db_catalog_version_proof_data"));
   md.IgnoreField(req1.GetDescriptor()->FindFieldByName("populate_db_catalog_info"));
 
   if (diff_str) {
@@ -579,6 +583,7 @@ ReleaseObjectLockRequestPB ReleaseRequestToPersist(const ReleaseObjectLockReques
   }
   DCHECK(!req.has_db_catalog_version_data());
   DCHECK(!req.has_db_catalog_inval_messages_data());
+  DCHECK(!req.has_db_catalog_version_proof_data());
   req_to_persist.set_populate_db_catalog_info(req.populate_db_catalog_info());
   req_to_persist.mutable_object_locks()->CopyFrom(req.object_locks());
 
@@ -638,6 +643,10 @@ void ObjectLockInfoManager::UnlockObject(
 
 void ObjectLockInfoManager::ReleaseLocksForTxn(const TransactionId& txn_id) {
   impl_->UnlockObject(txn_id);
+}
+
+Status ObjectLockInfoManager::UpdateTServersWithLatestCatalogVersion(CoarseTimePoint deadline) {
+  return impl_->UpdateTServersWithLatestCatalogVersion(deadline);
 }
 
 Status ObjectLockInfoManager::RefreshYsqlLease(
@@ -1010,9 +1019,13 @@ void ObjectLockInfoManager::Impl::PopulateDbCatalogVersionCache(ReleaseObjectLoc
     return;
   }
 
-  // Populate all known invalidation messages
+  // Populate all known invalidation messages, plus the catalog version watermark (per-(db, version)
+  // guaranteed read times) derived from the same read. Carrying the watermark lets the recipient
+  // TServer serve version-keyed catcache reads at the just-bumped version immediately, instead of
+  // waiting for the next heartbeat to deliver the guaranteed time.
+  DbOidToCatalogVersionGuaranteedTimeMap guaranteed_times;
   Result<DbOidVersionToMessageListMap> inval_messages =
-    catalog_manager_.GetYsqlCatalogInvalationMessages(false /*use_cache*/);
+    catalog_manager_.GetYsqlCatalogInvalationMessages(&versions, &guaranteed_times);
   if (!inval_messages.ok()) {
     LOG(WARNING) << "Couldn't populate invalidation messages in lock release request " << s;
     return;
@@ -1027,6 +1040,62 @@ void ObjectLockInfoManager::Impl::PopulateDbCatalogVersionCache(ReleaseObjectLoc
     }
   }
 
+  auto* const proof_data = req.mutable_db_catalog_version_proof_data();
+  for (const auto& [db_oid, version_times] : guaranteed_times) {
+    auto* const db_proof = proof_data->add_db_proofs();
+    db_proof->set_db_oid(db_oid);
+    for (const auto& [version, guaranteed_ht] : version_times) {
+      auto* const entry = db_proof->add_versions();
+      entry->set_version(version);
+      entry->set_guarantee_ht(guaranteed_ht);
+    }
+  }
+}
+
+Status ObjectLockInfoManager::Impl::UpdateTServersWithLatestCatalogVersion(
+    CoarseTimePoint deadline) {
+  // Build an empty-lock release request carrying just the latest catalog version data. The tserver
+  // applies the catalog version on receipt (see TabletServiceImpl::ReleaseObjectLocks), so this
+  // propagates a version-bumping DDL synchronously instead of waiting for the heartbeat.
+  ReleaseObjectLockRequestPB req;
+  req.set_populate_db_catalog_info(true);
+  PopulateDbCatalogVersionCache(req);
+  if (!req.has_db_catalog_version_data()) {
+    // Couldn't read catalog versions (e.g. table absent mid-migration); fall back to the heartbeat
+    // path rather than sending an empty update.
+    return Status::OK();
+  }
+
+  TSDescriptorVector descriptors;
+  master_.ts_manager()->GetAllLiveDescriptors(&descriptors);
+  VLOG(2) << "Pushing latest catalog version to " << descriptors.size()
+          << " tservers; db_catalog_version_data="
+          << req.db_catalog_version_data().ShortDebugString();
+  for (const auto& ts : descriptors) {
+    std::shared_ptr<tserver::TabletServerServiceProxy> proxy;
+    auto proxy_status = ts->GetProxy(&proxy);
+    if (!proxy_status.ok()) {
+      YB_LOG_EVERY_N_SECS(WARNING, 5)
+          << "Skipping catalog version push to tserver " << ts->permanent_uuid() << ": "
+          << proxy_status << " (will be caught up by heartbeat)";
+      continue;
+    }
+    tserver::ReleaseObjectLockResponsePB resp;
+    rpc::RpcController controller;
+    controller.set_deadline(deadline);
+    // Best-effort and synchronous per tserver: a tserver that is briefly unreachable is simply
+    // updated on its next heartbeat; we do not fail the DDL on a propagation error.
+    auto s = proxy->ReleaseObjectLocks(req, &resp, &controller);
+    if (!s.ok()) {
+      YB_LOG_EVERY_N_SECS(WARNING, 5)
+          << "Failed to push catalog version to tserver " << ts->permanent_uuid() << ": " << s;
+    } else if (resp.has_error()) {
+      YB_LOG_EVERY_N_SECS(WARNING, 5)
+          << "tserver " << ts->permanent_uuid() << " returned error for catalog version push: "
+          << resp.error().ShortDebugString();
+    }
+  }
+  return Status::OK();
 }
 
 Status ObjectLockInfoManager::Impl::UnlockObjectSync(

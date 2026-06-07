@@ -35,6 +35,7 @@
 
 DECLARE_int32(transaction_table_num_tablets);
 DECLARE_int32(heartbeat_interval_ms);
+DECLARE_bool(ysql_enable_catcache_response_caching);
 
 using namespace std::literals;
 using std::string;
@@ -114,6 +115,13 @@ class PgGetOldTxnsTest : public PgLocksTestBase {
  protected:
   void SetUp() override {
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_transaction_table_num_tablets) = 1;
+    // InitSession leaves each session's connection in an open snapshot transaction, and later a
+    // session references a table created by a different connection after that snapshot began. With
+    // the tserver catcache response cache, a backend's catalog reads are served at its own
+    // (transaction-pinned) catalog version, so the newer table is not visible ("relation does not
+    // exist"); without it the catcache miss reads the latest catalog. Disable the response cache
+    // here so these transaction-status tests see the latest catalog as they assume.
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_enable_catcache_response_caching) = false;
     PgLocksTestBase::SetUp();
   }
 

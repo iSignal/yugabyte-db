@@ -326,7 +326,12 @@ void MasterHeartbeatServiceImpl::PopulatePgCatalogVersionInfo(
   // a fingerprint or the tserver's fingerprint does not match the master's
   // fingerprint. The tserver does not provide a fingerprint when it has
   // not received any catalog versions yet after it starts.
-  if (req.has_ysql_db_catalog_versions_fingerprint() &&
+  // When invalidation messages are enabled, always return the full set of catalog versions: each
+  // heartbeat rebuilds the catalog-version watermark (guaranteed read times) from a fresh read of
+  // pg_yb_invalidation_messages, so the fingerprint short-circuit (which would skip the versions
+  // and the messages read) is disabled.
+  if (!FLAGS_ysql_yb_enable_invalidation_messages &&
+      req.has_ysql_db_catalog_versions_fingerprint() &&
       req.ysql_db_catalog_versions_fingerprint() == fingerprint) {
     VLOG_IF(2, FLAGS_log_ysql_catalog_versions)
         << "Responding (to ts "
@@ -344,15 +349,12 @@ void MasterHeartbeatServiceImpl::PopulatePgCatalogVersionInfo(
   }
 
   if (FLAGS_ysql_yb_enable_invalidation_messages) {
-    // We only read pg_yb_invalidation_messages when there is any catalog version
-    // change. This reduces the number of reading pg_yb_invalidation_messages which
-    // may be bulky if there are many databases and/or large invalidation messages.
-    // The risk is that if this read fails, we end up only having catalog version
-    // updates but not the associated invalidation messages updates which can cause
-    // catalog cache refreshes on those nodes that have got the new catalog
-    // version but missed the messages.
-    auto messages = catalog_manager_->GetYsqlCatalogInvalationMessages(
-        FLAGS_enable_heartbeat_pg_catalog_versions_cache /* use_cache */);
+    // Read pg_yb_invalidation_messages and derive the catalog version watermark from the same read:
+    // the per-version invalidation message lists go back to the tserver to invalidate catcaches,
+    // and the per-version guaranteed read times go back as the version->guarantee map the response
+    // cache uses to pick population read times for version-keyed catalog scans.
+    DbOidToCatalogVersionGuaranteedTimeMap guaranteed_times;
+    auto messages = catalog_manager_->GetYsqlCatalogInvalationMessages(&versions, &guaranteed_times);
     if (messages.ok()) {
       // The table pg_yb_invalidation_messages is empty.
       VLOG_IF(2, messages->empty()) << "No YSQL invalidation messages for heartbeat response: "
@@ -366,6 +368,20 @@ void MasterHeartbeatServiceImpl::PopulatePgCatalogVersionInfo(
           inval_messages->set_message_list(std::move(*message_list));
         }
       }
+      auto* const proof_data = resp.mutable_db_catalog_version_proof_data();
+      for (const auto& [db_oid, version_times] : guaranteed_times) {
+        auto* const db_proof = proof_data->add_db_proofs();
+        db_proof->set_db_oid(db_oid);
+        for (const auto& [version, guaranteed_ht] : version_times) {
+          auto* const entry = db_proof->add_versions();
+          entry->set_version(version);
+          entry->set_guarantee_ht(guaranteed_ht);
+        }
+      }
+      LOG_IF(INFO, FLAGS_log_ysql_catalog_versions)
+          << "responding (to ts " << req.common().ts_instance().permanent_uuid()
+          << ") catalog version guaranteed read times: "
+          << resp.db_catalog_version_proof_data().ShortDebugString();
     } else {
       const auto& s = messages.status();
       auto msg = Format("Could not get YSQL invalidation messages for heartbeat response: $0", s);

@@ -286,6 +286,10 @@ class TabletServer : public DbServerBase, public TabletServerIf {
     std::lock_guard l(lock_);
     SetYsqlDBCatalogVersionsUnlocked(db_catalog_version_data, 0UL /* debug_id */);
   }
+  void SetYsqlDBCatalogVersionProofs(
+      const tserver::DBCatalogVersionProofDataPB& proof_data) EXCLUDES(lock_) override;
+  std::optional<uint64_t> GetYsqlCatalogVersionProofHt(
+      uint32_t db_oid, uint64_t version) const EXCLUDES(lock_) override;
   void SetYsqlDBCatalogInvalMessagesUnlocked(
       const tserver::DBCatalogInvalMessagesDataPB& db_catalog_inval_messages_data,
       uint64_t debug_id) REQUIRES(lock_);
@@ -572,6 +576,15 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   uint64_t ysql_catalog_version_ GUARDED_BY(lock_) = 0;
   uint64_t ysql_last_breaking_catalog_version_ GUARDED_BY(lock_) = 0;
   tserver::DbOidToCatalogVersionInfoMap ysql_db_catalog_version_map_ GUARDED_BY(lock_);
+
+  // Catalog version proof times (watermark), heartbeat-fed: per db, hybrid times at which
+  // specific catalog versions were provably still current at the master. Consumed by
+  // PgClientSession to pick population read times for response-cache-keyed catalog scans.
+  // Flat catalog version -> guarantee hybrid time. Looked up purely by version (no latest/
+  // superseded distinction); merged by max so a version's time only moves forward.
+  using YsqlCatalogVersionProof = std::map<uint64_t, uint64_t>;
+  std::unordered_map<uint32_t, YsqlCatalogVersionProof> ysql_db_catalog_version_proof_map_
+      GUARDED_BY(lock_);
 
   // This map represents an extended history of pg_yb_invalidation_messages except message_time
   // (i.e., db_oid, current_version, inval messages). For each db_oid, it stores a queue of

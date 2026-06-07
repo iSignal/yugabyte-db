@@ -206,6 +206,7 @@ const YbcPgGFlagsAccessor* YBCGetGFlags() {
       .ysql_sleep_before_retry_on_txn_conflict  = &FLAGS_ysql_sleep_before_retry_on_txn_conflict,
       .ysql_colocate_database_by_default        = &FLAGS_ysql_colocate_database_by_default,
       .ysql_enable_read_request_caching         = &FLAGS_ysql_enable_read_request_caching,
+      .ysql_enable_catcache_response_caching    = &FLAGS_ysql_enable_catcache_response_caching,
       .ysql_enable_profile                      = &FLAGS_ysql_enable_profile,
       .ysql_disable_global_impact_ddl_statements =
           &FLAGS_ysql_disable_global_impact_ddl_statements,

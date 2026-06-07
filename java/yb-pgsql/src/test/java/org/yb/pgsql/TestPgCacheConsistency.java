@@ -54,6 +54,17 @@ public class TestPgCacheConsistency extends BasePgSQLTest {
     flags.put("enable_object_locking_for_table_locks", "false");
     // TODO(29142): Fix the test with txn ddl and reenable.
     flags.put("ysql_yb_ddl_transaction_block_enabled", "false");
+    // Disable the tserver catcache response cache for this suite. Some assertions here encode
+    // timing expectations about when a second connection observes a DDL from another connection
+    // (e.g. testPgInheritsCacheConsistency expects a mid-transaction SELECT to pick up a partition
+    // created concurrently). Those expectations are not reliable under the response cache: it serves
+    // version-keyed catalog scans at the reader's *own* catalog version, which for a backend inside
+    // a transaction is pinned (it does not advance mid-transaction unless object locking forces a
+    // refresh on lock acquisition). The outcome therefore depends on build mode (READ COMMITTED maps
+    // to REPEATABLE READ in debug but not release) and on object locking - none of which this suite
+    // controls for. The response cache itself is covered by PgCatalogPerfTest / PgLibPqTest's
+    // Catcache* tests; here we exercise the non-cached catalog-consistency path.
+    flags.put("ysql_enable_catcache_response_caching", "false");
     return flags;
   }
 
@@ -301,6 +312,13 @@ public class TestPgCacheConsistency extends BasePgSQLTest {
             assertTrue(miniCluster.getClient().setFlag(
                 hp, "TEST_tserver_disable_heartbeat", "true", true));
           }
+          // Also disable the synchronous catalog-version push to tservers; otherwise the DDL commit
+          // on connection 1 pushes the new version straight to connection 2's tserver (bypassing
+          // the disabled heartbeat), closing the staleness window this test relies on.
+          for (HostAndPort hp : miniCluster.getMasters().keySet()) {
+            assertTrue(miniCluster.getClient().setFlag(
+                hp, "ysql_enable_catalog_version_push_to_tservers_on_ddl", "false", true));
+          }
         }
 
         errors = IntStream.range(0, attempts)
@@ -323,6 +341,10 @@ public class TestPgCacheConsistency extends BasePgSQLTest {
           for (HostAndPort hp : miniCluster.getTabletServers().keySet()) {
             assertTrue(miniCluster.getClient().setFlag(
                 hp, "TEST_tserver_disable_heartbeat", "false", true));
+          }
+          for (HostAndPort hp : miniCluster.getMasters().keySet()) {
+            assertTrue(miniCluster.getClient().setFlag(
+                hp, "ysql_enable_catalog_version_push_to_tservers_on_ddl", "true", true));
           }
         }
       }
@@ -880,6 +902,13 @@ public class TestPgCacheConsistency extends BasePgSQLTest {
       for (HostAndPort hostAndPort : miniCluster.getTabletServers().keySet()) {
         assertTrue(miniCluster.getClient().setFlag(
             hostAndPort, "TEST_tserver_disable_heartbeat", "true", true));
+      }
+      // Also disable the synchronous catalog-version push, which would otherwise propagate the new
+      // version to tserver 1 at DDL commit (bypassing the disabled heartbeat) and let SELECT x1
+      // succeed, hiding the stale-cache error this test checks for.
+      for (HostAndPort hostAndPort : miniCluster.getMasters().keySet()) {
+        assertTrue(miniCluster.getClient().setFlag(
+            hostAndPort, "ysql_enable_catalog_version_push_to_tservers_on_ddl", "false", true));
       }
 
       statement1.execute("ALTER TABLE test_table ADD COLUMN x1 int");

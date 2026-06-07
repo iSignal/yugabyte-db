@@ -888,6 +888,7 @@ class PgClientServiceImpl::Impl : public SessionProvider {
         advisory_locks_table_(client_future_),
         session_context_{
             .xcluster_context = xcluster_context,
+            .tablet_server = &tablet_server_,
             .advisory_locks_table = advisory_locks_table_,
             .pg_node_level_mutation_counter = pg_node_level_mutation_counter,
             .clock = clock_,

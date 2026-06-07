@@ -34,7 +34,10 @@
 #include "yb/util/status_format.h"
 #include "yb/util/status_log.h"
 
+#include "yb/yql/pggate/pg_op.h"
+#include "yb/yql/pggate/pg_session.h"
 #include "yb/yql/pggate/pg_table.h"
+#include "yb/yql/pggate/pg_tabledesc.h"
 #include "yb/yql/pggate/pg_tools.h"
 #include "yb/yql/pggate/pggate_flags.h"
 #include "yb/yql/pggate/util/pg_doc_data.h"
@@ -47,6 +50,31 @@ DECLARE_double(max_buffer_size_to_rpc_limit_ratio);
 
 namespace yb::pggate {
 namespace {
+
+// Builds response cache options for a catcache/relcache miss read keyed by `cache_key`. Returns
+// nullopt (no caching) when the feature is disabled, the key is empty, or the session is in DDL
+// mode (a DDL must read its own uncommitted catalog writes, not a cached response). key_group ==
+// db_oid (the catalog table's database) matches the preload path, so a DDL-commit Disable(db_oid)
+// invalidates both preload and miss-fill entries.
+std::optional<PgSession::CacheOptions> BuildCatalogCacheOptions(
+    PgSession* session, PgOid db_oid, const std::string& cache_key, uint64_t catalog_version,
+    uint32_t version_db_oid) {
+  if (!FLAGS_ysql_enable_catcache_response_caching || cache_key.empty() || session->IsDdlMode()) {
+    VLOG(2) << "BuildCatalogCacheOptions: disabled (flag="
+            << FLAGS_ysql_enable_catcache_response_caching << " key_empty=" << cache_key.empty()
+            << " ddl=" << session->IsDdlMode() << ")";
+    return std::nullopt;
+  }
+  VLOG(2) << "BuildCatalogCacheOptions: enabled db_oid=" << db_oid << " key=" << cache_key
+          << " version=" << catalog_version << " version_db_oid=" << version_db_oid;
+  return PgSession::CacheOptions{
+      .key_group = db_oid,
+      .key_value = cache_key,
+      .lifetime_threshold_ms = std::nullopt,
+      .catalog_version = catalog_version,
+      .version_db_oid = version_db_oid,
+  };
+}
 
 struct PgDocReadOpCachedHelper {
   PgTable dummy_table;
@@ -455,6 +483,7 @@ Status PgDocOp::ProcessResponseImpl(const Result<PgDocResponse::Data>& response)
   if (data.used_in_txn_limit) {
     GetInTxnLimitHt() = data.used_in_txn_limit.ToUint64();
   }
+  response_cache_hit_ = data.response_cache_hit;
   return CompleteProcessResponse();
 }
 
@@ -562,10 +591,18 @@ Result<size_t> PgDocOp::CompleteRequests() {
 Result<PgDocResponse> PgDocOp::DefaultSender(
     PgSession* session, std::span<const PgsqlOpPtr> ops, const PgTableDesc& table,
     const PgSession::RunOptions& options, IsForWritePgDoc is_write) {
+  return DefaultSenderWithCacheOptions(session, ops, table, options, is_write, std::nullopt);
+}
+
+Result<PgDocResponse> PgDocOp::DefaultSenderWithCacheOptions(
+    PgSession* session, std::span<const PgsqlOpPtr> ops, const PgTableDesc& table,
+    const PgSession::RunOptions& options, IsForWritePgDoc is_write,
+    std::optional<PgSession::CacheOptions> cache_options) {
   PgDocResponse::MetricInfo metrics{
     ResolveRelationType(*ops.front(), table), is_write,
     IsOpBuffered(!options.force_non_bufferable)};
-  auto result = PgDocResponse{VERIFY_RESULT(session->RunAsync(ops, table, options)), metrics};
+  auto result = PgDocResponse{
+      VERIFY_RESULT(session->RunAsync(ops, table, options, std::move(cache_options))), metrics};
   if (!result.Valid()) {
     // session->RunAsync() calls PgSession::DoRunAsync() -> RunHelper::Flush().
     // RunHelper::Flush() returns PerformFuture() (empty constructor) when ops_info_.ops.Empty()
@@ -738,6 +775,46 @@ PgDocReadOp::PgDocReadOp(const PgSessionPtr& pg_session,
                          const Sender& sender)
     : PgDocOp(pg_session, table, sender), read_op_(std::move(read_op)) {}
 
+void PgDocReadOp::SetResponseCacheKey(
+    std::string cache_key, uint64_t catalog_version, uint32_t version_db_oid) {
+  response_cache_key_ = std::move(cache_key);
+  response_cache_catalog_version_ = catalog_version;
+  response_cache_version_db_oid_ = version_db_oid;
+  // Install a sender that routes this read through the tserver response cache. The full cache key
+  // is the prefix (set by the catcache/relcache miss path: "<reloid>:<indexoid>:<version>") plus
+  // the serialized read request. stmt_id and metrics_capture are backend-varying and are cleared
+  // before serialization (and restored afterwards) so different backends issuing the same keyless
+  // scan at the same catalog version compute an identical key and share one cache entry.
+  SetSender(
+      [this](
+          PgSession* session, std::span<const PgsqlOpPtr> ops, const PgTableDesc& table,
+          const PgSession::RunOptions& options, IsForWritePgDoc is_write) -> Result<PgDocResponse> {
+        VLOG(2) << "catcache response cache sender: prefix=" << response_cache_key_
+                << " ops=" << ops.size();
+        std::string full_key = response_cache_key_;
+        for (const auto& op : ops) {
+          auto& req = down_cast<PgsqlReadOp&>(*op).read_request();
+          const auto stmt_id = req.has_stmt_id() ? std::optional(req.stmt_id()) : std::nullopt;
+          const auto metrics_capture =
+              req.has_metrics_capture() ? std::optional(req.metrics_capture()) : std::nullopt;
+          req.clear_stmt_id();
+          req.clear_metrics_capture();
+          req.AppendToString(&full_key);
+          if (stmt_id) {
+            req.set_stmt_id(*stmt_id);
+          }
+          if (metrics_capture) {
+            req.set_metrics_capture(*metrics_capture);
+          }
+        }
+        return DefaultSenderWithCacheOptions(
+            session, ops, table, options, is_write,
+            BuildCatalogCacheOptions(
+                session, table.relfilenode_id().database_oid, full_key,
+                response_cache_catalog_version_, response_cache_version_db_oid_));
+      });
+}
+
 Status PgDocReadOp::ExecuteInit(const YbcPgExecParameters* exec_params) {
   RSTATUS_DCHECK(
       pgsql_ops_.empty() || !exec_params,
@@ -751,6 +828,22 @@ Status PgDocReadOp::ExecuteInit(const YbcPgExecParameters* exec_params) {
 
   read_op_->read_request().set_return_paging_state(true);
   RETURN_NOT_OK(SetRequestPrefetchLimit());
+  if (!response_cache_key_.empty()) {
+    // A response-cached catalog scan must issue ONE canonical, backend-independent request that
+    // returns the whole table in a single response:
+    //  - The cache key embeds the serialized request, so any backend-varying field makes sharing
+    //    impossible. limit/size_limit come from session GUCs (yb_fetch_row_limit/yb_fetch_size_limit)
+    //    and must not leak into the key.
+    //  - With the session's fetch limit applied, a single catcache miss turns into a PAGED full-table
+    //    scan: one Perform (and one cache entry, keyed by paging state) PER PAGE. At the default
+    //    1024-row limit a pg_attribute miss costs ~13 round trips; with a small yb_fetch_row_limit it
+    //    is thousands, stalling the statement for seconds and shifting its read time.
+    // 0 means 'unlimited' for both fields: the full scan arrives in one response with no paging
+    // state, so one miss = one master read and one hit = one round trip.
+    auto& req = read_op_->read_request();
+    req.set_limit(0);
+    req.set_size_limit(0);
+  }
   SetBackfillSpec();
   SetRowMark();
   SetReadTimeForBackfill();

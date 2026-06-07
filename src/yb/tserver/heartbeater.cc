@@ -497,6 +497,11 @@ Status HeartbeatPoller::TryHeartbeat() {
       PREDICT_TRUE(!FLAGS_TEST_tserver_disable_catalog_refresh_on_heartbeat)) {
     // In per-db catalog version mode (the only supported mode) we never use ysql_catalog_version.
     DCHECK(!last_hb_response_.has_ysql_catalog_version());
+    // Catalog version proof times (watermark) arrive on EVERY heartbeat, independent of the
+    // version-data fingerprint short-circuit, so handle them unconditionally first.
+    if (last_hb_response_.has_db_catalog_version_proof_data()) {
+      server_.SetYsqlDBCatalogVersionProofs(last_hb_response_.db_catalog_version_proof_data());
+    }
     if (last_hb_response_.has_db_catalog_version_data()) {
       if (FLAGS_log_ysql_catalog_versions) {
         VLOG_WITH_FUNC(1) << "got master db catalog version data: "

@@ -1766,6 +1766,19 @@ Status PgApiImpl::SetForwardScan(PgStatement* handle, bool is_forward_scan) {
   return Status::OK();
 }
 
+Status PgApiImpl::SetResponseCacheKey(
+    PgStatement* handle, const char* cache_key, uint64_t catalog_version,
+    uint32_t version_db_oid) {
+  VERIFY_RESULT_REF(GetStatementAs<PgSelect>(handle))
+      .SetResponseCacheKey(cache_key, catalog_version, version_db_oid);
+  return Status::OK();
+}
+
+Status PgApiImpl::GetResponseCacheHit(PgStatement* handle, bool* response_cache_hit) {
+  *response_cache_hit = VERIFY_RESULT_REF(GetStatementAs<PgSelect>(handle)).ResponseCacheHit();
+  return Status::OK();
+}
+
 Status PgApiImpl::SetDistinctPrefixLength(PgStatement* handle, int distinct_prefix_length) {
   VERIFY_RESULT_REF(GetStatementAs<PgSelect>(handle)).SetDistinctPrefixLength(
       distinct_prefix_length);
@@ -2318,6 +2331,10 @@ bool PgApiImpl::IsDdlMode() const {
 
 bool PgApiImpl::IsDdlModeWithRegularTransactionBlock() const {
   return pg_txn_manager_->IsDdlModeWithRegularTransactionBlock();
+}
+
+bool PgApiImpl::HasNonDdlCatalogWrites() const {
+  return pg_session_->HasNonDdlCatalogWrites();
 }
 
 Result<bool> PgApiImpl::CurrentTransactionUsesFastPath() const {

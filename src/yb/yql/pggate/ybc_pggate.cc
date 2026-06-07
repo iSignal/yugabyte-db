@@ -1723,6 +1723,17 @@ YbcStatus YBCPgSetDistinctPrefixLength(YbcPgStatement handle, int distinct_prefi
   return ToYBCStatus(pgapi->SetDistinctPrefixLength(handle, distinct_prefix_length));
 }
 
+YbcStatus YBCPgSetResponseCacheKey(
+    YbcPgStatement handle, const char* cache_key, uint64_t catalog_version,
+    uint32_t version_db_oid) {
+  return ToYBCStatus(
+      pgapi->SetResponseCacheKey(handle, cache_key, catalog_version, version_db_oid));
+}
+
+YbcStatus YBCPgGetResponseCacheHit(YbcPgStatement handle, bool* response_cache_hit) {
+  return ToYBCStatus(pgapi->GetResponseCacheHit(handle, response_cache_hit));
+}
+
 YbcStatus YBCPgExecSelect(YbcPgStatement handle, const YbcPgExecParameters *exec_params) {
   return ToYBCStatus(pgapi->ExecSelect(handle, exec_params));
 }
@@ -2039,6 +2050,10 @@ bool YBCPgIsDdlMode() {
 
 bool YBCPgIsDdlModeWithRegularTransactionBlock() {
   return pgapi->IsDdlModeWithRegularTransactionBlock();
+}
+
+bool YBCPgHasNonDdlCatalogWrites() {
+  return pgapi->HasNonDdlCatalogWrites();
 }
 
 bool YBCCurrentTransactionUsesFastPath() {

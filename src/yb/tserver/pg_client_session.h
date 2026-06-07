@@ -108,6 +108,9 @@ struct PgClientSessionMetrics {
 struct PgClientSessionContext {
   // xcluster_context is nullptr on master.
   const TserverXClusterContextIf* xcluster_context;
+  // Owning server, for the catalog version watermark (proof times); the master's
+  // MasterTabletServer returns no proofs (response-cache-keyed catalog reads are tserver-only).
+  const TabletServerIf* tablet_server;
   YsqlAdvisoryLocksTable& advisory_locks_table;
   PgMutationCounter* pg_node_level_mutation_counter;
   const scoped_refptr<ClockBase>& clock;

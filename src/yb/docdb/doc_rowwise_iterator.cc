@@ -794,6 +794,7 @@ Result<bool> DocRowwiseIterator::FetchNextImpl(TableRow table_row) {
     if (doc_found != DocReaderResult::kNotFound) {
       RETURN_NOT_OK(FillRow(table_row));
       prev_doc_found_ = doc_found;
+      last_fetched_row_write_time_ = write_time;
       break;
     }
 
@@ -846,6 +847,15 @@ Result<ReadRestartData> DocRowwiseIterator::GetReadRestartData() {
 
 HybridTime DocRowwiseIterator::TEST_MaxSeenHt() {
   return db_iter_->TEST_MaxSeenHt();
+}
+
+HybridTime DocRowwiseIterator::LastFetchedRowWriteTime() const {
+  if (last_fetched_row_write_time_.empty() ||
+      last_fetched_row_write_time_.is_min()) {
+    return HybridTime::kInvalid;
+  }
+  const auto decoded = last_fetched_row_write_time_.Decode();
+  return decoded.ok() ? decoded->hybrid_time() : HybridTime::kInvalid;
 }
 
 Status DocRowwiseIterator::FillRow(

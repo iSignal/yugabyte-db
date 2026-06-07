@@ -6594,6 +6594,26 @@ static struct config_real ConfigureNamesReal[] =
 static struct config_string ConfigureNamesString[] =
 {
 	{
+		{"yb_catalog_cache_key_columns", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Per-catalog response-cache key granularity, as a comma list of "
+						 "\"table:N\" (e.g. \"pg_attribute:1\")."),
+			gettext_noop("For a listed catalog, a catcache/relcache miss binds the first N leading "
+						 "index key columns as a prefix scan and adds their values to the response "
+						 "cache key, instead of a keyless full scan. N in {0,1}; empty/unlisted is 0."),
+			GUC_NOT_IN_SAMPLE
+		},
+		&yb_catalog_cache_key_columns,
+		/*
+		 * pg_attribute and pg_statistic dominate full-scan transfer cost (one row per column /
+		 * statistic of EVERY relation): keyless, a single miss ships the whole table (hundreds of
+		 * KB to MB) to the backend. Binding the first index key column (attrelid / starelid) caches
+		 * one small per-relation entry instead. Other catalogs are small enough to cache whole.
+		 */
+		"pg_attribute:1,pg_statistic:1",
+		NULL, NULL, NULL
+	},
+
+	{
 		{"archive_command", PGC_SIGHUP, WAL_ARCHIVING,
 			gettext_noop("Sets the shell command that will be called to archive a WAL file."),
 			gettext_noop("This is used only if \"archive_library\" is not set.")

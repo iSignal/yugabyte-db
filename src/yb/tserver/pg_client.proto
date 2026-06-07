@@ -827,6 +827,17 @@ message PgPerformOptionsPB {
     uint32 key_group = 1;
     bytes key_value = 2;
     OptionalUint32PB lifetime_threshold_ms = 3;
+    // The catalog version this cache-keyed read is keyed at (also embedded, opaquely, in
+    // key_value). Lets the tserver pick a provably-version-consistent population read time from
+    // the catalog version watermark; 0/absent for non-versioned (preload-style) entries.
+    uint64 catalog_version = 4;
+    // The database whose per-db catalog version counter catalog_version belongs to (MyDatabaseId).
+    // This is the backend's connected database, NOT key_group: for SHARED catalogs (pg_database,
+    // pg_authid, ...) key_group is the table's physical home (template1) while the version comes
+    // from the reading backend's own database. The watermark proof MUST be looked up under this
+    // db - (db_X, v2) and (db_Y, v2) are unrelated instants since each database versions
+    // independently.
+    uint32 version_db_oid = 5;
   }
 
   // Cannot use IsolationLevel enum, since we cannot use proto2 enum in proto3 messages.
@@ -890,6 +901,9 @@ message PgPerformResponsePB {
   repeated PgsqlResponsePB responses = 2;
   ReadHybridTimePB catalog_read_time = 3;
   fixed64 used_in_txn_limit_ht = 4;
+  // True when this Perform was served from the tserver response cache (PgResponseCache) rather than
+  // read from master. Used to log, per catcache/relcache miss, whether the miss hit the cache.
+  bool response_cache_hit = 5;
 }
 
 message PgReserveOidsRequestPB {

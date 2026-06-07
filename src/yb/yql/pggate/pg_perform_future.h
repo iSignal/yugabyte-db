@@ -29,6 +29,8 @@ class PerformFuture {
   struct Data {
     rpc::CallResponsePtr response;
     HybridTime used_in_txn_limit;
+    // True when the Perform was served from the tserver response cache rather than read from master.
+    bool response_cache_hit = false;
   };
 
   PerformFuture() = default;

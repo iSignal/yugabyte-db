@@ -1031,7 +1031,8 @@ class YBClient {
   Result<TableSizeInfo> GetTableDiskSize(const TableId& table_id);
 
   // Provide the completion status of 'txn' to the YB-Master.
-  Status ReportYsqlDdlTxnStatus(const TransactionMetadata& txn, bool is_committed);
+  Status ReportYsqlDdlTxnStatus(
+      const TransactionMetadata& txn, bool is_committed, bool has_docdb_schema_changes);
 
   Status WaitForDdlVerificationToFinish(const TransactionMetadata& txn);
 

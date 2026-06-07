@@ -4800,6 +4800,17 @@ YBRefreshCacheWrapperImpl(uint64_t catalog_master_version, bool is_retry,
 	}
 	if (message_lists.num_lists > 0)
 	{
+		/*
+		 * The session is moving to a new catalog version epoch: drop the pinned catalog read
+		 * time so that catalog reads from here on (including relcache rebuilds triggered DURING
+		 * message application, and later catcache misses) pick a fresh read point >= the DDL's
+		 * commit time. Without this, a session pinned at an older read time would populate the
+		 * shared response cache's NEW-version entries with PRE-DDL content (e.g. a pg_class-by-oid
+		 * scan missing a just-created view: "could not open relation with OID ..."), poisoning the
+		 * new version for every backend. The AcceptInvalidationMessages path (inval.c) already
+		 * resets before applying; this is the statement-boundary equivalent.
+		 */
+		// YBCPgResetCatalogReadTime();
 		YbResetNeedInvalidateAllTableCache();
 		if (YbApplyInvalidationMessages(&message_lists))
 		{

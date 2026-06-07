@@ -880,8 +880,9 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
   Status GetYsqlAllDBCatalogVersions(
       bool use_cache, DbOidToCatalogVersionMap* versions, uint64_t* fingerprint) override
       EXCLUDES(heartbeat_pg_catalog_versions_cache_mutex_);
-  Result<DbOidVersionToMessageListMap> GetYsqlCatalogInvalationMessages(bool use_cache) override
-      EXCLUDES(heartbeat_pg_catalog_versions_cache_mutex_);
+  Result<DbOidVersionToMessageListMap> GetYsqlCatalogInvalationMessages(
+      const DbOidToCatalogVersionMap* current_versions = nullptr,
+      DbOidToCatalogVersionGuaranteedTimeMap* guaranteed_times = nullptr) override;
 
   Status GetYsqlDBCatalogVersion(
       uint32_t db_oid, uint64_t* catalog_version, uint64_t* last_breaking_version,
@@ -3209,7 +3210,9 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
       ClusterConfigInfo* cluster_config, ClusterConfigInfo::WriteLock* l);
 
   Status GetYsqlAllDBCatalogVersionsImpl(DbOidToCatalogVersionMap* versions);
-  Result<DbOidVersionToMessageListMap> GetYsqlCatalogInvalationMessagesImpl();
+  Result<DbOidVersionToMessageListMap> GetYsqlCatalogInvalationMessagesImpl(
+      DbOidVersionToCommitTimeMap* commit_times = nullptr,
+      HybridTime* read_time_used = nullptr);
 
   // Create the global transaction status table if needed (i.e. if it does not exist already).
   Status CreateGlobalTransactionStatusTableIfNeededForNewTable(

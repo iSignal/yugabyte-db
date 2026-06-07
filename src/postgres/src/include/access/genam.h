@@ -240,6 +240,12 @@ extern SysScanDesc systable_beginscan(Relation heapRelation,
 									  bool indexOK,
 									  Snapshot snapshot,
 									  int nkeys, ScanKey key);
+extern SysScanDesc systable_beginscan_with_cache_key(Relation heapRelation,
+													 Oid indexId,
+													 bool indexOK,
+													 Snapshot snapshot,
+													 int nkeys, ScanKey key,
+													 bool cache_response);
 extern HeapTuple systable_getnext(SysScanDesc sysscan);
 extern bool systable_recheck_tuple(SysScanDesc sysscan, HeapTuple tup);
 extern void systable_endscan(SysScanDesc sysscan);

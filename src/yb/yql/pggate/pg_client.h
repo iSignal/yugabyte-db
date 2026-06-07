@@ -82,9 +82,12 @@ struct PerformResult {
   rpc::CallResponsePtr response;
   PgsqlOps operations;
   HybridTime used_in_txn_limit;
+  // True when the Perform was served from the tserver response cache rather than read from master.
+  bool response_cache_hit = false;
 
   std::string ToString() const {
-    return YB_STRUCT_TO_STRING(status, catalog_read_time, used_in_txn_limit);
+    return YB_STRUCT_TO_STRING(
+        status, catalog_read_time, used_in_txn_limit, response_cache_hit);
   }
 };
 

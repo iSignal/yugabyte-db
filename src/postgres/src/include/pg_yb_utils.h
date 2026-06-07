@@ -101,6 +101,13 @@ extern uint64_t YBGetActiveCatalogCacheVersion();
 
 extern uint64_t YbGetCatalogCacheVersion();
 extern uint64_t YbGetNewCatalogVersion();
+
+/*
+ * Whether a catcache/relcache miss scan should be served from the tserver response cache (a keyless
+ * full scan, cached and shared across backends, filtered locally in PG). False during initdb, while
+ * sys-table prefetching is active, or when the feature flag is off.
+ */
+extern bool YbShouldResponseCacheCatalogRead();
 extern void YbSetNeedInvalidateAllTableCache();
 extern void YbResetNeedInvalidateAllTableCache();
 extern bool YbGetNeedInvalidateAllTableCache();
@@ -485,6 +492,15 @@ extern Oid YbSystemDbOid();
  * YSQL guc variables that can be used to toggle yugabyte features.
  * See also the corresponding entries in guc.c.
  */
+
+/*
+ * Response-cache key granularity. Comma list of "table:N" (e.g. "pg_attribute:1,pg_statistic:1").
+ * For a listed catalog, a catcache/relcache miss binds the first N leading index key columns as a
+ * prefix scan (pushed to DocDB) AND adds their values to the response-cache key, instead of a keyless
+ * full scan; PG still HeapKeyTest-filters the remaining columns. N in {0,1}. Empty/unlisted => 0
+ * (whole-table keyless scan). Cuts the per-miss scan from O(table) to O(matching prefix).
+ */
+extern char *yb_catalog_cache_key_columns;
 
 /* Enables tables/indexes to be created WITH (table_oid = x). */
 extern bool yb_enable_create_with_table_oid;

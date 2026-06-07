@@ -410,6 +410,27 @@ systable_beginscan(Relation heapRelation,
 				   Snapshot snapshot,
 				   int nkeys, ScanKey key)
 {
+	return systable_beginscan_with_cache_key(heapRelation, indexId, indexOK,
+											 snapshot, nkeys, key, false);
+}
+
+/*
+ * systable_beginscan_with_cache_key --- systable_beginscan, optionally response-cached
+ *
+ * Identical to systable_beginscan, except that when cache_response is true and the relation is
+ * YB-backed, the scan is issued KEYLESS and its full-table response is cached at the tserver
+ * (shared across backends at the same catalog version), with the scan key applied locally in PG.
+ * The cache key is derived from the actual scan target inside ybc_systable_beginscan_with_cache_key.
+ * For non-YB relations cache_response is ignored.
+ */
+SysScanDesc
+systable_beginscan_with_cache_key(Relation heapRelation,
+								  Oid indexId,
+								  bool indexOK,
+								  Snapshot snapshot,
+								  int nkeys, ScanKey key,
+								  bool cache_response)
+{
 	SysScanDesc sysscan;
 	Relation	irel;
 
@@ -419,12 +440,13 @@ systable_beginscan(Relation heapRelation,
 	 * on TOAST tables, which can be temporary (and thus non-YB).
 	 */
 	if (IsYBRelation(heapRelation))
-		return ybc_systable_beginscan(heapRelation,
-									  indexId,
-									  indexOK,
-									  snapshot,
-									  nkeys,
-									  key);
+		return ybc_systable_beginscan_with_cache_key(heapRelation,
+													 indexId,
+													 indexOK,
+													 snapshot,
+													 nkeys,
+													 key,
+													 cache_response);
 
 	if (indexOK &&
 		!IgnoreSystemIndexes &&

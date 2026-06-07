@@ -128,6 +128,8 @@ class DocRowwiseIterator final : public YQLRowwiseIteratorIf {
 
   HybridTime TEST_MaxSeenHt() override;
 
+  HybridTime LastFetchedRowWriteTime() const override;
+
   // key slice should point to block of memory, that contains kHighest after the end.
   // So extended slice could be used as upperbound.
   Result<bool> PgFetchNext(dockv::PgTableRow* table_row) override;
@@ -300,6 +302,9 @@ class DocRowwiseIterator final : public YQLRowwiseIteratorIf {
   SeekFilter seek_filter_ = SeekFilter::kAll;
 
   EncodedDocHybridTime max_seen_ht_checkpoint_{DocHybridTime::kMin};
+
+  // Write time of the row most recently returned by a fetch. See LastFetchedRowWriteTime().
+  EncodedDocHybridTime last_fetched_row_write_time_{DocHybridTime::kInvalid};
 };
 
 }  // namespace yb::docdb

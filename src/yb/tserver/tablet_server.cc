@@ -1721,6 +1721,41 @@ void TabletServer::SetYsqlDBCatalogVersionsUnlocked(
   }
 }
 
+void TabletServer::SetYsqlDBCatalogVersionProofs(
+    const tserver::DBCatalogVersionProofDataPB& proof_data) {
+  std::lock_guard l(lock_);
+  for (const auto& db_proof : proof_data.db_proofs()) {
+    auto& proof = ysql_db_catalog_version_proof_map_[db_proof.db_oid()];
+    for (const auto& entry : db_proof.versions()) {
+      // Merge by max: a version's guarantee time only ever advances (heartbeats can arrive out of
+      // order; the current version's time keeps moving forward while superseded ones stay fixed).
+      auto& slot = proof[entry.version()];
+      slot = std::max(slot, entry.guarantee_ht());
+    }
+    // Keep the highest (most recent) versions, bounded by the same limit as the number of versions
+    // for which the master returns invalidation messages (the master derives the guaranteed times
+    // from exactly those rows), so we never drop a version the master still sends.
+    while (proof.size() > FLAGS_ysql_max_invalidation_message_queue_size) {
+      proof.erase(proof.begin());
+    }
+  }
+}
+
+std::optional<uint64_t> TabletServer::GetYsqlCatalogVersionProofHt(
+    uint32_t db_oid, uint64_t version) const {
+  SharedLock l(lock_);
+  const auto it = ysql_db_catalog_version_proof_map_.find(db_oid);
+  if (it == ysql_db_catalog_version_proof_map_.end()) {
+    return std::nullopt;
+  }
+  const auto& proof = it->second;
+  const auto version_it = proof.find(version);
+  if (version_it != proof.end() && version_it->second != 0) {
+    return version_it->second;
+  }
+  return std::nullopt;
+}
+
 void TabletServer::ResetCatalogVersionsFingerprint() {
   LOG(INFO) << "reset catalog_versions_fingerprint_";
   catalog_versions_fingerprint_.store(std::nullopt, std::memory_order_release);

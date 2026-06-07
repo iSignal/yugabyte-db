@@ -42,6 +42,7 @@
 #include "utils/resowner_private.h"
 #include "utils/syscache.h"
 #include "utils/yb_inheritscache.h"
+#include "pg_yb_utils.h"
 #include "yb/yql/pggate/ybc_gflags.h"
 
 /*
@@ -70,9 +71,18 @@ FindChildren(Oid parentOid)
 				ObjectIdGetDatum(parentOid));
 
 	elog(DEBUG3, "FindChildren for parentOid %d", parentOid);
-	SysScanDesc scan = ybc_systable_begin_default_scan(relation,
-													   InheritsParentIndexId,
-													   true, NULL, 1, key);
+	/*
+	 * Scan pg_inherits to populate the inherits cache. We must NOT use the
+	 * optimized pg_inherits scan here (the ybc_systable_beginscan path), because
+	 * that scan reads from this very cache and would recurse. When response
+	 * caching applies, use the keyless cached scan (also avoids the optimized
+	 * path); otherwise fall back to the raw default scan.
+	 */
+	SysScanDesc scan = YbShouldResponseCacheCatalogRead() ?
+		ybc_systable_beginscan_with_cache_key(relation, InheritsParentIndexId,
+											  true, NULL, 1, key, true) :
+		ybc_systable_begin_default_scan(relation, InheritsParentIndexId,
+										true, NULL, 1, key);
 
 	HeapTuple	inheritsTuple = NULL;
 
@@ -141,9 +151,12 @@ FindParents(Oid relid)
 				Anum_pg_inherits_inhrelid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(relid));
-	SysScanDesc scan = ybc_systable_begin_default_scan(relation,
-													   InheritsRelidSeqnoIndexId,
-													   true, NULL, 1, key);
+	/* See FindChildren: never use the optimized (cache-backed) pg_inherits scan here. */
+	SysScanDesc scan = YbShouldResponseCacheCatalogRead() ?
+		ybc_systable_beginscan_with_cache_key(relation, InheritsRelidSeqnoIndexId,
+											  true, NULL, 1, key, true) :
+		ybc_systable_begin_default_scan(relation, InheritsRelidSeqnoIndexId,
+										true, NULL, 1, key);
 
 	HeapTuple	inheritsTuple = NULL;
 

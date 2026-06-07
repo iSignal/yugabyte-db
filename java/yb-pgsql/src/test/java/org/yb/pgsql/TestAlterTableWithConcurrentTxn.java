@@ -41,6 +41,14 @@ public class TestAlterTableWithConcurrentTxn extends BasePgSQLTest {
     // and doesn't expect proper wait-on behavior for DML-DDL interaction.
     Map<String, String> flagMap = super.getTServerFlags();
     flagMap.put("enable_object_locking_for_table_locks", "false");
+    // Disable the tserver catcache response cache for this suite. These tests assert specific
+    // outcomes for a DML issued concurrently with an ALTER on another connection, assuming the DML
+    // reads the latest catalog. The response cache serves version-keyed catalog scans at the
+    // reader's own (transaction-pinned, object-locking-disabled) catalog version, so the DML can
+    // operate on a catalog snapshot that predates the ALTER - changing the observed outcome. The
+    // response cache is covered by PgCatalogPerfTest / PgLibPqTest's Catcache* tests; here we
+    // exercise the non-cached concurrent DDL/DML path.
+    flagMap.put("ysql_enable_catcache_response_caching", "false");
     return flagMap;
   }
 
