@@ -67,6 +67,7 @@ DEFINE_test_flag(int32, ysql_ddl_atomicity_alter_table_request_delay_ms, 0,
 DECLARE_bool(ysql_yb_enable_ddl_savepoint_support);
 DECLARE_bool(enable_heartbeat_pg_catalog_versions_cache);
 DECLARE_bool(enable_object_locking_for_table_locks);
+DECLARE_bool(ysql_enable_catalog_version_push_on_all_ddl);
 
 DEFINE_RUNTIME_bool(ysql_enable_catalog_version_push_to_tservers_on_ddl, true,
     "When object locking is disabled, after a DDL commits, synchronously push the new YSQL catalog "
@@ -399,7 +400,8 @@ Status CatalogManager::ReportYsqlDdlTxnStatus(
   // old version whose ReleaseObjectLocks handler does not support this empty-lock catalog-version
   // payload (and double-responds on it), and pushing mixed-version catalog data across them is not
   // valid anyway. Heartbeats still propagate versions to those nodes until the upgrade finalizes.
-  if (!FLAGS_enable_object_locking_for_table_locks &&
+  if (FLAGS_ysql_enable_catalog_version_push_on_all_ddl &&
+      !FLAGS_enable_object_locking_for_table_locks &&
       FLAGS_ysql_enable_catalog_version_push_to_tservers_on_ddl &&
       !IsYsqlMajorVersionUpgradeInProgress()) {
     // Bound the push so one slow/unreachable tserver can't consume the whole DDL client deadline;

@@ -43,6 +43,7 @@
 #include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_database.h"
+#include "common/hashfn.h"		/* for hash_bytes (bound-key serialization) */
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_opfamily.h"
@@ -4513,6 +4514,69 @@ yb_catalog_cache_key_columns_for(Relation relation)
 	return result;
 }
 
+/*
+ * Append one bound prefix-key value to a response cache key buffer.
+ *
+ * Bound keys are NOT necessarily integers: key[i].sk_argument is a Datum whose meaning depends on
+ * the catalog column's type. For the common prefix columns (OIDs / ints, e.g. pg_attribute.attrelid)
+ * the Datum holds the value by-value and serializes directly. A pass-by-reference column (e.g. a
+ * "name"/text leading index column) instead holds a POINTER whose address is backend-local and
+ * meaningless as a shared key - it must serialize its CONTENT.
+ *
+ * This deliberately reads typbyval/typlen/atttypid from the relation's already-loaded, in-memory
+ * tuple descriptor and serializes the raw datum bytes itself. It does NOT use the type's output
+ * function (YBDatumToString / getTypeOutputInfo): that does a pg_type (TYPEOID) catcache lookup,
+ * which on a miss issues a pg_type scan that re-reads pg_attribute and re-enters THIS prefix-key
+ * path - unbounded re-entrancy that overflows the stack (observed as a SIGSEGV in
+ * CatcacheResponseCacheSharing). Catalog access is not allowed in this scan-setup hot path.
+ *
+ * The fixed key buffer cannot grow, so a value whose literal form would overflow (or that contains
+ * the ':' separator) is keyed by a stable content hash instead of being truncated - silent
+ * truncation could alias two distinct values onto one cache entry, which would be a correctness bug.
+ */
+static void
+YbAppendBoundKeyValue(char *key, size_t keysize, Relation relation,
+					  AttrNumber heap_attno, Datum value)
+{
+	Form_pg_attribute att = TupleDescAttr(RelationGetDescr(relation), heap_attno - 1);
+	size_t		off = strlen(key);
+	char	   *out = key + off;
+	size_t		avail = keysize - off;
+	const char *bytes;
+	int			len;
+
+	if (att->attbyval)
+	{
+		/* Integer-like (oid, int2/4/8, bool, char, ...): the Datum IS the value. */
+		snprintf(out, avail, ":%llu", (unsigned long long) value);
+		return;
+	}
+
+	if (att->attlen == -1)		/* varlena (text, bytea, ...) */
+	{
+		struct varlena *v = pg_detoast_datum_packed((struct varlena *) DatumGetPointer(value));
+
+		bytes = VARDATA_ANY(v);
+		len = VARSIZE_ANY_EXHDR(v);
+	}
+	else if (att->attlen == -2) /* cstring */
+	{
+		bytes = DatumGetCString(value);
+		len = strlen(bytes);
+	}
+	else						/* fixed-length by-ref, e.g. "name" */
+	{
+		bytes = (const char *) DatumGetPointer(value);
+		len = (att->atttypid == NAMEOID) ? (int) strnlen(bytes, NAMEDATALEN) : att->attlen;
+	}
+
+	/* +2 leaves room for the ':' separator and the terminating NUL. */
+	if ((size_t) len + 2 <= avail && memchr(bytes, ':', len) == NULL)
+		snprintf(out, avail, ":%.*s", len, bytes);
+	else
+		snprintf(out, avail, ":h%08x", hash_bytes((const unsigned char *) bytes, len));
+}
+
 SysScanDesc
 ybc_systable_beginscan_with_cache_key(Relation relation,
 									  Oid indexId,
@@ -4602,35 +4666,9 @@ ybc_systable_beginscan_with_cache_key(Relation relation,
 	 */
 	for (int i = 0; i < bound_nkeys; i++)
 	{
-		/*
-		 * Serialize the bound value via its type's output function. This is correct for ANY column
-		 * type (not just integers): the Datum for a pass-by-reference column - e.g. a "name"/text
-		 * leading index column - is a backend-local POINTER that must be serialized by content, and
-		 * YBDatumToString does exactly that. key[i].sk_attno is still the HEAP attnum here (it is
-		 * converted to the index attnum just below), so it indexes the relation's tuple descriptor.
-		 *
-		 * Recursion note: YBDatumToString -> getTypeOutputInfo does a pg_type (TYPEOID) catcache
-		 * lookup, which on a miss issues a pg_type catalog scan that itself comes back through this
-		 * function. That is safe ONLY because pg_type is not configured for prefix keying
-		 * (yb_catalog_cache_key_columns): its scan has bound_nkeys == 0, so it never reaches this
-		 * loop and cannot re-enter YBDatumToString -> no infinite recursion. If pg_type were ever
-		 * prefix-keyed, this serialization would recurse on itself; keep pg_type keyless.
-		 */
-		Oid			typid = TupleDescAttr(RelationGetDescr(relation),
-										  key[i].sk_attno - 1)->atttypid;
-		size_t		off = strlen(scan->response_cache_key);
-		int			n PG_USED_FOR_ASSERTS_ONLY =
-			snprintf(scan->response_cache_key + off,
-					 sizeof(scan->response_cache_key) - off,
-					 ":%s", YBDatumToString(key[i].sk_argument, typid));
-
-		/*
-		 * Prefix keys are capped at one column (yb_catalog_cache_key_columns_for) and are oid/name
-		 * in practice, so the value always fits. Assert catches a pathological long-value prefix
-		 * config that would truncate and could alias two distinct values onto one cache entry.
-		 */
-		Assert(n >= 0 && (size_t) n < sizeof(scan->response_cache_key) - off);
-
+		/* key[i].sk_attno is still the HEAP attnum here (converted to index attnum below). */
+		YbAppendBoundKeyValue(scan->response_cache_key, sizeof(scan->response_cache_key),
+							  relation, key[i].sk_attno, key[i].sk_argument);
 		bound_keys[i] = key[i];
 		if (index)
 			bound_keys[i].sk_attno = YbGetIndexAttnum(index, bound_keys[i].sk_attno);

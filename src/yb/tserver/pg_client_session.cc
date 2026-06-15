@@ -151,6 +151,7 @@ DECLARE_bool(ysql_yb_allow_replication_slot_ordering_modes);
 DECLARE_bool(ysql_yb_enable_advisory_locks);
 DECLARE_bool(ysql_yb_ddl_transaction_block_enabled);
 DECLARE_bool(enable_object_locking_for_table_locks);
+DECLARE_bool(ysql_enable_catalog_version_push_on_all_ddl);
 DECLARE_bool(ysql_enable_object_locking_infra);
 DECLARE_bool(ysql_yb_enable_ddl_savepoint_support);
 
@@ -3174,14 +3175,18 @@ class PgClientSession::Impl {
     //      is true. This is the original reason to report, and is the only one needed when object
     //      locking is enabled (object locking's lock-release path already propagates the new catalog
     //      version to tservers synchronously).
-    //   2. When object locking is disabled, to synchronously push the new catalog version to
-    //      tservers, keeping the catcache response cache consistent cross-node without waiting for
-    //      the next heartbeat. This needs the report for EVERY catalog-version-bumping DDL, including
-    //      ones with no DocDB schema changes (e.g. CREATE ROLE, GRANT).
-    // So report for no-schema-change DDLs only when object locking is disabled. The transaction_id
-    // may be nil for such a DDL; that is fine because the master skips the verification callback
-    // (which needs the id) when has_docdb_schema_changes is false.
-    const bool report_for_catalog_version_push = !FLAGS_enable_object_locking_for_table_locks;
+    //   2. When the synchronous catalog-version push is enabled (and object locking is disabled), to
+    //      push the new catalog version to tservers, keeping the catcache response cache consistent
+    //      cross-node without waiting for the next heartbeat. This needs the report for EVERY
+    //      catalog-version-bumping DDL, including ones with no DocDB schema changes (e.g. CREATE
+    //      ROLE, GRANT).
+    // So report for no-schema-change DDLs only when the push feature is on. The transaction_id may
+    // be nil for such a DDL; that is fine because the master skips the verification callback (which
+    // needs the id) when has_docdb_schema_changes is false. When the push feature is off we revert
+    // to the original behavior: report only DDLs with DocDB schema changes.
+    const bool report_for_catalog_version_push =
+        FLAGS_ysql_enable_catalog_version_push_on_all_ddl &&
+        !FLAGS_enable_object_locking_for_table_locks;
     if (commit.has_value() && metadata && FLAGS_report_ysql_ddl_txn_status_to_master &&
         (has_docdb_schema_changes || report_for_catalog_version_push)) {
       TEST_SYNC_POINT(

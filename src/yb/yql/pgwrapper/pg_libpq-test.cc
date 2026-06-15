@@ -2993,6 +2993,21 @@ class PgLibPqTestDisableObjectLockingNoRetry : public PgLibPqTestDisableObjectLo
   void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
     options->extra_tserver_flags.emplace_back(
         "--TEST_ysql_disable_transparent_cache_refresh_retry=true");
+    // This test validates legacy transparent-retry-on-stale-catalog behavior, and relies on the
+    // post-DDL heartbeat-propagation lag to create a stale catalog version on the DML node (so the
+    // retry-disabled SELECT hits "schema version mismatch"). Two parts of the response-cache feature
+    // (active here because this fixture sets object-locking=false) would defeat that premise, so
+    // disable both:
+    //   - the synchronous catalog-version push delivers the new version to the DML node immediately,
+    //     removing the staleness window entirely;
+    //   - the catcache response cache serves the DML node a consistent stale snapshot, changing the
+    //     staleness symptom from "schema version mismatch" to a stale name-resolution miss
+    //     ("relation does not exist") that this test's assertion does not expect.
+    // In production the transparent retry (enabled) absorbs either symptom; this test disables retry
+    // to assert on the raw error, so it must also disable the feature to see the legacy one.
+    options->extra_master_flags.emplace_back(
+        "--ysql_enable_catalog_version_push_to_tservers_on_ddl=false");
+    options->extra_tserver_flags.emplace_back("--ysql_enable_catcache_response_caching=false");
     PgLibPqTestDisableObjectLocking::UpdateMiniClusterOptions(options);
   }
 };
@@ -5784,6 +5799,12 @@ class PgCatcacheResponseCacheTest : public PgLibPqTest {
     // (The PgCatcacheResponseCacheObjectLockTest subclass re-enables it afterwards for its own case.)
     options->extra_master_flags.push_back("--enable_object_locking_for_table_locks=false");
     options->extra_tserver_flags.push_back("--enable_object_locking_for_table_locks=false");
+    // The synchronous catalog-version push (report every DDL + master pushes to all tservers) is
+    // off by default. These tests assert IMMEDIATE cross-node cache consistency after a DDL, which
+    // depends on that push, so enable it on both master (initiates the push) and tservers (PG side
+    // reports every DDL).
+    options->extra_master_flags.push_back("--ysql_enable_catalog_version_push_on_all_ddl=true");
+    options->extra_tserver_flags.push_back("--ysql_enable_catalog_version_push_on_all_ddl=true");
     // vmodule propagates to the postgres backend and tserver processes.
     options->extra_tserver_flags.emplace_back("--vmodule=pg_response_cache=2,pg_doc_op=2");
     // Log every PG-side catcache/relcache miss so the test log shows the misses that the response
@@ -6209,11 +6230,12 @@ class PgCatcacheResponseCacheObjectLockTest : public PgCatcacheResponseCacheTest
  protected:
   void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
     PgCatcacheResponseCacheTest::UpdateMiniClusterOptions(options);
-    // Override the base's object-locking=false on BOTH master and tservers (a later --flag wins),
-    // so master and tservers agree: the lock-release path propagates catalog versions and the
-    // synchronous DDL-commit push in ReportYsqlDdlTxnStatus (master-side, gated on this flag) is
-    // not taken.
-    options->extra_master_flags.push_back("--enable_object_locking_for_table_locks=true");
+    // Enable object locking on the TSERVERS only, so session 2's SELECT blocks on session 1's
+    // uncommitted ALTER lock (the mechanism this test needs). Leave the MASTER in push mode
+    // (object-locking=false, inherited from the base): the synchronous DDL-commit push delivers the
+    // new catalog version + watermark to session 2's tserver so its rebuild-during-inval reads the
+    // new version. (Forcing master object-locking=true disables that push and the rebuild reads
+    // stale -> "column b does not exist".)
     options->extra_tserver_flags.push_back("--enable_object_locking_for_table_locks=true");
     options->extra_tserver_flags.push_back("--ysql_yb_ddl_transaction_block_enabled=true");
   }

@@ -4809,8 +4809,13 @@ YBRefreshCacheWrapperImpl(uint64_t catalog_master_version, bool is_retry,
 		 * scan missing a just-created view: "could not open relation with OID ..."), poisoning the
 		 * new version for every backend. The AcceptInvalidationMessages path (inval.c) already
 		 * resets before applying; this is the statement-boundary equivalent.
+		 *
+		 * Not redundant with YbGetMasterCatalogVersion's own reset/re-pin earlier in this refresh:
+		 * the CatcacheResponseCacheRebuildDuringInvalSeesNewVersion regression test fails without
+		 * this line (a relcache rebuild during YbApplyInvalidationMessages reads at the stale pinned
+		 * read time and the rebuilt tupdesc misses a just-added column).
 		 */
-		// YBCPgResetCatalogReadTime();
+		YBCPgResetCatalogReadTime();
 		YbResetNeedInvalidateAllTableCache();
 		if (YbApplyInvalidationMessages(&message_lists))
 		{
