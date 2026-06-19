@@ -3786,18 +3786,26 @@ TEST_F_EX(
   // run ANALYZEs aggressively.
   ASSERT_OK(cluster_->SetFlagOnTServers("ysql_auto_analyze_threshold", "1"));
   ASSERT_OK(cluster_->SetFlagOnTServers("ysql_auto_analyze_scale_factor", "0.1"));
-  SleepFor(3s * kTimeMultiplier);
+
+  // The auto analyze service updates pg_class.reltuples asynchronously, so poll until the
+  // expected value is observed rather than assuming a fixed delay is enough. This mirrors
+  // WaitForTableReltuples in pg_auto_analyze-test.cc.
+  auto wait_for_reltuples = [this](const std::string& db, const std::string& relname,
+                                   float expected) -> Status {
+    auto conn = VERIFY_RESULT(cluster_->ConnectToDB(db));
+    return WaitFor(
+        [&conn, &db, &relname, expected]() -> Result<bool> {
+          auto reltuples = VERIFY_RESULT(conn.FetchRow<float>(
+              Format("SELECT reltuples FROM pg_class WHERE relname = '$0'", relname)));
+          LOG(INFO) << relname << " in " << db << " has reltuples " << reltuples;
+          return reltuples == expected;
+        },
+        90s * kTimeMultiplier,
+        Format("Wait for auto analyze to set reltuples for $0", relname));
+  };
 
   // Verify that the auto analyze service is running.
-  ASSERT_NO_FATALS(RunPsqlCommand(
-      "SELECT reltuples FROM pg_class WHERE relname = 'tbl_0'",
-      R"#(
-         reltuples
-        -----------
-                 3
-        (1 row)
-      )#"
-  ));
+  ASSERT_OK(wait_for_reltuples("yugabyte", "tbl_0", 3));
 
   // Backup and restore to a new database.
   const string backup_dir = GetTempDir("backup");
@@ -3810,16 +3818,7 @@ TEST_F_EX(
   SetDbName("db2");
   ASSERT_NO_FATALS(CreateTable(Format("CREATE TABLE tbl_$0(a INT)", num_tables)));
   ASSERT_NO_FATALS(InsertRows(Format("INSERT INTO tbl_$0 VALUES (1), (2), (3)", num_tables), 3));
-  SleepFor(3s * kTimeMultiplier);
-  ASSERT_NO_FATALS(RunPsqlCommand(
-      Format("SELECT reltuples FROM pg_class WHERE relname = 'tbl_$0'", num_tables),
-      R"#(
-         reltuples
-        -----------
-                 3
-        (1 row)
-      )#"
-  ));
+  ASSERT_OK(wait_for_reltuples("db2", Format("tbl_$0", num_tables), 3));
 }
 
 // Starts each base table with a single hash tablet so that we can drive

@@ -220,6 +220,18 @@ YbGetCatalogCacheVersion()
  */
 static bool yb_ddl_classification_in_progress = false;
 
+/*
+ * Latched true once this session commits a DDL whose final mode is SILENT_ALTERING: such a DDL
+ * changes catalog DATA but does NOT bump the catalog version (e.g. pg_replication_origin_create).
+ * The version-keyed tserver response cache can then serve this session a STALE scan of the altered
+ * catalog (a HIT at the unchanged version), so a same-session read misses the just-written row
+ * ("replication origin ... does not exist"). Mirrors the non-DDL catalog-write latch
+ * (YBCPgHasNonDdlCatalogWrites): once set, this session's catcache/relcache miss reads bypass the
+ * response cache and go to master, where they see the write. Session-lifetime (never reset), like
+ * the non-DDL latch.
+ */
+static bool yb_session_did_silent_altering_write = false;
+
 bool
 YbShouldResponseCacheCatalogRead()
 {
@@ -290,6 +302,7 @@ YbShouldResponseCacheCatalogRead()
 		YBGetDdlNestingLevel() == 0 &&
 		!YBGetDdlUseRegularTransactionBlock() &&
 		!yb_ddl_classification_in_progress &&
+		!yb_session_did_silent_altering_write &&
 		!OidIsValid(temp_namespace_id) &&
 		!YbNeedAdditionalCatalogTables() &&
 		yb_read_time == 0 &&
@@ -3453,6 +3466,15 @@ YBCommitTransactionContainingDDL()
 		 */
 		YBCPgResetCatalogReadTime();
 	}
+
+	/*
+	 * A SILENT_ALTERING DDL changed catalog DATA without bumping the catalog version, so the
+	 * read-time reset above is not enough: the version-keyed response cache would still serve this
+	 * session a HIT on the pre-change scan at the unchanged version. Latch the session off the
+	 * response cache so later catcache/relcache misses read fresh from master and see the change.
+	 */
+	if (is_silent_altering)
+		yb_session_did_silent_altering_write = true;
 
 	/*
 	 * Optimization to avoid redundant cache refresh on the current session
