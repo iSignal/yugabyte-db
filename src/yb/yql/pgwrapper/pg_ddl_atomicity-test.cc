@@ -310,6 +310,83 @@ class PgDdlAtomicitySanityTest : public PgDdlAtomicityTest {
   }
 };
 
+// Repro for CE-1637: an orphaned secondary index left behind after a partially-rolled-back DDL
+// transaction that created a table together with an index.
+//
+// CREATE TABLE ... UNIQUE(...) creates a base table AND its index in a single DDL transaction --
+// the exact create-table-with-index scenario described in commit a4170bc9c2c (D22148). When that
+// transaction aborts, DocDB rolls back both new objects. By design (to avoid an inverted-lock
+// deadlock between dropping the index and dropping the indexed table) the index is NOT dropped on
+// its own; the rollback relies on dropping the base table to cascade-delete the index.
+//
+// That cascade lives in DeleteTableInMemory, which marks the base table DELETING and persists that
+// to sys_catalog, and only THEN recurses to drop the base table's indexes. We inject a "crash"
+// exactly in that window (TEST_simulate_crash_after_table_marked_deleting) so the base table is
+// durably DELETING but its index is never dropped -- the index stays RUNNING, still tagged with the
+// aborted txn. This mirrors prod, where a master-leader failover hit the same window.
+//
+// On master restart the base table's deletion completes, but the orphaned index can never be
+// reclaimed: the re-run verification probes the DELETING/gone base table and trips
+// SCHECK(is_running())/FindTableById(parent), so the verifier bails before dropping the index.
+//
+// Expected (correct) behaviour: both the base table AND its index get cleaned up (0 DocDB tables
+// each, since this is an aborted CREATE). On the CE-1637 bug the index stays at 1 forever.
+TEST_F(PgDdlAtomicitySanityTest, TestOrphanedIndexAfterPartialRollback) {
+  // Use names where neither is a substring of the other (client->ListTables does substring
+  // matching), so the per-object DocDB table counts don't collide.
+  const string kTable = "ce1637base";
+  const string kUniqueIndex = "ce1637uniqidx";
+
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  auto conn = ASSERT_RESULT(Connect());
+
+  // Do not let PG block waiting for the master to finish DDL verification: the crash injection
+  // below intentionally wedges the rollback in kDdlPostProcessing, so a waiting client would hang.
+  ASSERT_OK(cluster_->SetFlagOnTServers(
+      "ysql_ddl_transaction_wait_for_ddl_verification", "false"));
+  ASSERT_OK(cluster_->SetFlagOnTServers("report_ysql_ddl_txn_status_to_master", "false"));
+
+  // Inject the partial delete: during abort rollback, crash after the base table is marked DELETING
+  // but before its index is dropped.
+  ASSERT_OK(cluster_->SetFlagOnMasters(
+      "TEST_simulate_crash_after_table_marked_deleting", "true"));
+
+  // CREATE TABLE with a UNIQUE constraint creates the table AND its index in one DDL transaction.
+  // Force it to fail so the transaction aborts and DocDB rolls back both newly-created objects.
+  ASSERT_OK(conn.TestFailDdl(
+      Format("CREATE TABLE $0 (a int, b int, CONSTRAINT $1 UNIQUE(b))", kTable, kUniqueIndex)));
+
+  // Both new DocDB objects were created before the failure.
+  ASSERT_EQ(ASSERT_RESULT(client->ListTables(kTable)).size(), 1);
+  ASSERT_EQ(ASSERT_RESULT(client->ListTables(kUniqueIndex)).size(), 1);
+
+  // Give the master's background DDL-verification task time to run the abort rollback and hit the
+  // crash injection: the base table gets marked DELETING and persisted, but its index is left.
+  SleepFor(MonoDelta::FromSeconds(10) * kTimeMultiplier);
+
+  // Resume from the persisted partial state with the crash injection disabled.
+  ASSERT_OK(cluster_->SetFlagOnMasters(
+      "TEST_simulate_crash_after_table_marked_deleting", "false"));
+  RestartMaster();
+  client = ASSERT_RESULT(cluster_->CreateClient());
+
+  // The base table's deletion resumes and completes -> no DocDB table for it.
+  ASSERT_OK(LoggedWaitFor(
+      [&]() -> Result<bool> {
+        return VERIFY_RESULT(client->ListTables(kTable)).empty();
+      },
+      MonoDelta::FromSeconds(90), "Wait for the base table to be cleaned up"));
+
+  // The orphaned index should also be cleaned up. On correct code it drops to 0 DocDB tables; on
+  // the CE-1637 bug it stays at 1 forever. Assert the desired behaviour so this doubles as the
+  // regression test for the fix -- it currently FAILS (times out), which is the reproduction.
+  ASSERT_OK(LoggedWaitFor(
+      [&]() -> Result<bool> {
+        return VERIFY_RESULT(client->ListTables(kUniqueIndex)).empty();
+      },
+      MonoDelta::FromSeconds(90), "Wait for the orphaned index to be cleaned up"));
+}
+
 TEST_F(PgDdlAtomicitySanityTest, BasicTest) {
   auto conn = ASSERT_RESULT(Connect());
   const int num_rows = 5;
