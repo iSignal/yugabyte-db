@@ -131,6 +131,7 @@
 #include "storage/procarray.h"
 #include "tcop/pquery.h"
 #include "tcop/utility.h"
+#include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -9062,38 +9063,44 @@ YbCheckTserverResponseCacheForAuthGflags()
 		yb_enable_invalidation_messages;
 }
 
+/*
+ * Decide whether the current backend should serve its connection-auth catalog
+ * prefetch (pg_authid, pg_database, ...) from the tserver response cache.
+ *
+ * Treats connection manager auth backends and regular backends uniformly:
+ * when ysql_enable_read_request_cache_for_connection_auth is set (and the
+ * response cache + invalidation messages are available), both serve the
+ * prefetch from cache. Login profiles disable the cache because
+ * pg_yb_role_profile is written during login without bumping the catalog
+ * version (the cache would go stale); such backends fall back to the
+ * no-cache prefetch.
+ *
+ * Note this only governs the connection-auth prefetch. After authentication
+ * the backend still resolves the latest master catalog version and rebuilds
+ * its full catalog cache (and the shared relcache init file) from fresh data
+ * in RelationCacheInitializePhase3, so only the per-connection authentication
+ * lookup is served from the (version-keyed) cache.
+ */
 bool
 YbUseTserverResponseCacheForAuth(uint64_t shared_catalog_version)
 {
-	if (!(YbIsAuthBackend() || YbIsAuthPassthroughInProgress(MyProcPort)))
-		return false;
-	/*
-	 * We should only see auth backend or auth passthrough in progress if
-	 * connection manager is enabled.
-	 */
-	Assert(YbIsYsqlConnMgrEnabled());
-
 	if (!YbCheckTserverResponseCacheForAuthGflags())
 		return false;
 
 	/*
-	 * For now we do not allow using tserver response cache for auth processing
-	 * if login profile is enabled. This is because the login process itself
-	 * writes to pg_yb_role_profile table but this is not done under a DDL
-	 * statement context. As a result the catalog version isn't incremented
-	 * but the tserver response cache becomes stale. Newer login processing
-	 * will continue to use the stale cache which isn't right.
+	 * initdb and major-version-upgrade catalog restore run DDLs that do not
+	 * increment the catalog version, so cached responses could go stale -- the
+	 * same reason YbRunWithPrefetcher does not use the response cache for them.
 	 */
+	if (YBCIsInitDbModeEnvVarSet() || IsBinaryUpgrade)
+		return false;
+
 	if (*YBCGetGFlags()->ysql_enable_profile && YbLoginProfileCatalogsExist)
 		return false;
 
-	/*
-	 * Tserver response cache requires a valid catalog version. Use the shared
-	 * memory catalog version as an approximation of the latest master catalog
-	 * version.
-	 */
 	if (shared_catalog_version == YB_CATCACHE_VERSION_UNINITIALIZED)
 		return false;
+
 	return true;
 }
 
@@ -9135,6 +9142,7 @@ string_list_compare(const ListCell *a, const ListCell *b)
  * The returned data structure is a row type with the following columns:
  * - tablet_id: text
  * - object_uuid: text
+ * - oid: oid (stable pg_class.oid for YSQL tables, NULL otherwise)
  * - namespace: text
  * - object_name: text
  * - type: text
@@ -9142,10 +9150,21 @@ string_list_compare(const ListCell *a, const ListCell *b)
  * - end_hash_code: int32
  * - leader: text
  * - replicas: text[]
+ * - start_range: text
+ * - end_range: text
+ * - tablet_attrs: json
+ * - tablet_state: text
  *
- * The start_hash_code and end_hash_code are the hash codes of the start and end
- * keys of the tablet for hash sharded tables. Leader is provided as a separate
- * column for simpler querying and self-explanatory access.
+ * For hash-partitioned tables (primary key contains at least one HASH column),
+ * start_hash_code (inclusive) and end_hash_code (exclusive) contain the
+ * partition bounds, while start_range and end_range are NULL. This includes
+ * tables with composite (HASH, ASC) primary keys -- only the hash boundaries
+ * are reported; the range component is not currently surfaced.
+ * For purely range-partitioned tables, start_hash_code and end_hash_code are
+ * NULL, and start_range/end_range contain the decoded range partition key
+ * boundaries.
+ * Leader is provided as a separate column for simpler querying.
+ * tablet_attrs is reserved for future use and is currently always NULL.
  */
 Datum
 yb_get_tablet_metadata(PG_FUNCTION_ARGS)
@@ -9155,7 +9174,7 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 	Tuplestorestate *tupstore;
 	MemoryContext per_query_ctx;
 	MemoryContext oldcontext;
-	static int	ncols = 9;
+	int ncols = YbGetNumberOfFunctionOutputColumns(F_YB_GET_TABLET_METADATA);
 
 	/* check to see if caller supports us returning a tuplestore */
 	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
@@ -9187,6 +9206,17 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 	rsinfo->setResult = tupstore;
 	rsinfo->setDesc = tupdesc;
 
+	/*
+	 * Privilege gating: superusers and yb_db_admin members see real values
+	 * for every row. Other roles see real values only for rows whose table
+	 * lives in the current database and on which they hold SELECT (checked
+	 * per row below). The system 'transactions' tablet is always shown.
+	 */
+	const Oid	caller_uid = GetUserId();
+	const bool	is_privileged = superuser() || IsYbDbAdminUser(caller_uid);
+	const char *current_db = is_privileged ? NULL : get_database_name(MyDatabaseId);
+	static const char *const masked_placeholder = "<insufficient privilege>";
+
 	YbcPgGlobalTabletsDescriptor *tablets = NULL;
 	size_t		num_tablets = 0;
 
@@ -9202,26 +9232,130 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 		memset(values, 0, sizeof(values));
 		memset(nulls, 0, sizeof(nulls));
 
+		/*
+		 * Decide whether this row's sensitive columns (relname and the range
+		 * bounds) should show real values or the masked placeholder. Always
+		 * unmasked for superusers and yb_db_admin members; for other users,
+		 * only when the row belongs to the current database and the user
+		 * holds SELECT on the underlying relation. The system 'transactions'
+		 * tablet is exempt -- its name is fixed and non-sensitive.
+		 *
+		 * YCQL and system tablets (other than 'transactions') are always
+		 * masked for unprivileged users: the type gate (table_type == "YSQL")
+		 * ensures they never enter the OID/ACL check branch, so show_real
+		 * stays false.
+		 */
+		Oid			pg_table_oid = tablet->pg_table_oid;
+		bool		show_real = is_privileged;
+
+		if (!is_privileged)
+		{
+			/*
+			 * Pass a non-NULL is_missing so a rewritten or orphaned relation (a
+			 * valid-looking OID with no live pg_class row) returns ACLCHECK_NO_PRIV
+			 * and gets masked, instead of erroring out the whole view query.
+			 */
+			bool		acl_is_missing = false;
+
+			if (strcmp(tablet_descriptor->namespace_name, "system") == 0 &&
+				strcmp(tablet_descriptor->table_name, "transactions") == 0)
+			{
+				show_real = true;
+			}
+			else if (current_db != NULL &&
+					 strcmp(tablet_descriptor->table_type, "YSQL") == 0 &&
+					 strcmp(tablet_descriptor->namespace_name, current_db) == 0 &&
+					 OidIsValid(pg_table_oid) &&
+					 pg_class_aclcheck_ext(pg_table_oid, caller_uid, ACL_SELECT,
+										   &acl_is_missing) == ACLCHECK_OK)
+			{
+				show_real = true;
+			}
+		}
+
 		values[0] = CStringGetTextDatum(tablet_descriptor->tablet_id);
 		values[1] = CStringGetTextDatum(tablet_descriptor->table_id);
-		values[2] = CStringGetTextDatum(tablet_descriptor->namespace_name);
-		values[3] = CStringGetTextDatum(tablet_descriptor->table_name);
-		values[4] = CStringGetTextDatum(tablet_descriptor->table_type);
+
+		/*
+		 * The stable PG table oid is computed by the master, which handles
+		 * table rewrites (where relfilenode diverges from the oid). It is
+		 * InvalidOid for non-YSQL tables and colocation parents, which surface
+		 * as NULL.
+		 */
+		if (OidIsValid(tablet->pg_table_oid))
+			values[2] = ObjectIdGetDatum(tablet->pg_table_oid);
+		else
+			nulls[2] = true;
+
+		values[3] = CStringGetTextDatum(tablet_descriptor->namespace_name);
+		values[4] = CStringGetTextDatum(show_real
+										? tablet_descriptor->table_name
+										: masked_placeholder);
+		values[5] = CStringGetTextDatum(tablet_descriptor->table_type);
 
 		if (tablet->is_hash_partitioned)
 		{
-			values[5] =
+			values[6] =
 				UInt16GetDatum(YBCDecodeMultiColumnHashLeftBound(tablet_descriptor->partition_key_start,
 																 tablet_descriptor->partition_key_start_len));	/* start_hash is
 																												 * inclusive */
-			values[6] =
+			values[7] =
 				UInt16GetDatum(YBCDecodeMultiColumnHashRightBound(tablet_descriptor->partition_key_end,
 																  tablet_descriptor->partition_key_end_len) + 1);	/* end_hash is exclusive */
+			nulls[10] = true;
+			nulls[11] = true;
 		}
 		else
 		{
-			nulls[5] = true;
 			nulls[6] = true;
+			nulls[7] = true;
+
+			if (!show_real && OidIsValid(pg_table_oid))
+			{
+				/*
+				 * Valid table but the caller lacks privilege: mask both
+				 * range bounds uniformly -- including edge tablets whose
+				 * value would have been NULL -- to prevent leaking the
+				 * table's tablet count and edge positions.
+				 */
+				values[10] = CStringGetTextDatum(masked_placeholder);
+				nulls[10] = false;
+				values[11] = CStringGetTextDatum(masked_placeholder);
+				nulls[11] = false;
+			}
+			else if (show_real)
+			{
+				char	   *start_range =
+					YBCDecodeRangePartitionKey(tablet_descriptor->partition_key_start,
+											   tablet_descriptor->partition_key_start_len);
+				if (start_range != NULL)
+				{
+					values[10] = CStringGetTextDatum(start_range);
+					pfree(start_range);
+				}
+				else
+					nulls[10] = true;
+
+				char	   *end_range =
+					YBCDecodeRangePartitionKey(tablet_descriptor->partition_key_end,
+											   tablet_descriptor->partition_key_end_len);
+				if (end_range != NULL)
+				{
+					values[11] = CStringGetTextDatum(end_range);
+					pfree(end_range);
+				}
+				else
+					nulls[11] = true;
+			}
+			else
+			{
+				/*
+				 * InvalidOid (e.g. colocation parent): no meaningful
+				 * partition bounds exist to mask, so leave ranges NULL.
+				 */
+				nulls[10] = true;
+				nulls[11] = true;
+			}
 		}
 
 		/* Convert replicas array to PostgreSQL text array */
@@ -9230,7 +9364,7 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 			Assert(tablet->replicas != NULL);
 
 			/* The last replica is the leader. */
-			values[7] = CStringGetTextDatum(tablet->replicas[tablet->replicas_count - 1]);
+			values[8] = CStringGetTextDatum(tablet->replicas[tablet->replicas_count - 1]);
 
 			/* Convert char ** to List * */
 			List	   *replicas_list = NIL;
@@ -9243,13 +9377,21 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 			 * with same replicas have same entries.
 			 */
 			list_sort(replicas_list, string_list_compare);
-			values[8] = PointerGetDatum(strlist_to_textarray(replicas_list));
+			values[9] = PointerGetDatum(strlist_to_textarray(replicas_list));
 		}
 		else
 		{
-			nulls[7] = true;
 			nulls[8] = true;
+			nulls[9] = true;
 		}
+
+		/* TODO(#30180): Populate tablet_attrs. */
+		nulls[12] = true;
+
+		if (tablet->tablet_state)
+			values[13] = CStringGetTextDatum(tablet->tablet_state);
+		else
+			nulls[13] = true;
 
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 	}

@@ -2708,6 +2708,18 @@ static struct config_bool ConfigureNamesBool[] =
 	},
 
 	{
+		{"yb_enable_replication_slot_query_api", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Enable the query API (pull model) for logical "
+						 "replication via pg_logical_slot_get/peek_changes."),
+			NULL,
+			GUC_NOT_IN_SAMPLE,
+		},
+		&yb_enable_replication_slot_query_api,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"yb_enable_replica_identity", PGC_SUSET, REPLICATION_SENDING,
 			gettext_noop("Allow changing replica identity via ALTER TABLE command"),
 			NULL,
@@ -2770,6 +2782,19 @@ static struct config_bool ConfigureNamesBool[] =
 			GUC_NOT_IN_SAMPLE
 		},
 		&yb_enable_consistent_replication_from_hash_range,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"yb_enable_replication_slot_exclusive_lock", PGC_SUSET, DEVELOPER_OPTIONS,
+			gettext_noop("Acquire a cluster-wide exclusive advisory lock while a "
+						 "replication slot is in use so that only one consumer can "
+						 "use it at a time across the universe."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&yb_enable_replication_slot_exclusive_lock,
 		false,
 		NULL, NULL, NULL
 	},
