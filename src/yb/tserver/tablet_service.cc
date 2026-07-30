@@ -213,6 +213,12 @@ DEFINE_test_flag(double, respond_write_failed_probability, 0.0,
 DEFINE_test_flag(double, respond_write_with_abort_probability, 0.0,
     "Probability to respond that write request is aborted");
 
+DEFINE_test_flag(int32, num_write_responses_to_fail_after_apply, 0,
+    "Number of write responses to fail after the write has been fully applied. Simulates a "
+    "response lost in flight, so the client retries a write that already took effect. Unlike "
+    "TEST_respond_write_failed_probability, this fires from the completion callback, so the "
+    "write is guaranteed to be applied before the client can retry. Decremented on each use.");
+
 DEFINE_test_flag(bool, rpc_delete_tablet_fail, false, "Should delete tablet RPC fail.");
 
 DECLARE_bool(disable_alter_vs_write_mutual_exclusion);
@@ -562,6 +568,14 @@ class WriteQueryCompletionCallback {
         response_->dup_trace_buffer(trace_->DumpToString(true));
       }
       SetupErrorAndRespond(get_error(), status, context_.get());
+      return;
+    }
+
+    if (PREDICT_FALSE(FLAGS_TEST_num_write_responses_to_fail_after_apply > 0)) {
+      ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_num_write_responses_to_fail_after_apply)--;
+      LOG(INFO) << "TEST: failing write response after apply";
+      SetupErrorAndRespond(
+          get_error(), STATUS(LeaderHasNoLease, "TEST: lost write response"), context_.get());
       return;
     }
 
@@ -2693,6 +2707,7 @@ Status TabletServiceImpl::PerformWrite(
       leader_term, context_ptr->GetClientDeadline(), tablet.peer.get(), tablet.tablet,
       context_ptr.get(), resp);
   query->set_client_request(*req);
+  query->AdjustYsqlQueryTransactionality(req->pgsql_write_batch_size());
 
   if (RandomActWithProbability(FLAGS_TEST_respond_write_failed_probability)) {
     LOG(INFO) << "Responding with a failure to " << req->ShortDebugString();
@@ -2713,8 +2728,6 @@ Status TabletServiceImpl::PerformWrite(
   query->set_callback(WriteQueryCompletionCallback(
       tablet.peer, context_ptr, resp, query.get(), server_->Clock(), req->include_trace(),
       req->has_leader_term()));
-
-  query->AdjustYsqlQueryTransactionality(req->pgsql_write_batch_size());
 
   tablet.peer->WriteAsync(std::move(query));
 
