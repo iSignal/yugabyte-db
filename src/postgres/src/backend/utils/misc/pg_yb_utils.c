@@ -9565,20 +9565,16 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
-/*
- * Auto-analyze service keys are DocDB table-id OIDs: relfilenode after a
- * rewrite, and pg_class.oid beforehand. Mapped catalogs (relfilenode 0)
- * are dropped by the ScanKey so they are not returned from the master.
- * Only rewritten rows need a map entry (relfilenode != oid); that
- * predicate is column-vs-column and is applied here. Identity rows fall
- * back to treating the service key as oid.
- */
 typedef struct
 {
 	Oid			relfilenode;	/* hash key; must be first */
 	Oid			relid;
 } YbRelfilenodeMapEntry;
 
+/*
+ * Returns a hash map from relfilenode to relation oid for relations whose
+ * relfilenode differs from oid. Caller must hash_destroy the result.
+ */
 static HTAB *
 yb_build_relfilenode_to_relid_map(void)
 {
