@@ -9658,6 +9658,7 @@ yb_stat_auto_analyze(PG_FUNCTION_ARGS)
 		memset(values, 0, sizeof(values));
 		memset(nulls, 0, sizeof(nulls));
 
+		/* DocDB table oid maps to relfilenode in pg_class */
 		entry = hash_search(relfilenode_map, &row_info->table_oid, HASH_FIND, NULL);
 		relid = entry ? entry->relid : row_info->table_oid;
 
