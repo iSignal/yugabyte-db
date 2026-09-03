@@ -137,6 +137,7 @@
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
+#include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/jsonb.h"
 #include "utils/lsyscache.h"
@@ -9564,11 +9565,76 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
+typedef struct
+{
+	Oid			relfilenode;	/* hash key; must be first */
+	Oid			relid;
+} YbRelfilenodeMapEntry;
+
+/*
+ * Returns a hash map from relfilenode to relation oid for relations whose
+ * relfilenode differs from oid. Caller must hash_destroy the result.
+ */
+static HTAB *
+yb_build_relfilenode_to_relid_map(void)
+{
+	HASHCTL		hash_ctl;
+	HTAB	   *map;
+	Relation	pg_class;
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	ScanKeyData skey[2];
+
+	MemSet(&hash_ctl, 0, sizeof(hash_ctl));
+	hash_ctl.keysize = sizeof(Oid);
+	hash_ctl.entrysize = sizeof(YbRelfilenodeMapEntry);
+	hash_ctl.hcxt = CurrentMemoryContext;
+	map = hash_create("yb_stat_auto_analyze relfilenode map",
+					  128,
+					  &hash_ctl,
+					  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	/*
+	 * pg_class_tblspc_relfilenode_index is (reltablespace, relfilenode).
+	 * reltablespace >= 0 names the leading column (0 is the default
+	 * tablespace stored in pg_class) so relfilenode > 0 can be pushed.
+	 */
+	ScanKeyInit(&skey[0],
+				Anum_pg_class_reltablespace,
+				BTGreaterEqualStrategyNumber,
+				F_OIDGE,
+				ObjectIdGetDatum(InvalidOid));
+	ScanKeyInit(&skey[1],
+				Anum_pg_class_relfilenode,
+				BTGreaterStrategyNumber,
+				F_OIDGT,
+				ObjectIdGetDatum(InvalidOid));
+
+	pg_class = table_open(RelationRelationId, AccessShareLock);
+	scan = systable_beginscan(pg_class, ClassTblspcRelfilenodeIndexId, true,
+							  NULL, 2, skey);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Form_pg_class classform = (Form_pg_class) GETSTRUCT(tuple);
+		YbRelfilenodeMapEntry *entry;
+
+		if (classform->relfilenode == classform->oid)
+			continue;
+		entry = hash_search(map, &classform->relfilenode, HASH_ENTER, NULL);
+		entry->relid = classform->oid;
+	}
+	systable_endscan(scan);
+	table_close(pg_class, AccessShareLock);
+
+	return map;
+}
+
 Datum
 yb_stat_auto_analyze(PG_FUNCTION_ARGS)
 {
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	int			i;
+	HTAB	   *relfilenode_map;
 
 #define YB_AUTO_ANALYZE_TABLE_COLS 5
 
@@ -9578,22 +9644,32 @@ yb_stat_auto_analyze(PG_FUNCTION_ARGS)
 
 	HandleYBStatus(YBCQueryAutoAnalyze(MyDatabaseId, &auto_analyze_info, &num_rows));
 
+	relfilenode_map = yb_build_relfilenode_to_relid_map();
+
 	for (i = 0; i < num_rows; ++i)
 	{
 		YbcAutoAnalyzeInfo *row_info = (YbcAutoAnalyzeInfo *) auto_analyze_info + i;
+		YbRelfilenodeMapEntry *entry;
+		Oid			relid;
+		Relation	rel;
 		Datum		values[YB_AUTO_ANALYZE_TABLE_COLS];
 		bool		nulls[YB_AUTO_ANALYZE_TABLE_COLS];
 
 		memset(values, 0, sizeof(values));
 		memset(nulls, 0, sizeof(nulls));
-		Relation rel = RelationIdGetRelation(row_info->table_oid);
+
+		/* DocDB table oid maps to relfilenode in pg_class */
+		entry = hash_search(relfilenode_map, &row_info->table_oid, HASH_FIND, NULL);
+		relid = entry ? entry->relid : row_info->table_oid;
+
+		rel = RelationIdGetRelation(relid);
 		/*
 		 * A table could be deleted, but auto analyze hasn't cleaned up its
 		 * entry from its service table yet.
 		 */
 		if (!RelationIsValid(rel))
 			continue;
-		values[0] = ObjectIdGetDatum(row_info->table_oid);
+		values[0] = ObjectIdGetDatum(relid);
 		values[1] = CStringGetTextDatum(get_namespace_name(RelationGetNamespace(rel)));
 		values[2] = CStringGetTextDatum(RelationGetRelationName(rel));
 		values[3] = UInt64GetDatum(row_info->mutations);
@@ -9609,6 +9685,8 @@ yb_stat_auto_analyze(PG_FUNCTION_ARGS)
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 		RelationClose(rel);
 	}
+
+	hash_destroy(relfilenode_map);
 
 #undef YB_AUTO_ANALYZE_TABLE_COLS
 
