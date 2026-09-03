@@ -45,7 +45,6 @@
 #include "access/htup.h"
 #include "access/htup_details.h"
 #include "access/relation.h"
-#include "access/skey.h"
 #include "access/sysattr.h"
 #include "access/table.h"
 #include "access/tupdesc.h"
@@ -9570,10 +9569,6 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
  * Auto-analyze service keys are DocDB table-id OIDs: relfilenode after a
  * rewrite, and pg_class.oid beforehand. Mapped catalogs store relfilenode 0
  * and are resolved by treating the service key as oid.
- *
- * Scan pg_class_tblspc_relfilenode_index per tablespace with relfilenode > 0
- * so both index columns are bound (heap ScanKey on relfilenode alone is not
- * a PK qual and ybc_systable_beginscan asserts if a key needs PG recheck).
  */
 typedef struct
 {
@@ -9581,49 +9576,12 @@ typedef struct
 	Oid			relid;
 } YbRelfilenodeMapEntry;
 
-static void
-yb_add_relfilenodes_for_tablespace(HTAB *map, Relation pg_class,
-								   Oid reltablespace)
-{
-	ScanKeyData skey[2];
-	SysScanDesc scan;
-	HeapTuple	tuple;
-
-	ScanKeyInit(&skey[0],
-				Anum_pg_class_reltablespace,
-				BTEqualStrategyNumber,
-				F_OIDEQ,
-				ObjectIdGetDatum(reltablespace));
-	ScanKeyInit(&skey[1],
-				Anum_pg_class_relfilenode,
-				BTGreaterStrategyNumber,
-				F_OIDGT,
-				ObjectIdGetDatum(InvalidOid));
-
-	scan = systable_beginscan(pg_class,
-							  ClassTblspcRelfilenodeIndexId,
-							  true,
-							  NULL,
-							  2,
-							  skey);
-	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
-	{
-		Form_pg_class classform = (Form_pg_class) GETSTRUCT(tuple);
-		YbRelfilenodeMapEntry *entry;
-
-		entry = hash_search(map, &classform->relfilenode, HASH_ENTER, NULL);
-		entry->relid = classform->oid;
-	}
-	systable_endscan(scan);
-}
-
 static HTAB *
 yb_build_relfilenode_to_relid_map(void)
 {
 	HASHCTL		hash_ctl;
 	HTAB	   *map;
 	Relation	pg_class;
-	Relation	pg_tablespace;
 	SysScanDesc scan;
 	HeapTuple	tuple;
 
@@ -9636,24 +9594,21 @@ yb_build_relfilenode_to_relid_map(void)
 					  &hash_ctl,
 					  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
+	/* pg_class_tblspc_relfilenode_index; skip mapped catalogs (relfilenode 0). */
 	pg_class = table_open(RelationRelationId, AccessShareLock);
-
-	/* Default tablespace is stored as 0 in pg_class.reltablespace. */
-	yb_add_relfilenodes_for_tablespace(map, pg_class, InvalidOid);
-	yb_add_relfilenodes_for_tablespace(map, pg_class, GLOBALTABLESPACE_OID);
-
-	pg_tablespace = table_open(TableSpaceRelationId, AccessShareLock);
-	scan = systable_beginscan(pg_tablespace, InvalidOid, false, NULL, 0, NULL);
+	scan = systable_beginscan(pg_class, ClassTblspcRelfilenodeIndexId, true,
+							  NULL, 0, NULL);
 	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
 	{
-		Oid			ts = ((Form_pg_tablespace) GETSTRUCT(tuple))->oid;
+		Form_pg_class classform = (Form_pg_class) GETSTRUCT(tuple);
+		YbRelfilenodeMapEntry *entry;
 
-		if (ts == DEFAULTTABLESPACE_OID || ts == GLOBALTABLESPACE_OID)
+		if (!OidIsValid(classform->relfilenode))
 			continue;
-		yb_add_relfilenodes_for_tablespace(map, pg_class, ts);
+		entry = hash_search(map, &classform->relfilenode, HASH_ENTER, NULL);
+		entry->relid = classform->oid;
 	}
 	systable_endscan(scan);
-	table_close(pg_tablespace, AccessShareLock);
 	table_close(pg_class, AccessShareLock);
 
 	return map;
