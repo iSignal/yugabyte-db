@@ -9584,6 +9584,7 @@ yb_build_relfilenode_to_relid_map(void)
 	Relation	pg_class;
 	SysScanDesc scan;
 	HeapTuple	tuple;
+	ScanKeyData skey[2];
 
 	MemSet(&hash_ctl, 0, sizeof(hash_ctl));
 	hash_ctl.keysize = sizeof(Oid);
@@ -9594,17 +9595,30 @@ yb_build_relfilenode_to_relid_map(void)
 					  &hash_ctl,
 					  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
-	/* pg_class_tblspc_relfilenode_index; skip mapped catalogs (relfilenode 0). */
+	/*
+	 * pg_class_tblspc_relfilenode_index is (reltablespace, relfilenode).
+	 * reltablespace >= 0 names the leading column (0 is the default
+	 * tablespace stored in pg_class) so relfilenode > 0 can be pushed.
+	 */
+	ScanKeyInit(&skey[0],
+				Anum_pg_class_reltablespace,
+				BTGreaterEqualStrategyNumber,
+				F_OIDGE,
+				ObjectIdGetDatum(InvalidOid));
+	ScanKeyInit(&skey[1],
+				Anum_pg_class_relfilenode,
+				BTGreaterStrategyNumber,
+				F_OIDGT,
+				ObjectIdGetDatum(InvalidOid));
+
 	pg_class = table_open(RelationRelationId, AccessShareLock);
 	scan = systable_beginscan(pg_class, ClassTblspcRelfilenodeIndexId, true,
-							  NULL, 0, NULL);
+							  NULL, 2, skey);
 	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
 	{
 		Form_pg_class classform = (Form_pg_class) GETSTRUCT(tuple);
 		YbRelfilenodeMapEntry *entry;
 
-		if (!OidIsValid(classform->relfilenode))
-			continue;
 		entry = hash_search(map, &classform->relfilenode, HASH_ENTER, NULL);
 		entry->relid = classform->oid;
 	}
