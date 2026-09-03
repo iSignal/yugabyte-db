@@ -45,6 +45,7 @@
 #include "access/htup.h"
 #include "access/htup_details.h"
 #include "access/relation.h"
+#include "access/skey.h"
 #include "access/sysattr.h"
 #include "access/table.h"
 #include "access/tupdesc.h"
@@ -137,6 +138,7 @@
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
+#include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/jsonb.h"
 #include "utils/lsyscache.h"
@@ -9564,11 +9566,105 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
+/*
+ * Auto-analyze service keys are DocDB table-id OIDs: relfilenode after a
+ * rewrite, and pg_class.oid beforehand. Mapped catalogs store relfilenode 0
+ * and are resolved by treating the service key as oid.
+ *
+ * Scan pg_class_tblspc_relfilenode_index per tablespace with relfilenode > 0
+ * so both index columns are bound (heap ScanKey on relfilenode alone is not
+ * a PK qual and ybc_systable_beginscan asserts if a key needs PG recheck).
+ */
+typedef struct
+{
+	Oid			relfilenode;	/* hash key; must be first */
+	Oid			relid;
+} YbRelfilenodeMapEntry;
+
+static void
+yb_add_relfilenodes_for_tablespace(HTAB *map, Relation pg_class,
+								   Oid reltablespace)
+{
+	ScanKeyData skey[2];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+
+	ScanKeyInit(&skey[0],
+				Anum_pg_class_reltablespace,
+				BTEqualStrategyNumber,
+				F_OIDEQ,
+				ObjectIdGetDatum(reltablespace));
+	ScanKeyInit(&skey[1],
+				Anum_pg_class_relfilenode,
+				BTGreaterStrategyNumber,
+				F_OIDGT,
+				ObjectIdGetDatum(InvalidOid));
+
+	scan = systable_beginscan(pg_class,
+							  ClassTblspcRelfilenodeIndexId,
+							  true,
+							  NULL,
+							  2,
+							  skey);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Form_pg_class classform = (Form_pg_class) GETSTRUCT(tuple);
+		YbRelfilenodeMapEntry *entry;
+
+		entry = hash_search(map, &classform->relfilenode, HASH_ENTER, NULL);
+		entry->relid = classform->oid;
+	}
+	systable_endscan(scan);
+}
+
+static HTAB *
+yb_build_relfilenode_to_relid_map(void)
+{
+	HASHCTL		hash_ctl;
+	HTAB	   *map;
+	Relation	pg_class;
+	Relation	pg_tablespace;
+	SysScanDesc scan;
+	HeapTuple	tuple;
+
+	MemSet(&hash_ctl, 0, sizeof(hash_ctl));
+	hash_ctl.keysize = sizeof(Oid);
+	hash_ctl.entrysize = sizeof(YbRelfilenodeMapEntry);
+	hash_ctl.hcxt = CurrentMemoryContext;
+	map = hash_create("yb_stat_auto_analyze relfilenode map",
+					  128,
+					  &hash_ctl,
+					  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	pg_class = table_open(RelationRelationId, AccessShareLock);
+
+	/* Default tablespace is stored as 0 in pg_class.reltablespace. */
+	yb_add_relfilenodes_for_tablespace(map, pg_class, InvalidOid);
+	yb_add_relfilenodes_for_tablespace(map, pg_class, GLOBALTABLESPACE_OID);
+
+	pg_tablespace = table_open(TableSpaceRelationId, AccessShareLock);
+	scan = systable_beginscan(pg_tablespace, InvalidOid, false, NULL, 0, NULL);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Oid			ts = ((Form_pg_tablespace) GETSTRUCT(tuple))->oid;
+
+		if (ts == DEFAULTTABLESPACE_OID || ts == GLOBALTABLESPACE_OID)
+			continue;
+		yb_add_relfilenodes_for_tablespace(map, pg_class, ts);
+	}
+	systable_endscan(scan);
+	table_close(pg_tablespace, AccessShareLock);
+	table_close(pg_class, AccessShareLock);
+
+	return map;
+}
+
 Datum
 yb_stat_auto_analyze(PG_FUNCTION_ARGS)
 {
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	int			i;
+	HTAB	   *relfilenode_map;
 
 #define YB_AUTO_ANALYZE_TABLE_COLS 5
 
@@ -9578,22 +9674,31 @@ yb_stat_auto_analyze(PG_FUNCTION_ARGS)
 
 	HandleYBStatus(YBCQueryAutoAnalyze(MyDatabaseId, &auto_analyze_info, &num_rows));
 
+	relfilenode_map = yb_build_relfilenode_to_relid_map();
+
 	for (i = 0; i < num_rows; ++i)
 	{
 		YbcAutoAnalyzeInfo *row_info = (YbcAutoAnalyzeInfo *) auto_analyze_info + i;
+		YbRelfilenodeMapEntry *entry;
+		Oid			relid;
+		Relation	rel;
 		Datum		values[YB_AUTO_ANALYZE_TABLE_COLS];
 		bool		nulls[YB_AUTO_ANALYZE_TABLE_COLS];
 
 		memset(values, 0, sizeof(values));
 		memset(nulls, 0, sizeof(nulls));
-		Relation rel = RelationIdGetRelation(row_info->table_oid);
+
+		entry = hash_search(relfilenode_map, &row_info->table_oid, HASH_FIND, NULL);
+		relid = entry ? entry->relid : row_info->table_oid;
+
+		rel = RelationIdGetRelation(relid);
 		/*
 		 * A table could be deleted, but auto analyze hasn't cleaned up its
 		 * entry from its service table yet.
 		 */
 		if (!RelationIsValid(rel))
 			continue;
-		values[0] = ObjectIdGetDatum(row_info->table_oid);
+		values[0] = ObjectIdGetDatum(relid);
 		values[1] = CStringGetTextDatum(get_namespace_name(RelationGetNamespace(rel)));
 		values[2] = CStringGetTextDatum(RelationGetRelationName(rel));
 		values[3] = UInt64GetDatum(row_info->mutations);
@@ -9609,6 +9714,8 @@ yb_stat_auto_analyze(PG_FUNCTION_ARGS)
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 		RelationClose(rel);
 	}
+
+	hash_destroy(relfilenode_map);
 
 #undef YB_AUTO_ANALYZE_TABLE_COLS
 
