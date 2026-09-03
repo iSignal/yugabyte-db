@@ -9567,10 +9567,11 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 
 /*
  * Auto-analyze service keys are DocDB table-id OIDs: relfilenode after a
- * rewrite, and pg_class.oid beforehand. Only rewritten rows need a map
- * entry (relfilenode != oid). Identity rows and mapped catalogs
- * (relfilenode 0) fall back to treating the service key as oid.
- * relfilenode != oid is column-vs-column and cannot be a ScanKey.
+ * rewrite, and pg_class.oid beforehand. Mapped catalogs (relfilenode 0)
+ * are dropped by the ScanKey so they are not returned from the master.
+ * Only rewritten rows need a map entry (relfilenode != oid); that
+ * predicate is column-vs-column and is applied here. Identity rows fall
+ * back to treating the service key as oid.
  */
 typedef struct
 {
@@ -9586,6 +9587,7 @@ yb_build_relfilenode_to_relid_map(void)
 	Relation	pg_class;
 	SysScanDesc scan;
 	HeapTuple	tuple;
+	ScanKeyData skey[2];
 
 	MemSet(&hash_ctl, 0, sizeof(hash_ctl));
 	hash_ctl.keysize = sizeof(Oid);
@@ -9596,16 +9598,31 @@ yb_build_relfilenode_to_relid_map(void)
 					  &hash_ctl,
 					  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
+	/*
+	 * pg_class_tblspc_relfilenode_index is (reltablespace, relfilenode).
+	 * reltablespace >= 0 names the leading column (0 is the default
+	 * tablespace stored in pg_class) so relfilenode > 0 can be pushed.
+	 */
+	ScanKeyInit(&skey[0],
+				Anum_pg_class_reltablespace,
+				BTGreaterEqualStrategyNumber,
+				F_OIDGE,
+				ObjectIdGetDatum(InvalidOid));
+	ScanKeyInit(&skey[1],
+				Anum_pg_class_relfilenode,
+				BTGreaterStrategyNumber,
+				F_OIDGT,
+				ObjectIdGetDatum(InvalidOid));
+
 	pg_class = table_open(RelationRelationId, AccessShareLock);
 	scan = systable_beginscan(pg_class, ClassTblspcRelfilenodeIndexId, true,
-							  NULL, 0, NULL);
+							  NULL, 2, skey);
 	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
 	{
 		Form_pg_class classform = (Form_pg_class) GETSTRUCT(tuple);
 		YbRelfilenodeMapEntry *entry;
 
-		if (!OidIsValid(classform->relfilenode) ||
-			classform->relfilenode == classform->oid)
+		if (classform->relfilenode == classform->oid)
 			continue;
 		entry = hash_search(map, &classform->relfilenode, HASH_ENTER, NULL);
 		entry->relid = classform->oid;
