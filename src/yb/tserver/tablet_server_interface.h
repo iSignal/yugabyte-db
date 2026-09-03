@@ -151,6 +151,10 @@ class TabletServerIf : public LocalTabletServer {
 
   virtual std::shared_ptr<cdc::CDCServiceImpl> GetCDCService() const = 0;
 
+  // The tserver-local DocDB copy of the master system catalog tablet, or nullptr when the feature
+  // is off or the server is not a tserver.
+  virtual LocalCatalogReplica* local_catalog_replica() const { return nullptr; }
+
   virtual void ClearAllMetaCachesOnServer() = 0;
 
   virtual Status ClearMetacache(const std::string& namespace_id) = 0;

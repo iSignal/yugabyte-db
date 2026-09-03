@@ -410,6 +410,16 @@ typedef struct {
   uint32_t* aux;
 } YbcWaitEventInfoPtr;
 
+/*
+ * The catalog version a backend believes it is at, and the database it applies to. db_oid is
+ * InvalidOid outside per-database catalog version mode, where the version is a global one and
+ * cannot be compared against the per-database versions a local catalog copy tracks.
+ */
+typedef struct {
+  YbcPgOid db_oid;
+  uint64_t version;
+} YbcPgLocalCatalogVersion;
+
 typedef struct {
   YbcPgMemctx (*GetCurrentYbMemctx)();
   const char* (*GetDebugQueryString)();
@@ -422,6 +432,8 @@ typedef struct {
   /* pgstat.h */
   YbcWaitEventInfo (*PgstatReportWaitStart)(YbcWaitEventInfo);
   YbcReadPointHandle (*GetCatalogSnapshotReadPoint)(YbcPgOid table_oid, bool create_if_not_exists);
+  /* pg_yb_utils.h: the catalog version this backend believes it is at, and its database. */
+  YbcPgLocalCatalogVersion (*GetLocalCatalogVersion)();
   /* replication origin */
   uint16_t (*GetSessionReplicationOriginId)();
   bool (*HasProcessableAbortInterrupt)();

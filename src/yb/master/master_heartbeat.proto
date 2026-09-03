@@ -307,6 +307,19 @@ message TSHeartbeatResponsePB {
   optional tserver.DBCatalogVersionDataPB db_catalog_version_data = 20;
   optional tserver.DBCatalogInvalMessagesDataPB db_catalog_inval_messages_data = 28;
 
+  // The hybrid time at which master read db_catalog_version_data. A tserver that serves catalog
+  // reads from a local copy of the master system catalog tablet skips this response's version data
+  // entirely while its copy is not yet complete up to this time, and publishes the next full
+  // report once it is. It cannot instead lower the versions it publishes: a version below the one
+  // already published is treated as a stale master report and eventually crashes the tserver.
+  optional fixed64 db_catalog_versions_read_time = 36;
+
+  // Set while a YSQL major version upgrade is in progress. A tserver that serves catalog reads
+  // from a local copy of the master system catalog tablet takes the copy out of the read path
+  // while this is set: during the upgrade two catalog version tables are in play and DDLs still
+  // run, and the copy's read rule has not been worked out for that state.
+  optional bool ysql_major_version_upgrade_in_progress = 35;
+
   optional encryption.UniverseKeyRegistryPB universe_key_registry = 11;
 
   optional cdc.ConsumerRegistryPB consumer_registry = 12;

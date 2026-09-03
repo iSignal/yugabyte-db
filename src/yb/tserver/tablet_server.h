@@ -464,6 +464,12 @@ class TabletServer : public DbServerBase, public TabletServerIf {
 
   std::shared_ptr<cdc::CDCServiceImpl> GetCDCService() const override { return cdc_service_; }
 
+  // The tserver-local copy of the master system catalog tablet, or nullptr when
+  // enable_local_tserver_catalog is off.
+  LocalCatalogReplica* local_catalog_replica() const override {
+    return local_catalog_replica_.get();
+  }
+
   key_t GetYsqlConnMgrStatsShmemKey() { return ysql_conn_mgr_stats_shmem_key_; }
   void SetYsqlConnMgrStatsShmemKey(key_t shmem_key) { ysql_conn_mgr_stats_shmem_key_ = shmem_key; }
   Status YCQLStatementStats(const tserver::PgYCQLStatementStatsRequestPB& req,
@@ -764,6 +770,10 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   std::shared_ptr<ObjectLockTracker> object_lock_tracker_;
 
   std::optional<YSQLLeaseManager> ysql_lease_manager_;
+
+  // Tserver-local DocDB copy of the master system catalog tablet. Created only when
+  // enable_local_tserver_catalog is set.
+  std::unique_ptr<LocalCatalogReplica> local_catalog_replica_;
   std::optional<ConnectivityPoller> connectivity_poller_;
 
   std::unique_ptr<docdb::ObjectLockSharedStateManager> object_lock_shared_state_manager_;

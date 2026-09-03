@@ -246,9 +246,13 @@ class SysCatalogTable {
   }
 
   using ReadRestartFn = std::function<Status (const ReadHybridTime &, HybridTime *)>;
+  // When used_read_time is set, it receives the hybrid time the successful read ran at. A caller
+  // that publishes what it read to another server uses it to say "everything I am publishing was
+  // committed at or below this time".
   Status ReadWithRestarts(
       const ReadRestartFn& fn,
-      tablet::RequireLease require_lease = tablet::RequireLease::kTrue) const;
+      tablet::RequireLease require_lease = tablet::RequireLease::kTrue,
+      HybridTime* used_read_time = nullptr) const;
 
   // Read the global ysql catalog version info from the pg_yb_catalog_version catalog table.
   Status ReadYsqlCatalogVersion(const TableId& ysql_catalog_table_id,
@@ -263,7 +267,8 @@ class SysCatalogTable {
   // catalog table.
   Status ReadYsqlAllDBCatalogVersions(
       const TableId& ysql_catalog_table_id,
-      DbOidToCatalogVersionMap* versions);
+      DbOidToCatalogVersionMap* versions,
+      HybridTime* used_read_time = nullptr);
   // Read the ysql catalog cache invalidation messages info for all databases from the
   // pg_yb_invalidation_messages catalog table.
   Result<DbOidVersionToMessageListMap> ReadYsqlCatalogInvalationMessages();
@@ -435,7 +440,8 @@ class SysCatalogTable {
       uint32_t db_oid,
       uint64_t* catalog_version,
       uint64_t* last_breaking_version,
-      DbOidToCatalogVersionMap* versions);
+      DbOidToCatalogVersionMap* versions,
+      HybridTime* used_read_time = nullptr);
   Status ReadYsqlDBCatalogVersionImplWithReadTime(
       const TableId& ysql_catalog_table_id,
       uint32_t db_oid,

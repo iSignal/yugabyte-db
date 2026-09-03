@@ -961,7 +961,8 @@ Status SysCatalogTable::Visit(VisitorBase* visitor) {
 }
 
 Status SysCatalogTable::ReadWithRestarts(
-    const ReadRestartFn& read_fn, tablet::RequireLease require_lease) const {
+    const ReadRestartFn& read_fn, tablet::RequireLease require_lease,
+    HybridTime* used_read_time) const {
   ReadHybridTime read_time;
   auto tablet = tablet_peer()->shared_tablet_maybe_null();
   if (!tablet) {
@@ -984,6 +985,9 @@ Status SysCatalogTable::ReadWithRestarts(
     }
     RETURN_NOT_OK(read_fn(read_time, &read_restart_ht));
   } while (read_restart_ht.is_valid());
+  if (used_read_time) {
+    *used_read_time = read_time.read;
+  }
   return Status::OK();
 }
 
@@ -1006,11 +1010,12 @@ Status SysCatalogTable::ReadYsqlDBCatalogVersion(
 }
 
 Status SysCatalogTable::ReadYsqlAllDBCatalogVersions(
-    const TableId& ysql_catalog_table_id, DbOidToCatalogVersionMap* versions) {
+    const TableId& ysql_catalog_table_id, DbOidToCatalogVersionMap* versions,
+    HybridTime* used_read_time) {
   TRACE_EVENT0("master", "ReadYsqlAllDBCatalogVersions");
   return ReadYsqlDBCatalogVersionImpl(
       ysql_catalog_table_id, kInvalidOid, /*catalog_version=*/nullptr,
-      /*last_breaking_version=*/nullptr, versions);
+      /*last_breaking_version=*/nullptr, versions, used_read_time);
 }
 
 Status SysCatalogTable::ReadYsqlDBCatalogVersionImpl(
@@ -1018,14 +1023,16 @@ Status SysCatalogTable::ReadYsqlDBCatalogVersionImpl(
     uint32_t db_oid,
     uint64_t* catalog_version,
     uint64_t* last_breaking_version,
-    DbOidToCatalogVersionMap* versions) {
+    DbOidToCatalogVersionMap* versions,
+    HybridTime* used_read_time) {
   return ReadWithRestarts(
       [this, ysql_catalog_table_id, db_oid, catalog_version, last_breaking_version, versions](
           const ReadHybridTime& read_ht, HybridTime* read_restart_ht) -> Status {
         return SysCatalogTable::ReadYsqlDBCatalogVersionImplWithReadTime(
             ysql_catalog_table_id, db_oid, read_ht, read_restart_ht, catalog_version,
             last_breaking_version, versions);
-      });
+      },
+      tablet::RequireLease::kTrue, used_read_time);
 }
 
 Status SysCatalogTable::ReadYsqlDBCatalogVersionImplWithReadTime(

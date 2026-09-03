@@ -29,6 +29,8 @@
 
 #include "yb/server/server_base.h"
 
+#include "yb/tserver/local_catalog_replica.h"
+
 #include "yb/tserver/service_util.h"
 #include "yb/tserver/tserver_service.pb.h"
 
@@ -528,6 +530,36 @@ class TSLocalLockManager::Impl {
     RETURN_NOT_OK(add_to_in_progress.status());
     // In case of exclusive locks, invalidate the db table cache before releasing them.
     if (req.has_db_catalog_version_data()) {
+      // The exposure gate. Master read these versions at catalog_versions_read_time, so every
+      // catalog change they describe committed at or below that time. A backend told version V
+      // must be able to read a copy that contains V, so the copy is not allowed to publish the
+      // versions until it holds every change up to that time. The release RPC handler is
+      // synchronous, so waiting here delays the acknowledgement, and the DDL's client is told the
+      // DDL succeeded only after every tserver has acknowledged.
+      //
+      // While the copy is not serving (bootstrapping, re-seeding, or disabled by lease loss) its
+      // backends' catalog reads go to master, so there is nothing to gate and the versions are
+      // published immediately.
+      auto* local_catalog = server_->local_catalog_replica();
+      if (local_catalog && local_catalog->IsServing() && req.has_catalog_versions_read_time()) {
+        const auto target = HybridTime(req.catalog_versions_read_time());
+        const auto wait_start = MonoTime::Now();
+        VLOG(1) << "Waiting for the local catalog copy to reach "
+                << LocalCatalogHybridTimeForLog(target)
+                << " before publishing the catalog versions of txn " << txn
+                << "; the copy holds "
+                << LocalCatalogHybridTimeForLog(local_catalog->safe_time());
+        auto wait_status = local_catalog->WaitForSafeTime(target, deadline);
+        const auto waited = MonoTime::Now() - wait_start;
+        VLOG(1) << "Wait for the local catalog copy to reach "
+                << LocalCatalogHybridTimeForLog(target) << " ended after " << waited << ": "
+                << wait_status;
+        local_catalog->RecordGateWait(waited);
+        RETURN_NOT_OK_PREPEND(
+            wait_status,
+            Format("Local catalog copy did not catch up to $0 before publishing catalog versions",
+                   target));
+      }
       if (FLAGS_ysql_yb_enable_invalidation_messages && req.has_db_catalog_inval_messages_data()) {
         VLOG(4) << "Received inval msgs during lock release "
         << tserver::CatalogInvalMessagesDataDebugString(req.db_catalog_inval_messages_data());

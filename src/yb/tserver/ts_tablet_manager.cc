@@ -103,6 +103,7 @@
 
 #include "yb/tserver/full_compaction_manager.h"
 #include "yb/tserver/heartbeater.h"
+#include "yb/tserver/local_catalog_replica.h"
 #include "yb/tserver/remote_bootstrap_client.h"
 #include "yb/tserver/remote_bootstrap_session.h"
 #include "yb/tserver/remote_snapshot_transfer_client.h"
@@ -121,6 +122,7 @@
 #include "yb/util/env.h"
 #include "yb/util/fault_injection.h"
 #include "yb/util/file_util.h"
+#include "yb/util/backoff_waiter.h"
 #include "yb/util/flags.h"
 #include "yb/util/format.h"
 #include "yb/util/logging.h"
@@ -342,6 +344,7 @@ DECLARE_bool(qos_compaction_per_db_cgroups);
 DECLARE_bool(qos_consensus_per_db_cgroups);
 DECLARE_bool(qos_system_dbs_use_shared_pool);
 DECLARE_int32(timestamp_history_retention_interval_sec);
+DECLARE_int32(timestamp_syscatalog_history_retention_interval_sec);
 DECLARE_int32(db_history_retention_pin_max_txn_age_sec);
 DECLARE_bool(enable_db_history_retention_pins);
 DECLARE_uint32(vector_index_num_compactions_limit);
@@ -774,6 +777,10 @@ Status TSTabletManager::Init() {
   // submitting the actual OpenTablet() tasks so that we don't have to compete
   // for disk resources, etc, with bootstrap processes and running tablets.
   MonoTime start(MonoTime::Now());
+  // The tserver-local copy of the master system catalog tablet is opened by LocalCatalogReplica,
+  // not here: it must not enter tablet_map_, or the heartbeat tablet report would offer master a
+  // replica of its own system catalog tablet and master would order it deleted.
+  std::erase(tablet_ids, kLocalCatalogTabletId);
   for (const string& tablet_id : tablet_ids) {
     RETURN_NOT_OK(open_metadata_runner.status());
     open_metadata_runner.Submit([this, tablet_id, &metas]() -> Status {
@@ -2267,11 +2274,17 @@ Status MaybeAssignPerDbCgroups(
 
 void TSTabletManager::OpenTablet(const RaftGroupMetadataPtr& meta,
                                  const scoped_refptr<TransitionInProgressDeleter>& deleter) {
+  OpenTabletPeer(
+      meta, CHECK_RESULT(GetTablet(meta->raft_group_id())), deleter, /* private_copy= */ false);
+}
+
+void TSTabletManager::OpenTabletPeer(
+    const RaftGroupMetadataPtr& meta, const TabletPeerPtr& tablet_peer,
+    const scoped_refptr<TransitionInProgressDeleter>& deleter, bool private_copy) {
   string tablet_id = meta->raft_group_id();
   TRACE_EVENT1("tserver", "TSTabletManager::OpenTablet",
                "tablet_id", tablet_id);
 
-  TabletPeerPtr tablet_peer = CHECK_RESULT(GetTablet(tablet_id));
   TabletPeerWeakPtr peer_weak_ptr(tablet_peer);
 
   tablet::TabletPtr tablet;
@@ -2291,7 +2304,11 @@ void TSTabletManager::OpenTablet(const RaftGroupMetadataPtr& meta,
   }
 
   consensus::ConsensusBootstrapInfo bootstrap_info;
-  bool bootstrap_retryable_requests = true;
+  // The copy takes no client requests, so it has no retryable requests to rebuild. Asking for them
+  // would also force the bootstrap optimizer to replay from the earliest retained segment instead
+  // of from the flushed op id, which for a copy of the master system catalog tablet means
+  // replaying the whole of initdb's WAL.
+  bool bootstrap_retryable_requests = !private_copy;
 
   auto bootstrap_state_manager = std::make_shared<tablet::TabletBootstrapStateManager>(
       tablet_id, fs_manager_, meta->wal_dir());
@@ -2388,8 +2405,11 @@ void TSTabletManager::OpenTablet(const RaftGroupMetadataPtr& meta,
         .local_tablet_filter = std::bind(&TSTabletManager::PreserveLocalLeadersOnly, this, _1),
         .transaction_coordinator_context = tablet_peer.get(),
         .txns_enabled = tablet::TransactionsEnabled::kTrue,
-        // We are assuming we're never dealing with the system catalog tablet in TSTabletManager.
-        .is_sys_catalog = tablet::IsSysCatalogTablet::kFalse,
+        // The only system catalog tablet TSTabletManager ever opens is the tserver-local copy of
+        // master's. Marking it as one is what gives it a transaction participant: the copy's
+        // primary table is not declared transactional, yet its log and its polled records carry
+        // catalog transactions whose intents must be resolved and applied.
+        .is_sys_catalog = tablet::IsSysCatalogTablet(private_copy),
         .snapshot_coordinator = nullptr,
         .tablet_splitter = this,
         .allowed_history_cutoff_provider =
@@ -2455,6 +2475,27 @@ void TSTabletManager::OpenTablet(const RaftGroupMetadataPtr& meta,
       tablet_peer->SetFailed(s);
       return;
     }
+
+    if (private_copy) {
+      // The replayed log is the source group's, so it carries that group's CHANGE_CONFIG_OPs and
+      // the replay has just installed the source's peers into cmeta. Consensus is started from
+      // cmeta below; left alone it would try to replicate to the source's peers. Force the config
+      // back to this server alone, which is what makes the copy a single-peer group that elects
+      // itself and never contacts anyone.
+      consensus::RaftConfigPB config;
+      config.set_committed_op_index(consensus::kInvalidOpIdIndex);
+      auto* peer = config.add_peers();
+      *peer = local_peer_pb_;
+      peer->set_member_type(consensus::PeerMemberType::VOTER);
+      cmeta->clear_pending_config();
+      cmeta->set_committed_config(config);
+      s = cmeta->Flush();
+      if (!s.ok()) {
+        LOG(DFATAL) << kLogPrefix << "Failed to write single-peer consensus metadata: " << s;
+        tablet_peer->SetFailed(s);
+        return;
+      }
+    }
   }
 
   auto pool_tag = PoolTagForTablet(tablet);
@@ -2511,7 +2552,7 @@ void TSTabletManager::OpenTablet(const RaftGroupMetadataPtr& meta,
       return;
     }
 
-    if (server_->GetCDCService()) {
+    if (!private_copy && server_->GetCDCService()) {
       tablet_peer->log()->SetGetXClusterMinIndexToRetainFunc(
           server_->GetCDCService()->GetXClusterMinRequiredIndexFunc());
     }
@@ -2546,14 +2587,145 @@ void TSTabletManager::OpenTablet(const RaftGroupMetadataPtr& meta,
     }
   }
 
-  if (tablet->ShouldDisableLbMove()) {
+  if (!private_copy && tablet->ShouldDisableLbMove()) {
     std::lock_guard lock(mutex_);
     tablets_blocked_from_lb_.insert(tablet->tablet_id());
     VLOG(2) << TabletLogPrefix(tablet->tablet_id())
             << " marking as maybe being compacted after split.";
   }
 
-  tablet_metadata_validator_->ScheduleValidation(*tablet->metadata());
+  if (!private_copy) {
+    // The validator asks master about the backfill status of index tables it finds in the
+    // metadata. Master knows nothing about this tablet, and the copy's catalog indexes were
+    // created by initdb and never backfilled, so there is nothing for it to validate.
+    tablet_metadata_validator_->ScheduleValidation(*tablet->metadata());
+  }
+}
+
+namespace {
+
+void IgnoreLocalCatalogTabletStateChange(
+    std::shared_ptr<consensus::StateChangeContext> context) {}
+
+}  // namespace
+
+Result<bool> TSTabletManager::CanReuseLocalCatalogTablet(const TabletId& local_tablet_id) {
+  RaftGroupMetadataPtr meta;
+  if (!OpenTabletMeta(local_tablet_id, &meta).ok()) {
+    return false;
+  }
+  return CanServeTabletData(meta->tablet_data_state());
+}
+
+Result<TabletPeerPtr> TSTabletManager::OpenOrCreateLocalCatalogTablet(
+    const TabletId& local_tablet_id, const TabletId& source_tablet_id, const PeerId& source_uuid,
+    const HostPort& source_addr, bool force_reseed) {
+  const auto kLogPrefix = TabletLogPrefix(local_tablet_id);
+  SCHECK(!IsShutdownStarted(), ShutdownInProgress, "Tablet manager is shutting down");
+
+  RaftGroupMetadataPtr meta;
+  bool reuse_existing = false;
+  if (OpenTabletMeta(local_tablet_id, &meta).ok()) {
+    if (!force_reseed && CanServeTabletData(meta->tablet_data_state())) {
+      reuse_existing = true;
+    } else {
+      LOG(INFO) << kLogPrefix << "Deleting the existing local catalog copy before fetching a new "
+                << "one: force_reseed=" << force_reseed
+                << ", data state=" << TabletDataState_Name(meta->tablet_data_state());
+      RETURN_NOT_OK(DeleteTabletData(
+          meta, TABLET_DATA_DELETED, fs_manager_->uuid(), yb::OpId(), this));
+      meta.reset();
+    }
+  } else {
+    meta.reset();
+  }
+
+  TabletPeerPtr tablet_peer;
+  const auto make_peer = [this](const RaftGroupMetadataPtr& tablet_meta) {
+    return std::make_shared<tablet::TabletPeer>(
+        tablet_meta, local_peer_pb_, scoped_refptr<server::Clock>(server_->clock()),
+        fs_manager_->uuid(),
+        // The copy is not in tablet_map_, so it is never reported to master and there is nothing
+        // to mark dirty on a state change. The callback still has to be a live one: consensus
+        // invokes it as soon as it starts.
+        Bind(&IgnoreLocalCatalogTabletStateChange),
+        metric_registry_, this, server_->client_future());
+  };
+
+  if (reuse_existing) {
+    LOG(INFO) << kLogPrefix << "Reopening the existing local catalog copy";
+    RegisterDataAndWalDir(
+        fs_manager_, meta->table_id(), local_tablet_id, meta->data_root_dir(),
+        meta->wal_root_dir());
+    tablet_peer = make_peer(meta);
+  } else {
+    auto rb_client = InitRemoteClient<RemoteBootstrapClient>(
+        kLogPrefix, local_tablet_id, source_uuid, source_addr.ToString(), kDebugBootstrapString,
+        [this] { return IsShutdownStarted(); });
+    rb_client->SetPrivateCopyOfSourceTablet(source_tablet_id, local_peer_pb_);
+    RETURN_NOT_OK(rb_client->Start(
+        source_uuid, &server_->proxy_cache(), source_addr, ServerRegistrationPB(), yb::OpId(),
+        &meta, this));
+    tablet_peer = make_peer(meta);
+    RETURN_NOT_OK_PREPEND(
+        rb_client->FetchAll(tablet_peer->status_listener()),
+        "Unable to fetch the master system catalog tablet's files");
+    RETURN_NOT_OK_PREPEND(rb_client->Finish(), "Unable to finish the local catalog copy");
+    WARN_NOT_OK(rb_client->Remove(), "Removing the local catalog copy session failed");
+  }
+
+  OpenTabletPeer(meta, tablet_peer, /* deleter= */ nullptr, /* private_copy= */ true);
+  RETURN_NOT_OK_PREPEND(tablet_peer->error(), "Unable to open the local catalog copy");
+  RETURN_NOT_OK(tablet_peer->WaitUntilConsensusRunning(
+      MonoDelta::FromMilliseconds(FLAGS_tablet_start_warn_threshold_ms)));
+
+  return tablet_peer;
+}
+
+Status TSTabletManager::MakeLocalCatalogTabletLeader(const TabletPeerPtr& tablet_peer) {
+  // The copy comes up as a follower of a group that has no other member, so nothing would make it
+  // leader until the failure detector times out, and until then it cannot apply what the poller
+  // fetches. Electing it here removes that wait, which is one failure detection interval of the
+  // copy answering nothing on every restart. The election is decided locally because this peer is
+  // the only voter.
+  //
+  // This runs after the poller has read its resume position out of the copied log, because winning
+  // an election appends a no-op in the new term and that entry is not a position in master's WAL.
+  auto consensus = VERIFY_RESULT(tablet_peer->GetConsensus());
+  if (consensus->GetLeaderStatus() == consensus::LeaderStatus::NOT_LEADER) {
+    RETURN_NOT_OK_PREPEND(
+        consensus->StartElection(consensus::LeaderElectionData{}),
+        "Unable to make the local catalog copy leader of its own group");
+  }
+  // The election is asynchronous and LeaderTerm() stays unset until the new term's no-op is
+  // committed, so the poller's first apply would still race it and be rejected.
+  return WaitFor(
+      [&tablet_peer]() -> Result<bool> { return tablet_peer->LeaderTerm() > 0; },
+      MonoDelta::FromMilliseconds(FLAGS_tablet_start_warn_threshold_ms),
+      Format("Local catalog copy $0 to lead its own group", tablet_peer->tablet_id()));
+}
+
+Status TSTabletManager::DeleteLocalCatalogTablet(
+    const TabletId& local_tablet_id, const TabletPeerPtr& peer) {
+  if (peer) {
+    // Nothing else holds this peer, so nothing else can have started its shutdown.
+    if (peer->StartShutdown(tablet::DisableFlushOnShutdown::kTrue, tablet::AbortOps::kTrue)) {
+      peer->CompleteShutdown();
+    } else {
+      LOG(DFATAL) << "The local catalog copy's tablet peer was already shutting down";
+    }
+  }
+  RaftGroupMetadataPtr meta;
+  if (!OpenTabletMeta(local_tablet_id, &meta).ok()) {
+    return Status::OK();
+  }
+  const auto table_id = meta->table_id();
+  const auto data_root_dir = meta->data_root_dir();
+  const auto wal_root_dir = meta->wal_root_dir();
+  RETURN_NOT_OK(
+      DeleteTabletData(meta, TABLET_DATA_DELETED, fs_manager_->uuid(), yb::OpId(), this));
+  UnregisterDataWalDir(table_id, local_tablet_id, data_root_dir, wal_root_dir);
+  return Status::OK();
 }
 
 Status TSTabletManager::TriggerAdminCompaction(
@@ -3830,7 +4002,20 @@ HybridTime TSTabletManager::ComputeDbHistoryRetentionPinCutoff(
   return db_cutoff;
 }
 
+docdb::HistoryCutoff TSTabletManager::LocalCatalogAllowedHistoryCutoff() {
+  const auto retention_sec =
+      ANNOTATE_UNPROTECTED_READ(FLAGS_timestamp_syscatalog_history_retention_interval_sec);
+  if (retention_sec <= 0) {
+    return {.cotables_cutoff_ht = HybridTime::kMax, .primary_cutoff_ht = HybridTime::kMax};
+  }
+  const auto allowed = server_->Clock()->Now().AddSeconds(-retention_sec);
+  return {.cotables_cutoff_ht = allowed, .primary_cutoff_ht = allowed};
+}
+
 docdb::HistoryCutoff TSTabletManager::AllowedHistoryCutoff(tablet::RaftGroupMetadata* metadata) {
+  if (metadata->raft_group_id() == kLocalCatalogTabletId) {
+    return LocalCatalogAllowedHistoryCutoff();
+  }
   HybridTime result = HybridTime::kMax;
   // CDC SDK safe time
   if (metadata->cdc_sdk_safe_time() != HybridTime::kInvalid) {

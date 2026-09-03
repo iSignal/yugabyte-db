@@ -22,6 +22,10 @@
 #include "yb/tserver/ts_tablet_manager.h"
 #include "yb/tserver/tserver_fwd.h"
 #include "yb/tserver/ysql_lease_manager.h"
+
+#include "yb/server/clock.h"
+
+#include "yb/tserver/local_catalog_replica.h"
 #include "yb/tserver/ysql_lease_poller.h"
 
 #include "yb/util/atomic.h"
@@ -157,6 +161,18 @@ Status YSQLLeaseManager::Impl::ProcessLeaseUpdate(
 
   TEST_PAUSE_IF_FLAG(TEST_pause_ysql_lease_refresh_after_epoch_update);
 
+  if (restart_pg) {
+    // A new lease epoch means the previous lease had lapsed, and while it was gone master could
+    // complete DDLs without this tserver acknowledging their lock releases, so versions advanced
+    // with no gate here. Every such DDL committed before the lease was regranted, and
+    // MaxGlobalNow is an upper bound on every hybrid time in the cluster right now, so once the
+    // local catalog copy is complete up to it, it holds all of them. The copy stays out of the
+    // read path until then.
+    if (auto* local_catalog = server_.local_catalog_replica()) {
+      local_catalog->OnLeaseGained(server_.clock()->MaxGlobalNow());
+    }
+  }
+
   // It is safer to end the pg-sessions after resetting the local lock manager.
   // This way, if a new session gets created it will also be reset. But that is better than
   // having it the other way around, and having an old-session that is not reset.
@@ -290,6 +306,9 @@ std::optional<CoarseTimePoint> YSQLLeaseManager::Impl::CheckLeaseStatusInner() {
       return lease_expiry_time_;
     }
     lease_is_live_ = false;
+  }
+  if (auto* local_catalog = server_.local_catalog_replica()) {
+    local_catalog->OnLeaseLost();
   }
   // todo(zdrudi): make this a fatal?
   LOG(INFO) << "Lease has expired, killing pg sessions.";

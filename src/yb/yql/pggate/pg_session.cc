@@ -946,10 +946,25 @@ Result<PerformFuture> PgSession::Perform(BufferableOperations&& ops, PerformOpti
     }
     options.set_use_legacy_catalog_session(true);
   } else {
+    const auto is_catalog_snapshot =
+        IsCatalogSnapshot(!YBCIsLegacyModeForCatalogOps() && ops_options.has_catalog_ops);
     RETURN_NOT_OK(SetupPerformOptions(
         {}, options, OpsHaveNonTransactionalWrites(ops.operations()),
-        ops_options.read_time_action, SkipReadTimeOptions::kFalse,
-        IsCatalogSnapshot(!YBCIsLegacyModeForCatalogOps() && ops_options.has_catalog_ops)));
+        ops_options.read_time_action, SkipReadTimeOptions::kFalse, is_catalog_snapshot));
+    if (is_catalog_snapshot) {
+      // A tserver that answers this read from a local copy of the master system catalog tablet
+      // must first have applied every catalog change up to the version this backend is at. The
+      // per-operation ysql_db_catalog_version cannot say what that version is, because PG leaves
+      // it unset on internal scans of system relations, which is what a catalog cache miss and a
+      // relcache build are. This value is used only to make the tserver wait; it is never
+      // validated.
+      const auto local_version = pg_callbacks_.GetLocalCatalogVersion();
+      if (local_version.db_oid != kPgInvalidOid) {
+        auto& read_time_options = *options.mutable_read_time_options();
+        read_time_options.set_backend_catalog_version(local_version.version);
+        read_time_options.set_backend_catalog_version_db_oid(local_version.db_oid);
+      }
+    }
     if (pg_txn_manager_->IsTxnInProgress()) {
       options.mutable_in_txn_limit_ht()->set_value(ops_options.in_txn_limit.ToUint64());
     }

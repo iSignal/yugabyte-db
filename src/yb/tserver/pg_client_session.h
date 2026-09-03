@@ -129,6 +129,9 @@ struct PgClientSessionContext {
   PgClientSessionMetrics metrics;
   const std::string& instance_uuid;
   docdb::ObjectLockOwnerRegistry* lock_owner_registry;
+  // The tserver-local DocDB copy of the master system catalog tablet. nullptr on master and when
+  // enable_local_tserver_catalog is off.
+  LocalCatalogReplica* local_catalog_replica;
   const TransactionManagerProvider transaction_manager_provider;
 #ifdef __linux__
   TServerCgroupManager* cgroup_manager;

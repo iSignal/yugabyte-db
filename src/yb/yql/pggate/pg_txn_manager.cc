@@ -819,6 +819,7 @@ Status PgTxnManager::SetupReadTimeOptions(
   }
 
   read_time_options.set_read_time_serial_no(serial_no_.read_time());
+  read_time_options.set_is_catalog_snapshot(is_catalog_snapshot);
 
   // read_time may be set by
   // - PgSession::SetReadTimeIfPresent.

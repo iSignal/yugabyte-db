@@ -333,9 +333,10 @@ void MasterHeartbeatServiceImpl::PopulatePgCatalogVersionInfo(
 
   DbOidToCatalogVersionMap versions;
   uint64_t fingerprint; // can only be used when versions is not empty.
+  HybridTime versions_read_time;
   auto s = catalog_manager_->GetYsqlAllDBCatalogVersions(
       FLAGS_enable_heartbeat_pg_catalog_versions_cache /* use_cache */,
-      &versions, &fingerprint);
+      &versions, &fingerprint, &versions_read_time);
   if (!s.ok() || versions.empty()) {
     LOG(WARNING) << "Could not get YSQL db catalog versions for heartbeat response: "
                  << s.ToUserMessage();
@@ -355,6 +356,9 @@ void MasterHeartbeatServiceImpl::PopulatePgCatalogVersionInfo(
     return;
   }
 
+  if (versions_read_time.is_valid()) {
+    resp.set_db_catalog_versions_read_time(versions_read_time.ToUint64());
+  }
   auto* const mutable_version_data = resp.mutable_db_catalog_version_data();
   for (const auto& it : versions) {
     auto* const catalog_version = mutable_version_data->add_db_catalog_versions();
@@ -582,6 +586,9 @@ void MasterHeartbeatServiceImpl::TSHeartbeat(
   }
 
   PopulateYsqlDbOldestPinnedReadTimes(*resp);
+
+  resp->set_ysql_major_version_upgrade_in_progress(
+      server_->ysql_manager().IsMajorUpgradeInProgress());
 
   PopulatePgCatalogVersionInfo(*req, *resp);
 

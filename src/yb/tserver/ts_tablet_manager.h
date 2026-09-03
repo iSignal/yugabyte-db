@@ -480,6 +480,27 @@ class TSTabletManager : public tserver::TabletPeerLookupIf, public tablet::Table
   HybridTime TEST_LastSnapshotHybridTime(const SnapshotScheduleId& schedule_id) const
       EXCLUDES(snapshot_schedule_info_mutex_);
 
+  // Creates or reopens the tserver-local copy of the master system catalog tablet and returns its
+  // peer, started and (being a single-peer Raft group) its own leader.
+  //
+  // The peer is deliberately not registered in tablet_map_: every tablet in that map is reported
+  // to master in the heartbeat tablet report, and master's report processing would treat a
+  // tserver-hosted replica of the system catalog tablet as a stray one and order it deleted.
+  // Nothing else on this tserver can therefore resolve it by tablet id; the only handle on it is
+  // the returned peer, held by LocalCatalogReplica.
+  //
+  // When the local copy already exists on disk in a servable state and force_reseed is false, it
+  // is reopened without contacting the source. Otherwise its data is deleted and a fresh copy is
+  // fetched by remote bootstrap from source_tablet_id on the peer at source_addr.
+  Result<std::shared_ptr<tablet::TabletPeer>> OpenOrCreateLocalCatalogTablet(
+      const TabletId& local_tablet_id, const TabletId& source_tablet_id,
+      const PeerId& source_uuid, const HostPort& source_addr, bool force_reseed);
+
+  // Shuts the local copy down and deletes its data, WAL, consensus metadata and superblock.
+  Status DeleteLocalCatalogTablet(
+      const TabletId& local_tablet_id, const std::shared_ptr<tablet::TabletPeer>& peer);
+
+
  private:
   FRIEND_TEST(TsTabletManagerTest, TestTombstonedTabletsAreUnregistered);
   friend class ComputeDbHistoryRetentionPinCutoffTest;
@@ -557,6 +578,18 @@ class TSTabletManager : public tserver::TabletPeerLookupIf, public tablet::Table
   // opening the tablet is complete (in either a success or a failure case).
   void OpenTablet(const scoped_refptr<tablet::RaftGroupMetadata>& meta,
                   const scoped_refptr<TransitionInProgressDeleter>& deleter);
+
+  // Bootstraps and starts tablet_peer. Split out of OpenTablet so that the tserver-local copy of
+  // the master system catalog tablet, whose peer is not in tablet_map_, can be opened by the same
+  // code. private_copy is set for that copy: its consensus config is forced back to this server
+  // alone after the log replay, because the replayed log carries the source group's config
+  // changes, and its Tablet is built as a system catalog tablet so that it gets the transaction
+  // participant that resolves the catalog transactions in that log.
+  void OpenTabletPeer(
+      const scoped_refptr<tablet::RaftGroupMetadata>& meta,
+      const std::shared_ptr<tablet::TabletPeer>& tablet_peer,
+      const scoped_refptr<TransitionInProgressDeleter>& deleter,
+      bool private_copy);
 
   // Open a tablet whose metadata has already been loaded.
   void BootstrapAndInitTablet(const scoped_refptr<tablet::RaftGroupMetadata>& meta,
@@ -674,6 +707,24 @@ class TSTabletManager : public tserver::TabletPeerLookupIf, public tablet::Table
   void CleanupSplitTablets();
 
   docdb::HistoryCutoff AllowedHistoryCutoff(tablet::RaftGroupMetadata* metadata);
+
+  // The allowed history cutoff of the tserver-local copy of the master system catalog tablet. The
+  // copy holds master's system catalog, so it follows the retention master applies to that data,
+  // timestamp_syscatalog_history_retention_interval_sec, rather than the user tablet retention.
+  docdb::HistoryCutoff LocalCatalogAllowedHistoryCutoff();
+
+ public:
+  // Elects the tserver-local copy of the master system catalog tablet leader of its own
+  // single-peer group and waits until it can accept writes. Called by the poller after it has read
+  // its resume position, because the election appends an entry of its own.
+  Status MakeLocalCatalogTabletLeader(const tablet::TabletPeerPtr& tablet_peer);
+
+  // Whether the tserver-local copy of the master system catalog tablet is already on disk in a
+  // state it can be reopened from. Answered from local metadata alone, so that a restart with a
+  // copy in hand needs nothing from master before it can resume polling.
+  Result<bool> CanReuseLocalCatalogTablet(const TabletId& local_tablet_id);
+
+ private:
 
   template <class Key>
   Result<tablet::TabletPeerPtr> DoGetServingTablet(const Key& tablet_id) const;

@@ -901,7 +901,8 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
       uint64_t* catalog_version, uint64_t* last_breaking_version,
       bool use_cache = false) override;
   Status GetYsqlAllDBCatalogVersions(
-      bool use_cache, DbOidToCatalogVersionMap* versions, uint64_t* fingerprint) override
+      bool use_cache, DbOidToCatalogVersionMap* versions, uint64_t* fingerprint,
+      HybridTime* used_read_time = nullptr) override
       EXCLUDES(heartbeat_pg_catalog_versions_cache_mutex_);
   Result<DbOidVersionToMessageListMap> GetYsqlCatalogInvalationMessages(bool use_cache) override
       EXCLUDES(heartbeat_pg_catalog_versions_cache_mutex_);
@@ -3317,7 +3318,8 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
   Status BumpVersionAndStoreClusterConfig(
       ClusterConfigInfo* cluster_config, ClusterConfigInfo::WriteLock* l);
 
-  Status GetYsqlAllDBCatalogVersionsImpl(DbOidToCatalogVersionMap* versions);
+  Status GetYsqlAllDBCatalogVersionsImpl(
+      DbOidToCatalogVersionMap* versions, HybridTime* used_read_time = nullptr);
   Result<DbOidVersionToMessageListMap> GetYsqlCatalogInvalationMessagesImpl();
 
   // Create the global transaction status table if needed (i.e. if it does not exist already).
@@ -3564,6 +3566,11 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
   // a value.
   uint64_t heartbeat_pg_catalog_versions_cache_fingerprint_
     GUARDED_BY(heartbeat_pg_catalog_versions_cache_mutex_) = 0;
+  // The hybrid time at which heartbeat_pg_catalog_versions_cache_ was read. Callers that hand the
+  // cached versions to a tserver need it to tell the tserver's local catalog copy how far it must
+  // have caught up before it may publish those versions.
+  HybridTime heartbeat_pg_catalog_versions_cache_read_time_
+    GUARDED_BY(heartbeat_pg_catalog_versions_cache_mutex_);
   // Set to nullopt when the value is stale.
   std::optional<DbOidVersionToMessageListMap> heartbeat_pg_inval_messages_cache_
     GUARDED_BY(heartbeat_pg_catalog_versions_cache_mutex_);

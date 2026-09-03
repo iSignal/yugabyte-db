@@ -95,6 +95,25 @@ std::vector<xrepl::StreamTabletStats> StreamMetadata::GetAllStreamTabletStats(
   return result;
 }
 
+void StreamMetadata::InitForSysCatalogChangeStream(const xrepl::StreamId& stream_id) {
+  std::lock_guard l(load_mutex_);
+  {
+    std::lock_guard l_table(mutex_);
+    stream_id_ = stream_id;
+    record_format_ = CDCRecordFormat::WAL;
+    source_type_ = CDCRequestSource::XCLUSTER;
+    checkpoint_type_ = CDCCheckpointType::IMPLICIT;
+  }
+  state_.store(master::SysCDCStreamEntryPB_State_ACTIVE, std::memory_order_release);
+  transactional_.store(StreamModeTransactional::kTrue, std::memory_order_release);
+  // The local copy is not an xCluster target: nothing polls it, so no loop-prevention filter is
+  // needed, and the legacy external_hybrid_time predicate is the correct one for records the
+  // master itself wrote.
+  use_target_applied_filter_.store(false, std::memory_order_release);
+  is_sys_catalog_change_stream_.store(true, std::memory_order_release);
+  loaded_.store(true, std::memory_order_release);
+}
+
 Status StreamMetadata::InitOrReloadIfNeeded(
     const xrepl::StreamId& stream_id, RefreshStreamMapOption opts, client::YBClient* client) {
   std::lock_guard l(load_mutex_);

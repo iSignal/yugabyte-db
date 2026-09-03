@@ -326,6 +326,7 @@ YbcPgInsertOnConflictKeyState
 YbcPgJwtAuthOptions
 YbcPgKeyValue
 YbcPgLastKnownCatalogVersionInfo
+YbcPgLocalCatalogVersion
 YbcPgLocalTabletsDescriptor
 YbcPgMemctx
 YbcPgMetricsCaptureType

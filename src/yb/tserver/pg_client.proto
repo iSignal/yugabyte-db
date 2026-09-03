@@ -850,6 +850,33 @@ message PgPerformOptionsPB {
     // See the commit desc for more info.
     bool clamp_uncertainty_window = 7;
     OptionalUint32PB follower_read_staleness_ms = 8;
+
+    // Set when read_time_serial_no identifies a PG catalog snapshot rather than a transaction's
+    // read point. The tserver needs to know this to decide whether a read may be answered from
+    // its local copy of the master system catalog tablet, and it must not be inferred from
+    // clamp_uncertainty_window: that flag is skipped whenever the read time is supplied
+    // explicitly or a reset is requested, and it may acquire other callers.
+    bool is_catalog_snapshot = 9;
+
+    // The catalog version the issuing backend believes it is at, for the database it is connected
+    // to. Zero when unknown.
+    //
+    // A tserver serving catalog reads from a local copy of the master system catalog tablet waits
+    // for that copy to have applied this version before answering, so that a backend that has
+    // been told version V never reads a copy that lacks V's rows. The per-operation
+    // ysql_db_catalog_version cannot serve that purpose: PG leaves it unset on internal scans of
+    // system relations, which is exactly the catalog cache miss and relcache build class this
+    // feature exists to serve.
+    //
+    // Deliberately separate from ysql_db_catalog_version rather than a wider use of it, because
+    // that field is also what the tserver validates in CatalogVersionChecker; sending it on those
+    // reads would turn the version check on for them too, which is the looseness the guard in
+    // yb_scan_core.c documents and defers. This field is never validated.
+    //
+    // Both fields are set together, and only in per-database catalog version mode: a global
+    // catalog version cannot be compared against the per-database versions the local copy tracks.
+    uint64 backend_catalog_version = 10;
+    uint32 backend_catalog_version_db_oid = 11;
   }
 
   // Cannot use IsolationLevel enum, since we cannot use proto2 enum in proto3 messages.

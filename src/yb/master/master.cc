@@ -42,6 +42,8 @@
 #include "yb/common/pg_catversions.h"
 #include "yb/common/wire_protocol.h"
 
+#include "yb/cdc/sys_catalog_change_service.h"
+
 #include "yb/consensus/consensus_meta.h"
 
 #include "yb/gutil/bind.h"
@@ -131,6 +133,8 @@ DEPRECATE_FLAG(int32, master_remote_bootstrap_svc_num_threads, "02_2024");
 DEFINE_NON_RUNTIME_int32(master_tserver_svc_queue_length, 1000,
              "RPC queue length for master tserver service");
 TAG_FLAG(master_tserver_svc_queue_length, advanced);
+
+DECLARE_bool(enable_local_tserver_catalog);
 
 DEFINE_NON_RUNTIME_int32(master_svc_queue_length, 1000,
              "RPC queue length for master service");
@@ -328,6 +332,22 @@ Status Master::RegisterServices() {
     auto cdc_service = master_tablet_server_->CreateCDCService(
         metric_entity(), client_future(), metric_registry());
     RETURN_NOT_OK(RegisterService(FLAGS_master_xrepl_svc_queue_length, cdc_service));
+  }
+
+  if (FLAGS_enable_local_tserver_catalog) {
+    // Tservers pull the system catalog tablet's WAL through this service to keep their local
+    // copies of it current. It is high priority for the same reason the ysql lease service is: a
+    // DDL's client is not told the DDL succeeded until every tserver has acknowledged the lock
+    // release, and that acknowledgement waits for this service to have shipped the DDL's records.
+    RETURN_NOT_OK(RegisterService(
+        FLAGS_master_xrepl_svc_queue_length,
+        std::make_shared<cdc::SysCatalogChangeServiceImpl>(
+            metric_entity(),
+            [this]() -> Result<tablet::TabletPeerPtr> {
+              return master_tablet_server_->GetServingTablet(TabletId(kSysCatalogTabletId));
+            },
+            mem_tracker()),
+        rpc::ServicePriority::kHigh));
   }
 
   RETURN_NOT_OK(RegisterService(

@@ -41,6 +41,8 @@ namespace tserver {
 
 class DbServerBase;
 class Heartbeater;
+class LocalCatalogPoller;
+class LocalCatalogReplica;
 class LocalTabletServer;
 class MetricsSnapshotter;
 class PgClientServiceMockImpl;

@@ -59,6 +59,7 @@
 #include "yb/server/hybrid_clock.h"
 #include "yb/server/server_base.proxy.h"
 
+#include "yb/tserver/local_catalog_replica.h"
 #include "yb/tserver/master_leader_poller.h"
 #include "yb/tserver/service_util.h"
 #include "yb/tserver/tablet_server.h"
@@ -125,6 +126,19 @@ class HeartbeatPoller : public MasterLeaderPollerInterface {
   Status SetupRegistration(master::TSRegistrationPB* reg);
   void SetupCommonField(master::TSToMasterCommonPB* common);
   MonoDelta GetMinimumHeartbeatMillis(int32_t consecutive_failures) const;
+
+  // Whether the tserver-local copy of the master system catalog tablet already holds every
+  // catalog change committed at or below the time master read the heartbeat's versions at. True
+  // when the feature is off or the copy is not serving, because then catalog reads go to master.
+  bool LocalCatalogCopyHoldsHeartbeatVersions() {
+    auto* local_catalog = server_.local_catalog_replica();
+    if (!local_catalog || !local_catalog->IsServing() ||
+        !last_hb_response_.has_db_catalog_versions_read_time()) {
+      return true;
+    }
+    return local_catalog->HoldsCatalogStateAt(
+        HybridTime(last_hb_response_.db_catalog_versions_read_time()));
+  }
 
   TabletServer& server_;
   MasterLeaderFinder& finder_;
@@ -515,12 +529,30 @@ Status HeartbeatPoller::TryHeartbeat() {
     full_report_seq_no_.reset();
   }
 
+  if (auto* local_catalog = server_.local_catalog_replica()) {
+    local_catalog->SetMajorVersionUpgradeInProgress(
+        last_hb_response_.ysql_major_version_upgrade_in_progress());
+  }
+
   // Update the master's YSQL catalog version (i.e. if there were schema changes for YSQL objects).
   if (FLAGS_enable_ysql &&
       PREDICT_TRUE(!FLAGS_TEST_tserver_disable_catalog_refresh_on_heartbeat)) {
     // In per-db catalog version mode (the only supported mode) we never use ysql_catalog_version.
     DCHECK(!last_hb_response_.has_ysql_catalog_version());
-    if (last_hb_response_.has_db_catalog_version_data()) {
+    if (last_hb_response_.has_db_catalog_version_data() &&
+        !LocalCatalogCopyHoldsHeartbeatVersions()) {
+      // The exposure gate on the heartbeat path. Master read these versions at
+      // db_catalog_versions_read_time, so publishing them now would tell a backend a version
+      // whose catalog rows the local copy does not yet hold, and the backend's next catalog read
+      // would be served from a copy that lacks them. The versions are a full report, so skipping
+      // this response loses nothing: the next heartbeat after the poller catches up publishes
+      // them. Lowering the versions instead is not an option here, because a version below the
+      // one already published is treated as a stale master report and eventually crashes the
+      // tserver.
+      VLOG_WITH_FUNC(1) << "Skipping master db catalog version data until the local catalog copy "
+                        << "holds the state it was read at: "
+                        << last_hb_response_.db_catalog_versions_read_time();
+    } else if (last_hb_response_.has_db_catalog_version_data()) {
       if (FLAGS_log_ysql_catalog_versions) {
         VLOG_WITH_FUNC(1) << "got master db catalog version data: "
                           << last_hb_response_.db_catalog_version_data().ShortDebugString()

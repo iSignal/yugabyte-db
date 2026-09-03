@@ -940,6 +940,7 @@ class PgClientServiceImpl::Impl : public SessionProvider, public SessionRegistry
             .lock_owner_registry = tablet_server_.ObjectLockSharedStateManager()
                                        ? &tablet_server_.ObjectLockSharedStateManager()->registry()
                                        : nullptr,
+            .local_catalog_replica = tablet_server_.local_catalog_replica(),
             .transaction_manager_provider = transaction_manager_provider_,
 #ifdef __linux__
             .cgroup_manager = tablet_server_.cgroup_manager(),

@@ -119,10 +119,15 @@ class CatalogManagerIf : public tserver::TabletPeerLookupIf {
 
   virtual Status GetYsqlCatalogVersion(
       uint64_t* catalog_version, uint64_t* last_breaking_version, bool use_cache = false) = 0;
+  // When used_read_time is set, it receives the hybrid time at which the returned versions were
+  // read from pg_yb_catalog_version. A caller that forwards the versions to a tserver whose local
+  // catalog copy gates on them needs that time: the copy may publish a version only once it holds
+  // every catalog change committed at or below it.
   virtual Status GetYsqlAllDBCatalogVersions(
       bool use_cache,
       DbOidToCatalogVersionMap* versions,
-      uint64_t* fingerprint) = 0;
+      uint64_t* fingerprint,
+      HybridTime* used_read_time = nullptr) = 0;
   virtual Result<DbOidVersionToMessageListMap> GetYsqlCatalogInvalationMessages(bool use_cache) = 0;
   virtual Status GetYsqlDBCatalogVersion(
       uint32_t db_oid, uint64_t* catalog_version, uint64_t* last_breaking_version,

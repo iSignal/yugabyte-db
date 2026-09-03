@@ -187,6 +187,13 @@ Status RemoteBootstrapClient::SetTabletToReplace(const RaftGroupMetadataPtr& met
   return Status::OK();
 }
 
+void RemoteBootstrapClient::SetPrivateCopyOfSourceTablet(
+    const TabletId& source_tablet_id, const consensus::RaftPeerPB& local_peer_pb) {
+  CHECK(!started_);
+  source_tablet_id_ = source_tablet_id;
+  single_peer_config_ = local_peer_pb;
+}
+
 Status RemoteBootstrapClient::Start(const string& bootstrap_peer_uuid,
                                     rpc::ProxyCache* proxy_cache,
                                     const HostPort& bootstrap_peer_addr,
@@ -208,7 +215,7 @@ Status RemoteBootstrapClient::Start(const string& bootstrap_peer_uuid,
   auto rbs_source_role = "LEADER";
   BeginRemoteBootstrapSessionRequestPB req;
   req.set_requestor_uuid(permanent_uuid());
-  req.set_tablet_id(tablet_id_);
+  req.set_tablet_id(source_tablet_id_.empty() ? tablet_id_ : source_tablet_id_);
 
   if (tablet_leader_conn_info.has_cloud_info()) {
     // If tablet_leader_conn_info is populated, propagate it to the RBS source (which is a follower
@@ -255,6 +262,14 @@ Status RemoteBootstrapClient::Start(const string& bootstrap_peer_uuid,
   YB_LOG_EVERY_N_SECS_OR_VLOG(INFO, 30, 1)
       << "Received superblock: " << resp.superblock().ShortDebugString();
   RETURN_NOT_OK(MigrateSuperblock(resp.mutable_superblock()));
+
+  if (!source_tablet_id_.empty()) {
+    // The superblock names the source's tablet id. RaftGroupMetadata::LoadFromSuperBlock rejects a
+    // superblock whose id differs from the metadata's, so rewrite it to the local id before it is
+    // ever loaded or persisted. The KV-store id follows the tablet id for the same reason.
+    resp.mutable_superblock()->set_raft_group_id(tablet_id_);
+    resp.mutable_superblock()->mutable_kv_store()->set_kv_store_id(tablet_id_);
+  }
 
   auto* kv_store = resp.mutable_superblock()->mutable_kv_store();
   const TableId table_id = resp.superblock().primary_table_id();
@@ -767,6 +782,27 @@ Status RemoteBootstrapClient::DownloadTabletBootstrapStateFile() {
 }
 
 Status RemoteBootstrapClient::WriteConsensusMetadata() {
+  if (single_peer_config_) {
+    // A private copy is not a member of the source's Raft group. Its committed config holds this
+    // server alone, so its consensus elects it leader and never contacts the source's peers. The
+    // term is carried over so that the log entries replayed from the source do not appear to come
+    // from a future term.
+    consensus::RaftConfigPB config;
+    config.set_committed_op_index(consensus::kInvalidOpIdIndex);
+    auto* peer = config.add_peers();
+    *peer = *single_peer_config_;
+    peer->set_member_type(consensus::PeerMemberType::VOTER);
+    if (!cmeta_) {
+      cmeta_ = VERIFY_RESULT(ConsensusMetadata::Create(
+          &fs_manager(), tablet_id_, fs_manager().uuid(), config,
+          remote_committed_cstate_->current_term()));
+    } else {
+      cmeta_->set_committed_config(config);
+      cmeta_->set_current_term(remote_committed_cstate_->current_term());
+    }
+    return cmeta_->Flush();
+  }
+
   // If we didn't find a previous consensus meta file, create one.
   if (!cmeta_) {
     cmeta_ = VERIFY_RESULT(ConsensusMetadata::Create(

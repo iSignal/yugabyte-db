@@ -83,6 +83,7 @@
 
 #include "yb/tserver/backup_service.h"
 #include "yb/tserver/heartbeater.h"
+#include "yb/tserver/local_catalog_replica.h"
 #include "yb/tserver/heartbeater_factory.h"
 #include "yb/tserver/metrics_snapshotter.h"
 #include "yb/tserver/pg_client.pb.h"
@@ -295,6 +296,8 @@ DECLARE_string(ysql_pg_conf_csv);
 DECLARE_string(ysql_hba_conf_csv);
 DECLARE_string(ysql_ident_conf_csv);
 DECLARE_string(tmp_dir);
+
+DECLARE_bool(enable_local_tserver_catalog);
 
 namespace yb::tserver {
 
@@ -925,10 +928,21 @@ Status TabletServer::Start() {
 
   AutoInitServiceFlags();
 
+  // Created before the services so that PgClientServiceImpl can capture it; the poll thread is
+  // started further down, once the tablet manager can open the copy's tablet.
+  if (FLAGS_enable_local_tserver_catalog) {
+    local_catalog_replica_ = std::make_unique<LocalCatalogReplica>(*this, metric_entity());
+    local_catalog_replica_->Init();
+  }
+
   RETURN_NOT_OK(RegisterServices());
   RETURN_NOT_OK(DbServerBase::Start());
 
   RETURN_NOT_OK(tablet_manager_->Start());
+
+  if (local_catalog_replica_) {
+    RETURN_NOT_OK(local_catalog_replica_->Start());
+  }
 
   RETURN_NOT_OK(heartbeater_->Start());
   ysql_lease_manager_->StartTSLocalLockManager();
@@ -1000,6 +1014,10 @@ void TabletServer::Shutdown() {
   maintenance_manager_->Shutdown();
   heartbeater_->Shutdown();
 
+  if (local_catalog_replica_) {
+    local_catalog_replica_->StartShutdown();
+  }
+
   if (FLAGS_tserver_enable_metrics_snapshotter) {
     WARN_NOT_OK(metrics_snapshotter_->Stop(), "Failed to stop TS Metrics Snapshotter thread");
   }
@@ -1027,6 +1045,13 @@ void TabletServer::Shutdown() {
   // shutting down, which would otherwise wedge their own shutdown. See issue #32211.
   if (auto remote_bootstrap_service = remote_bootstrap_service_.lock()) {
     remote_bootstrap_service->StartShutdown();
+  }
+
+  // The poll thread holds RPCs to master and writes to the local catalog copy, so it must be
+  // joined before the reactors are, and the copy's tablet peer shut down before the tablet
+  // manager's own shutdown completes.
+  if (local_catalog_replica_) {
+    local_catalog_replica_->CompleteShutdown();
   }
 
   tablet_manager_->StartShutdown();

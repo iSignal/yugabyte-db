@@ -214,6 +214,25 @@ YbGetCatalogCacheVersion()
 	return yb_catalog_cache_version;
 }
 
+/*
+ * The catalog version this backend believes it is at, with the database it applies to. Reported to
+ * pggate so that a tserver answering a catalog read from a local copy of the master system catalog
+ * tablet can wait for that copy to have applied this version first.
+ *
+ * db_oid is left invalid outside per-database catalog version mode: the version is then a global
+ * one, which cannot be compared against the per-database versions such a copy tracks.
+ */
+static YbcPgLocalCatalogVersion
+YbGetLocalCatalogVersion()
+{
+	YbcPgLocalCatalogVersion result = {
+		.db_oid = YBIsDBCatalogVersionMode() ? MyDatabaseId : InvalidOid,
+		.version = yb_catalog_cache_version,
+	};
+
+	return result;
+}
+
 uint64_t
 YbGetNewCatalogVersion()
 {
@@ -1042,6 +1061,7 @@ YBInitPostgresBackend(const char *program_name, const YbcPgInitPostgresInfo *ini
 			.CheckUserMap = &check_usermap,
 			.PgstatReportWaitStart = &yb_pgstat_report_wait_start,
 			.GetCatalogSnapshotReadPoint = &YbGetCatalogSnapshotReadPoint,
+			.GetLocalCatalogVersion = &YbGetLocalCatalogVersion,
 			.GetSessionReplicationOriginId = &YbGetSessionReplicationOriginId,
 			.HasProcessableAbortInterrupt = &YBHasProcessableAbortInterrupt,
 			.IsInParallelMode = &IsInParallelMode,

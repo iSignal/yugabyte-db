@@ -176,11 +176,28 @@ class StreamMetadata {
     return db_oid_to_get_sequences_for_;
   }
 
+  // True for the in-memory stream that feeds a tserver-local copy of the master system catalog
+  // tablet. That copy must be told which subtransactions aborted, or a subtransaction rolled back
+  // inside a DDL transaction block would leave its catalog rows visible in the copy while master
+  // has none.
+  bool IsSysCatalogChangeStream() const {
+    return is_sys_catalog_change_stream_.load(std::memory_order_acquire);
+  }
+
   std::shared_ptr<StreamTabletMetadata> GetTabletMetadata(const TabletId& tablet_id)
       EXCLUDES(tablet_metadata_map_mutex_);
 
   std::vector<xrepl::StreamTabletStats> GetAllStreamTabletStats(
       const xrepl::StreamId& stream_id) const EXCLUDES(tablet_metadata_map_mutex_);
+
+  // Initializes this object for the change stream that feeds a tserver-local copy of the master
+  // system catalog tablet. That stream has no entry in the master catalog and no row in the
+  // cdc_state table, so InitOrReloadIfNeeded cannot be used: the fields the producer path reads
+  // are set here instead. The producer needs a WAL record format, an xCluster source type and
+  // transactional mode, because only the transactional path resolves running catalog transactions
+  // before reporting an apply safe time.
+  void InitForSysCatalogChangeStream(const xrepl::StreamId& stream_id)
+      EXCLUDES(mutex_, table_ids_mutex_, tablet_metadata_map_mutex_);
 
   Status InitOrReloadIfNeeded(
       const xrepl::StreamId& stream_id, RefreshStreamMapOption opts, client::YBClient* client)
@@ -218,6 +235,7 @@ class StreamMetadata {
   std::atomic<std::optional<uint64_t>> consistent_snapshot_time_;
   std::atomic<std::optional<uint64_t>> stream_creation_time_;
   std::atomic<bool> use_target_applied_filter_{false};
+  std::atomic<bool> is_sys_catalog_change_stream_{false};
 
   std::mutex load_mutex_;  // Used to ensure only a single thread performs InitOrReload.
   std::atomic<bool> loaded_ = false;

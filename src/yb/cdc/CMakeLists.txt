@@ -111,7 +111,8 @@ set(CDC_SRCS
   xrepl_stream_metadata.cc
   xrepl_stream_stats.cc
   cdcsdk_virtual_wal.cc
-  cdcsdk_unique_record_id.cc)
+  cdcsdk_unique_record_id.cc
+  sys_catalog_change_service.cc)
 
 ADD_YB_LIBRARY(
     cdc

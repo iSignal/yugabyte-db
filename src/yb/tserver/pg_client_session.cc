@@ -12,7 +12,6 @@
 //
 
 #include "yb/tserver/pg_client_session.h"
-#include "yb/tserver/pg_client_session_util.h"
 
 #include <sys/types.h>
 
@@ -65,7 +64,10 @@
 #include "yb/rpc/sidecars.h"
 #include "yb/rpc/scheduler.h"
 
+#include "yb/tserver/local_catalog_read.h"
+#include "yb/tserver/local_catalog_replica.h"
 #include "yb/tserver/pg_client.messages.h"
+#include "yb/tserver/pg_client_session_util.h"
 #include "yb/tserver/pg_create_table.h"
 #include "yb/tserver/pg_mutation_counter.h"
 #include "yb/tserver/pg_response_cache.h"
@@ -3143,6 +3145,10 @@ class PgClientSession::Impl {
     return context_.pg_node_level_mutation_counter;
   }
 
+  LocalCatalogReplica* local_catalog_replica() const {
+    return context_.local_catalog_replica;
+  }
+
   HybridTime ResolveReadTimeForPinSerial(uint64_t pin_read_time_serial_no) {
     if (pin_read_time_serial_no == 0) {
       return HybridTime::kInvalid;
@@ -3430,6 +3436,12 @@ class PgClientSession::Impl {
     }
     ADOPT_TRACE(trace.get());
 
+    if (VERIFY_RESULT(TryServeCatalogReadsLocally(data, setup_session_result, deadline))) {
+      // The response has been filled from the local copy of the master system catalog tablet and
+      // sent; there is nothing for the client session to flush.
+      return Status::OK();
+    }
+
     data->used_read_time_applier = MakeUsedReadTimeApplier(setup_session_result, data->req);
     // MakeUsedReadTimeApplier has set plain_session_used_read_time_.pending_update, so the next
     // request expects a used read time stored by the applier, which
@@ -3508,6 +3520,196 @@ class PgClientSession::Impl {
     });
     RefreshHistoryRetentionPinFromSharedMemory();
     return Status::OK();
+  }
+
+  // Serves a request whose operations are all catalog reads from the tserver-local copy of the
+  // master system catalog tablet, when every condition below holds, and returns whether it did.
+  // A false return leaves the request to take the ordinary path to master.
+  //
+  //  - The feature is on and the copy is serving. While it bootstraps, re-seeds or is disabled by
+  //    lease loss, the copy is either incomplete or unproven, so reads go to master.
+  //  - The request's read time serial number identifies a PG catalog snapshot. Catalog reads under
+  //    one such snapshot must all see one state, which is what pinning them to one hybrid time on
+  //    the copy achieves.
+  //  - The backend is not executing a DDL and is not in a transaction block in which a DDL already
+  //    ran. Such a backend's own uncommitted catalog rows exist only on master.
+  //  - Every operation is a read of a table the copy holds.
+  //
+  // Relies on the read point being saved into the read point history under the outgoing serial
+  // before the catalog serial becomes current, so it never holds an attached transaction's own
+  // read time here.
+  //
+  // The read runs at exactly the catalog snapshot's hybrid time. On the snapshot's first read that
+  // time is set to C, the highest hybrid time for which the copy is complete for every writer, so
+  // every later read under the same snapshot restores the same time from the session's read point
+  // history and sees the same state. A snapshot whose first read went to master carries a time
+  // taken from the tserver clock instead, which is above C; that read is routed to master rather
+  // than answered from the copy at an earlier time, which would show the backend an older state
+  // than it has already seen.
+  Result<bool> TryServeCatalogReadsLocally(
+      const PerformQueryDataPtr& data, const SetupSessionResult& setup_session_result,
+      CoarseTimePoint deadline) {
+    auto* replica = local_catalog_replica();
+    if (!replica) {
+      return false;
+    }
+    const auto& options = data->req.options();
+    if (!options.read_time_options().is_catalog_snapshot() ||
+        setup_session_result.kind != PgClientSessionKind::kPlain) {
+      return false;
+    }
+    if (options.ddl_mode() || options.ddl_use_regular_transaction_block() ||
+        options.yb_non_ddl_txn_for_sys_tables_allowed()) {
+      // A YSQL upgrade's migration session writes catalog rows outside a DDL, with
+      // yb_non_ddl_txn_for_sys_tables_allowed set, so like a DDL backend it can hold uncommitted
+      // catalog rows that exist only on master.
+      replica->IncReadsToMasterInDdl();
+      return false;
+    }
+    if (!replica->IsServing()) {
+      replica->IncReadsToMasterNotServing();
+      return false;
+    }
+    auto tablet_peer = replica->tablet_peer();
+    if (!tablet_peer || !AllOpsAreReadsOfLocalCatalogTables(tablet_peer, data->req)) {
+      replica->IncReadsToMasterNotServing();
+      return false;
+    }
+
+    // The backend was told this catalog version, so the copy must already hold every catalog
+    // change up to it before it may answer the read. Two paths reach here without the exposure
+    // gate having done the work: a version this backend advanced itself at its own DDL commit
+    // before this tserver's poller had the commit, and a version published while the copy was not
+    // serving. This wait is where both are closed.
+    //
+    // The version comes from the request rather than from each operation's
+    // ysql_db_catalog_version, which PG leaves unset on internal scans of system relations --
+    // that is, on catalog cache misses and relcache builds, the reads this feature exists to
+    // serve.
+    const auto& read_time_options = options.read_time_options();
+    const auto backend_version = read_time_options.backend_catalog_version();
+    const auto db_oid = read_time_options.backend_catalog_version_db_oid();
+    if (db_oid != kInvalidOid && backend_version > 0) {
+      backend_catalog_version_.store(backend_version, std::memory_order_release);
+      if (replica->applied_version(db_oid) < backend_version) {
+        replica->IncReadsWaitedForVersion();
+        VLOG_WITH_PREFIX(1) << "Waiting for the local catalog copy to apply version "
+                            << backend_version << " of database " << db_oid << "; it has applied "
+                            << replica->applied_version(db_oid);
+        const auto wait_start = MonoTime::Now();
+        // A wait that runs out of time means the poller is not making progress, which is a
+        // serving outage rather than a request error. Master can answer the read.
+        auto status = replica->WaitForAppliedVersion(db_oid, backend_version, deadline);
+        VLOG_WITH_PREFIX(1) << "Wait for version " << backend_version << " of database " << db_oid
+                            << " ended after " << (MonoTime::Now() - wait_start) << ": " << status;
+        if (!status.ok()) {
+          VLOG_WITH_PREFIX(1) << "Routing a catalog read to master after waiting for version "
+                              << backend_version << " of database " << db_oid << ": " << status;
+          replica->IncReadsToMasterNotServing();
+          return false;
+        }
+      }
+    }
+
+    // A catalog-writing transaction that did not increment any catalog version (a temporary
+    // relation's DDL) leaves the backend's version unchanged, so the check above cannot see it.
+    // The session records a hybrid time at or after that transaction's commit, and the copy must
+    // reach it before this session reads its own writes.
+    //
+    // Skipped once the backend's version has moved past what it was when that transaction
+    // committed: the transaction did increment a version, so the wait above covers it, and the
+    // release gate has already pushed C past that version's read time. Waiting for the recorded
+    // clock reading as well would cost this session a poll interval after every DDL.
+    const auto own_write_floor =
+        HybridTime(own_catalog_write_floor_.load(std::memory_order_acquire));
+    if (own_write_floor.is_valid() &&
+        backend_version <= own_catalog_write_floor_version_.load(std::memory_order_acquire)) {
+      replica->IncReadsWaitedForOwnWrites();
+      VLOG_WITH_PREFIX(1) << "Waiting for the local catalog copy to reach this session's own "
+                          << "catalog writes at " << LocalCatalogHybridTimeForLog(own_write_floor)
+                          << "; it holds " << LocalCatalogHybridTimeForLog(replica->safe_time());
+      const auto wait_start = MonoTime::Now();
+      auto status = replica->WaitForSafeTime(own_write_floor, deadline);
+      VLOG_WITH_PREFIX(1) << "Wait for own catalog writes at "
+                          << LocalCatalogHybridTimeForLog(own_write_floor)
+                          << " ended after " << (MonoTime::Now() - wait_start) << ": " << status;
+      if (!status.ok()) {
+        VLOG_WITH_PREFIX(1) << "Routing a catalog read to master after waiting for the session's "
+                            << "own catalog writes at " << own_write_floor << ": " << status;
+        replica->IncReadsToMasterNotServing();
+        return false;
+      }
+    }
+
+    auto& session = *setup_session_result.session_data.session;
+    const auto safe_time = replica->safe_time();
+    if (!safe_time.is_valid()) {
+      replica->IncReadsToMasterNotServing();
+      return false;
+    }
+    const auto existing_read_time = session.read_point()->GetReadTime();
+    ReadHybridTime read_time;
+    if (!existing_read_time || catalog_read_time_picked_this_request_) {
+      // This is the catalog snapshot's first read: either the read point is still empty, or the
+      // time on it was taken from this server's clock a few lines up in UpdateReadTime, for this
+      // very request. Pin the snapshot to C instead. C is a complete point for every writer, so
+      // all of the snapshot's reads see one state.
+      read_time = ReadHybridTime::SingleTime(safe_time);
+      VLOG_WITH_PREFIX(1) << "Pinning this catalog snapshot to the local copy's safe time "
+                          << LocalCatalogHybridTimeForLog(safe_time) << " (read point was "
+                          << (existing_read_time ? existing_read_time.ToString() : "unset") << ")";
+    } else if (existing_read_time.read > safe_time) {
+      // The time was chosen by an earlier read under the same snapshot that master answered, or
+      // the caller asked for an explicit time above what the copy holds (yb_read_time,
+      // ysql_dump --read-time). Reading the copy at C instead would move the snapshot backwards in
+      // the first case and answer a different question in the second.
+      VLOG_WITH_PREFIX(1) << "Routing a catalog read at "
+                          << LocalCatalogHybridTimeForLog(existing_read_time.read)
+                          << " to master: the copy holds only "
+                          << LocalCatalogHybridTimeForLog(safe_time);
+      replica->IncReadsToMasterNotServing();
+      return false;
+    } else {
+      read_time = ReadHybridTime::SingleTime(existing_read_time.read);
+      VLOG_WITH_PREFIX(2) << "Reading the local copy at this catalog snapshot's existing time "
+                          << LocalCatalogHybridTimeForLog(existing_read_time.read)
+                          << "; the copy holds " << LocalCatalogHybridTimeForLog(safe_time);
+    }
+
+    // The copy keeps history only back to its own retention cutoff. A read below it -- an explicit
+    // read time far in the past -- must go to master rather than fail. Checked before the read
+    // point is changed, so a request that falls through still carries the time it arrived with.
+    auto read_op = PrepareLocalCatalogRead(tablet_peer, read_time, deadline);
+    if (!read_op.ok()) {
+      VLOG_WITH_PREFIX(2) << "Routing a catalog read at " << read_time
+                          << " to master: " << read_op.status();
+      replica->IncReadsToMasterNotServing();
+      return false;
+    }
+
+    // Store the time on the read point. The session saves it into its read point history under
+    // this serial when the serial changes, so every later read under the same catalog snapshot
+    // restores this exact time.
+    session.SetReadPoint(read_time);
+
+    auto status = ExecuteLocalCatalogReads(
+        tablet_peer, *read_op, deadline, data->req, data->sidecars, &data->resp);
+    if (!status.ok()) {
+      StatusToPB(status, data->resp.mutable_status());
+      data->sidecars.Reset();
+    } else {
+      replica->IncReadsServed();
+    }
+    // The response cache holds a pending entry for this key when caching was requested; it must be
+    // resolved here, or every other session waiting on that key blocks until the entry expires.
+    if (data->cache_setter) {
+      data->cache_setter({data->resp, ExtractRowsSidecar(data->resp, data->sidecars)});
+    }
+    data->SendResponse();
+    // The ordinary path does this at the tail of DoPerform. A session served locally for a long
+    // time must go on refreshing its master-side history retention pin exactly as it would have.
+    RefreshHistoryRetentionPinFromSharedMemory();
+    return true;
   }
 
   void ProcessReadTimeManipulation(
@@ -3679,6 +3881,7 @@ class PgClientSession::Impl {
     auto& session = *session_data.session;
     auto& txn = session_data.transaction;
 
+    catalog_read_time_picked_this_request_ = false;
     const auto& read_time_options = options.read_time_options();
     const auto txn_serial_no = options.txn_serial_no();
     const auto read_time_serial_no = read_time_options.read_time_serial_no();
@@ -3796,6 +3999,10 @@ class PgClientSession::Impl {
           !(txn && txn->isolation() == SERIALIZABLE_ISOLATION),
           IllegalState, "Clamping does not apply to SERIALIZABLE txns.");
         session.read_point()->SetCurrentReadTime(ClampUncertaintyWindow::kTrue);
+        // Remember that this request, and not an earlier one under the same snapshot, is where
+        // this time came from. A read served from the local catalog copy replaces it with C; a
+        // time an earlier read already used must be kept instead.
+        catalog_read_time_picked_this_request_ = read_time_options.is_catalog_snapshot();
         VLOG_WITH_PREFIX(2) << "Clamping read time to " << session.read_point()->GetReadTime();
       }
     }
@@ -4321,6 +4528,15 @@ class PgClientSession::Impl {
     // the response back. Thus we will not report any status to the YB-Master in this case. But
     // we still need to call WaitForDdlVerificationToFinish so that YB-Master can start its
     // background task to figure out whether the transaction succeeded or failed.
+    if (commit_status.ok() && is_ddl_mode) {
+      // The commit response propagated the transaction's commit hybrid time into this server's
+      // clock, so a reading of the clock taken now is at or above it. Requiring the local catalog
+      // copy to reach this time before it answers this session's next catalog read is therefore
+      // enough to make the session see its own catalog writes.
+      own_catalog_write_floor_version_.store(
+          backend_catalog_version_.load(std::memory_order_acquire), std::memory_order_release);
+      own_catalog_write_floor_.store(clock()->Now().ToUint64(), std::memory_order_release);
+    }
     if (!commit_status.ok()) {
       auto status = DdlAtomicityFinishTransaction(
           txn, kind, is_ddl_mode, has_docdb_schema_changes, metadata, std::nullopt, deadline);
@@ -4602,6 +4818,25 @@ class PgClientSession::Impl {
   std::atomic<uint64_t> applied_oldest_read_point_serial_no_{0};
 
   std::optional<RobustLendGuard<docdb::ObjectLockSharedState>> object_lock_lend_guard_;
+
+  // A hybrid time at or after the commit of this session's most recent catalog-writing
+  // transaction. Read lock-free on the request path; written after a DDL commit. A DDL that
+  // incremented no catalog version -- a temporary relation's -- leaves the backend's version
+  // unchanged, so the per-operation version check cannot see it; this floor is what makes the
+  // session read its own such writes from the local catalog copy.
+  std::atomic<uint64_t> own_catalog_write_floor_{0};
+
+  // The catalog version the last catalog snapshot request of this session carried, and the value
+  // it held when this session's most recent DDL committed. Their comparison is how the own-writes
+  // floor tells a DDL that incremented a catalog version, which the version wait and the exposure
+  // gate already cover, from one that did not.
+  std::atomic<uint64_t> backend_catalog_version_{0};
+  std::atomic<uint64_t> own_catalog_write_floor_version_{0};
+
+  // Set by UpdateReadTime when it takes the catalog snapshot's read time from this server's clock,
+  // which it does only on the snapshot's first read. Single-threaded per session: written and read
+  // within one Perform.
+  bool catalog_read_time_picked_this_request_ = false;
 };
 
 PgClientSession::PgClientSession(

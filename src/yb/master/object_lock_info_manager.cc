@@ -589,6 +589,8 @@ bool CompareReleaseRequestsIgnoringCatalogFields(
   md.IgnoreField(req1.GetDescriptor()->FindFieldByName("db_catalog_version_data"));
   md.IgnoreField(req1.GetDescriptor()->FindFieldByName("db_catalog_inval_messages_data"));
   md.IgnoreField(req1.GetDescriptor()->FindFieldByName("populate_db_catalog_info"));
+  // Set together with db_catalog_version_data, after the request has been persisted.
+  md.IgnoreField(req1.GetDescriptor()->FindFieldByName("catalog_versions_read_time"));
 
   if (diff_str) {
     md.ReportDifferencesToString(diff_str);
@@ -1093,8 +1095,9 @@ void ObjectLockInfoManager::Impl::PopulateDbCatalogVersionCache(ReleaseObjectLoc
   // send the catalog version of the db being operated on by the txn.
   DbOidToCatalogVersionMap versions;
   uint64_t fingerprint;
-  auto s =
-      catalog_manager_.GetYsqlAllDBCatalogVersions(false /* use_cache */, &versions, &fingerprint);
+  HybridTime versions_read_time;
+  auto s = catalog_manager_.GetYsqlAllDBCatalogVersions(
+      false /* use_cache */, &versions, &fingerprint, &versions_read_time);
   if (!s.ok()) {
     // In this case, we fallback to delayed cache invalidation on tserver-master heartbeat path.
     LOG(WARNING) << "Couldn't populate catalog version on exclusive lock release: " << s;
@@ -1102,6 +1105,9 @@ void ObjectLockInfoManager::Impl::PopulateDbCatalogVersionCache(ReleaseObjectLoc
   }
   if (versions.empty()) {
     return;
+  }
+  if (versions_read_time.is_valid()) {
+    req.set_catalog_versions_read_time(versions_read_time.ToUint64());
   }
   auto* db_catalog_version_data = req.mutable_db_catalog_version_data();
   // The catalog version data may become out of date by the time these requests are

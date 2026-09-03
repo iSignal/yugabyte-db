@@ -35,6 +35,10 @@
 #include <optional>
 #include <string>
 
+#include <optional>
+
+#include "yb/consensus/metadata.pb.h"
+
 #include "yb/tserver/remote_client_base.h"
 
 #include "yb/util/disk_space_checker.h"
@@ -110,6 +114,15 @@ class RemoteBootstrapClient : public RemoteClientBase {
   // should treat `IsShutdownInProgress()` as an expected outcome distinct from a real timeout.
   Status VerifyChangeRoleSucceeded(
       const std::shared_ptr<consensus::Consensus>& shared_consensus);
+
+  // Copies a tablet whose id on the source differs from the id it will have here. The local
+  // tablet's superblock and consensus metadata are rewritten to the local id, and the consensus
+  // config is replaced by one holding this server alone, so the copy does not join the source's
+  // Raft group. Used for the tserver-local copy of the master system catalog tablet, which must
+  // not be confused with the master's own tablet by anything that resolves a tablet id.
+  // Must be called before Start().
+  void SetPrivateCopyOfSourceTablet(
+      const TabletId& source_tablet_id, const consensus::RaftPeerPB& local_peer_pb);
 
  private:
   FRIEND_TEST(RemoteBootstrapRocksDBClientTest, TestBeginEndSession);
@@ -197,6 +210,11 @@ class RemoteBootstrapClient : public RemoteClientBase {
   // tablet's directories are known.
   std::optional<DiskSpaceChecker> data_disk_checker_;
   std::optional<DiskSpaceChecker> wal_disk_checker_;
+
+  // Set by SetPrivateCopyOfSourceTablet. Empty when the copy keeps the source's tablet id and
+  // joins its Raft group, which is the ordinary remote bootstrap.
+  TabletId source_tablet_id_;
+  std::optional<consensus::RaftPeerPB> single_peer_config_;
 
   DISALLOW_COPY_AND_ASSIGN(RemoteBootstrapClient);
 };

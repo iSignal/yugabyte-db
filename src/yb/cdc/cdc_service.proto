@@ -79,6 +79,39 @@ service CDCService {
       returns (UpdatePublicationTableListResponsePB);
 }
 
+// Request for the tserver-local copy of the master system catalog tablet. The copy pulls the
+// master system catalog tablet's WAL through this method; master keeps one apply-safe-time state
+// per requesting tserver, so that a safe time is reported to a tserver only once every record up
+// to it has been included in a response to that same tserver.
+message GetSysCatalogChangesRequestPB {
+  // Permanent uuid of the requesting tserver. Master keys its per-requestor stream state on it.
+  optional bytes requestor_uuid = 1;
+
+  // The WAL position the requesting copy has already applied. The response starts after it. When
+  // unset, master starts from the beginning of the retained WAL.
+  optional CDCCheckpointPB from_checkpoint = 2;
+}
+
+message GetSysCatalogChangesResponsePB {
+  optional CDCErrorPB error = 1;
+
+  // The WAL records, the WAL position they end at, and the safe time, as produced by the same
+  // code path xCluster uses. Empty when the request failed.
+  optional GetChangesResponsePB changes = 2;
+
+  // Set when master stopped reading the WAL before its end, so the requestor should poll again
+  // without waiting out its idle interval.
+  optional bool have_more_messages = 3;
+}
+
+// Ships the master system catalog tablet's WAL to the tserver-local copies of it. Separate from
+// CDCService because the copies are not CDC streams: they are not recorded in the master catalog
+// or in the cdc_state table, and each copy persists its own WAL position with its local tablet.
+service SysCatalogChangeService {
+  rpc GetSysCatalogChanges (GetSysCatalogChangesRequestPB)
+      returns (GetSysCatalogChangesResponsePB);
+}
+
 message CDCErrorPB {
   enum Code {
     // An error which has no more specific error code.
