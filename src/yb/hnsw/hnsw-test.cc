@@ -32,7 +32,7 @@
 using namespace std::chrono_literals;
 using namespace yb::size_literals;
 
-METRIC_DEFINE_entity(table);
+METRIC_DECLARE_entity(table);
 
 namespace yb::hnsw {
 

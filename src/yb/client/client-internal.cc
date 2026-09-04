@@ -33,6 +33,7 @@
 #include "yb/client/client-internal.h"
 
 #include <algorithm>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <memory>
@@ -47,10 +48,13 @@
 #include <boost/preprocessor/seq/for_each.hpp>
 #include <boost/preprocessor/stringize.hpp>
 
+#include "yb/client/async_rpc.h"
 #include "yb/client/client_master_rpc.h"
 #include "yb/client/meta_cache.h"
+#include "yb/client/table.h"
 #include "yb/client/table_info.h"
 
+#include "yb/common/common_types.pb.h"
 #include "yb/common/common_util.h"
 #include "yb/common/redis_constants_common.h"
 #include "yb/common/schema.h"
@@ -85,6 +89,7 @@
 #include "yb/util/atomic.h"
 #include "yb/util/format.h"
 #include "yb/util/logging.h"
+#include "yb/util/metrics.h"
 #include "yb/util/monotime.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/result.h"
@@ -395,6 +400,45 @@ YBClient::Data::Data()
 
 YBClient::Data::~Data() {
   rpcs_.Shutdown();
+}
+
+internal::AsyncRpcMetricsPtr YBClient::Data::GetTableAsyncRpcMetrics(const YBTable& table) {
+  if (!metric_registry_ || !metric_entity_) {
+    return nullptr;
+  }
+  const auto& table_id = table.id();
+  {
+    std::lock_guard l(table_async_rpc_metrics_mutex_);
+    auto it = table_async_rpc_metrics_.find(table_id);
+    if (it != table_async_rpc_metrics_.end()) {
+      return it->second;
+    }
+  }
+
+  auto entity = metric_registry_->FindEntity(table_id);
+  if (entity && strcmp(entity->prototype().name(), "table") != 0) {
+    return nullptr;
+  }
+  if (!entity) {
+    MetricEntity::AttributeMap attrs;
+    attrs["table_id"] = table_id;
+    attrs["table_name"] = table.name().table_name();
+    attrs["table_type"] = TableType_Name(ClientToPBTableType(table.table_type()));
+    attrs["namespace_name"] = table.name().namespace_name();
+    if (table.table_type() == YBTableType::PGSQL_TABLE_TYPE &&
+        !table.name().namespace_id().empty()) {
+      auto db_oid = GetPgsqlDatabaseOid(table.name().namespace_id());
+      if (db_oid.ok()) {
+        attrs["database_oid"] = std::to_string(*db_oid);
+      }
+    }
+    entity = METRIC_ENTITY_table.Instantiate(metric_registry_, table_id, attrs);
+  }
+
+  auto metrics = std::make_shared<internal::AsyncRpcMetrics>(
+      entity, internal::AsyncRpcMetrics::Scope::kTable);
+  std::lock_guard l(table_async_rpc_metrics_mutex_);
+  return table_async_rpc_metrics_.emplace(table_id, std::move(metrics)).first->second;
 }
 
 RemoteTabletServer* YBClient::Data::SelectTServer(RemoteTablet* rt,

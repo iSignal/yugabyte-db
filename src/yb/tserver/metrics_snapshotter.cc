@@ -282,8 +282,8 @@ MetricsSnapshotter::Thread::Thread(const TabletServerOptions& opts, TabletServer
   async_client_init_.emplace(
       "tserver_metrics_snapshotter_client",
       std::chrono::milliseconds(FLAGS_tserver_metrics_snapshotter_yb_client_default_timeout_ms),
-      "" /* tserver_uuid */, &server->options(), server->metric_entity(), server->mem_tracker(),
-      server->messenger());
+      "" /* tserver_uuid */, &server->options(), server->metric_entity(),
+      server->metric_registry(), server->mem_tracker(), server->messenger());
 }
 
 int MetricsSnapshotter::Thread::GetMillisUntilNextMetricsSnapshot() const {

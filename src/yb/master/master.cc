@@ -230,6 +230,7 @@ Status Master::Init() {
       "" /* tserver_uuid */,
       &options(),
       metric_entity(),
+      metric_registry(),
       mem_tracker(),
       messenger());
   cdc_state_client_init_->builder()

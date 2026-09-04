@@ -80,6 +80,8 @@ class YBClientBuilder::Data {
   // Metric entity to be used by components emitting metrics.
   scoped_refptr<MetricEntity> metric_entity_;
 
+  MetricRegistry* metric_registry_ = nullptr;
+
   // A descriptive name for the client. Useful for embedded ybclients.
   std::string client_name_ = "ybclient";
 
