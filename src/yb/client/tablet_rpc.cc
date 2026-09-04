@@ -370,6 +370,8 @@ Status TabletInvoker::FailToNewReplica(const Status& reason,
   auto status = retrier_->DelayedRetry(command_, reason);
   if (!status.ok()) {
     LOG(WARNING) << "Failed to schedule retry on new replica: " << status;
+  } else {
+    rpc_->NotifyRetry(reason);
   }
   return status;
 }
@@ -393,6 +395,7 @@ bool TabletInvoker::Done(Status* status) {
 
   // Prefer early failures over controller failures.
   if (status->ok() && retrier_->HandleResponse(command_, status)) {
+    rpc_->NotifyRetry(retrier_->controller().status());
     return false;
   }
 
@@ -509,6 +512,8 @@ bool TabletInvoker::Done(Status* status) {
           : retrier_->DelayedRetry(command_, *status);
       if (!retry_status.ok()) {
         command_->Finished(retry_status);
+      } else {
+        rpc_->NotifyRetry(*status);
       }
     }
     return false;

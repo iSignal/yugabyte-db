@@ -75,6 +75,9 @@ class TabletRpc {
   virtual TabletServerErrorPtr response_error() const = 0;
   virtual void Failed(const Status& status) = 0;
 
+  // Called when TabletInvoker schedules an internal retry of this RPC.
+  virtual void NotifyRetry(const Status& reason) {}
+
   // attempt_num starts with 1.
   virtual void SendRpcToTserver(int attempt_num) = 0;
 

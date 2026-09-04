@@ -46,18 +46,29 @@ struct InFlightOp;
 class RemoteTablet;
 class RemoteTabletServer;
 
-// Container for async rpc metrics
+// Container for async rpc metrics. Instantiated once on the server entity (overall) and once per
+// table entity (per-table). Table copies use prototypes that skip server-level scrape aggregation
+// so overall p99/counts come from the server-entity histograms/counters.
 struct AsyncRpcMetrics {
-  explicit AsyncRpcMetrics(const scoped_refptr<MetricEntity>& metric_entity);
+  enum class Scope { kServer, kTable };
 
-  scoped_refptr<EventStats> remote_write_rpc_time;
-  scoped_refptr<EventStats> remote_read_rpc_time;
-  scoped_refptr<EventStats> local_write_rpc_time;
-  scoped_refptr<EventStats> local_read_rpc_time;
-  scoped_refptr<EventStats> time_to_send;
+  explicit AsyncRpcMetrics(
+      const scoped_refptr<MetricEntity>& metric_entity, Scope scope = Scope::kServer);
+
+  void IncrementRetry(const Status& status);
+
+  scoped_refptr<Histogram> remote_write_rpc_time;
+  scoped_refptr<Histogram> remote_read_rpc_time;
+  scoped_refptr<Histogram> local_write_rpc_time;
+  scoped_refptr<Histogram> local_read_rpc_time;
+  scoped_refptr<Histogram> time_to_send;
   scoped_refptr<Counter> consistent_prefix_successful_reads;
   scoped_refptr<Counter> consistent_prefix_failed_reads;
   scoped_refptr<Counter> skip_intents_writes;
+  scoped_refptr<Counter> internal_retries;
+
+  scoped_refptr<MetricEntity> entity;
+  Scope scope = Scope::kServer;
 };
 
 using InFlightOps = boost::iterator_range<std::vector<InFlightOp>::iterator>;
@@ -130,6 +141,8 @@ class AsyncRpc : public rpc::Rpc, public TabletRpc {
 
   void Failed(const Status& status) override;
 
+  void NotifyRetry(const Status& reason) override;
+
   // Is this a local call?
   bool IsLocalCall() const;
 
@@ -152,6 +165,7 @@ class AsyncRpc : public rpc::Rpc, public TabletRpc {
 
   CoarseTimePoint start_;
   std::shared_ptr<AsyncRpcMetrics> async_rpc_metrics_;
+  std::shared_ptr<AsyncRpcMetrics> table_async_rpc_metrics_;
   rpc::RpcCommandPtr retained_self_;
 
   std::shared_ptr<tserver::TabletServerServiceProxy> ts_proxy_;
@@ -249,6 +263,8 @@ class WaitForAsyncWriteRpc : public rpc::Rpc, public TabletRpc {
   void Finished(const Status& status) override;
 
   void Failed(const Status& status) override;
+
+  void NotifyRetry(const Status& reason) override;
 
  private:
   void OnKeyLookup(const Result<internal::RemoteTabletPtr>& result);

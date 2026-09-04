@@ -117,7 +117,7 @@ DEFINE_RUNTIME_bool(enable_schema_version_check, yb::kIsDebug,
     "Whether to check existence of given schema version in CheckCotablePacking and "
     "CheckColocationPacking. If it's off, always return Status::OK().");
 
-METRIC_DEFINE_entity(table);
+METRIC_DECLARE_entity(table);
 
 using std::string;
 
