@@ -207,9 +207,22 @@ Status PrometheusWriter::WriteSingleEntry(
 
   if (aggregation_levels & kTableLevel) {
     DCHECK(table_id_it != attributes.end());
-    AddScrapeTimeAggregatedEntry(
-        table_id_it->second, type, description, attributes, name, value,
-        aggregation_function, metric_entity_type, metric_prototype_holder);
+    // Table-entity metrics are already one series per table. Scrape-aggregating by table_id
+    // would collapse histogram quantile labels (p50/p95/p99 share the metric name) into one
+    // summed value. Tablet entities still aggregate to table level below.
+    if (metric_entity_type == "table") {
+      if (remaining_allowed_entries_ == 0) {
+        num_of_entries_cut_off_++;
+      } else {
+        remaining_allowed_entries_--;
+        FlushHelpAndTypeIfRequested(name, description, type);
+        RETURN_NOT_OK(FlushSingleEntry(attributes, name, value));
+      }
+    } else {
+      AddScrapeTimeAggregatedEntry(
+          table_id_it->second, type, description, attributes, name, value,
+          aggregation_function, metric_entity_type, metric_prototype_holder);
+    }
   }
 
   if (aggregation_levels & kServerLevel) {

@@ -24,6 +24,7 @@
 
 namespace yb {
 class Thread;
+class MetricRegistry;
 
 namespace client {
 
@@ -34,7 +35,7 @@ class AsyncClientInitializer {
   AsyncClientInitializer(
       const std::string& client_name, MonoDelta default_timeout, const std::string& tserver_uuid,
       const server::ServerBaseOptions* opts, scoped_refptr<MetricEntity> metric_entity,
-      const std::shared_ptr<MemTracker>& parent_mem_tracker,
+      MetricRegistry* metric_registry, const std::shared_ptr<MemTracker>& parent_mem_tracker,
       rpc::Messenger* messenger);
 
   ~AsyncClientInitializer();

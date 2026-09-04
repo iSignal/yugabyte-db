@@ -13,10 +13,14 @@
 
 #include "yb/client/async_rpc.h"
 
+#include <mutex>
+#include <unordered_map>
+
 #include "yb/ash/wait_state.h"
 
 #include "yb/client/batcher.h"
 #include "yb/client/client.h"
+#include "yb/client/client-internal.h"
 #include "yb/client/client_error.h"
 #include "yb/client/in_flight_op.h"
 #include "yb/client/meta_cache.h"
@@ -51,24 +55,31 @@
 #include "yb/util/trace.h"
 #include "yb/util/yb_pg_errcodes.h"
 
+#include <boost/preprocessor/cat.hpp>
+
 // TODO: do we need word Redis in following two metrics? ReadRpc and WriteRpc objects emitting
 // these metrics are used not only in Redis service.
-METRIC_DEFINE_event_stats(
+METRIC_DEFINE_histogram(
     server, handler_latency_yb_client_write_remote, "yb.client.Write remote call time",
-    yb::MetricUnit::kMicroseconds, "Microseconds spent in the remote Write call ");
-METRIC_DEFINE_event_stats(
+    yb::MetricUnit::kMicroseconds, "Microseconds spent in the remote Write call ",
+    60000000LU, 2);
+METRIC_DEFINE_histogram(
     server, handler_latency_yb_client_read_remote, "yb.client.Read remote call time",
-    yb::MetricUnit::kMicroseconds, "Microseconds spent in the remote Read call ");
-METRIC_DEFINE_event_stats(
+    yb::MetricUnit::kMicroseconds, "Microseconds spent in the remote Read call ",
+    60000000LU, 2);
+METRIC_DEFINE_histogram(
     server, handler_latency_yb_client_write_local, "yb.client.Write local call time",
-    yb::MetricUnit::kMicroseconds, "Microseconds spent in the local Write call ");
-METRIC_DEFINE_event_stats(
+    yb::MetricUnit::kMicroseconds, "Microseconds spent in the local Write call ",
+    60000000LU, 2);
+METRIC_DEFINE_histogram(
     server, handler_latency_yb_client_read_local, "yb.client.Read local call time",
-    yb::MetricUnit::kMicroseconds, "Microseconds spent in the local Read call ");
-METRIC_DEFINE_event_stats(
+    yb::MetricUnit::kMicroseconds, "Microseconds spent in the local Read call ",
+    60000000LU, 2);
+METRIC_DEFINE_histogram(
     server, handler_latency_yb_client_time_to_send,
     "Time (microseconds) taken for a Write/Read rpc to be sent to the server",
-    yb::MetricUnit::kMicroseconds, "Microseconds spent before sending the request to the server");
+    yb::MetricUnit::kMicroseconds, "Microseconds spent before sending the request to the server",
+    60000000LU, 2);
 
 METRIC_DEFINE_counter(server, consistent_prefix_successful_reads,
     "Number of consistent prefix reads that were served by the closest replica.",
@@ -84,6 +95,58 @@ METRIC_DEFINE_counter(server, skip_intents_writes,
     "Number of writes that have skipped intents db within a transaction.",
     yb::MetricUnit::kRequests,
     "Number of writes that have skipped intents db within a transaction.");
+
+METRIC_DEFINE_counter(server, yb_client_internal_retries,
+    "YB client internal retries",
+    yb::MetricUnit::kRequests,
+    "Number of YB client internal tablet RPC retries.");
+
+namespace {
+
+constexpr uint64_t kRpcLatencyMaxMicros = 60000000LU;
+constexpr int kRpcLatencySigDigits = 2;
+
+const yb::MetricPrototype::OptionalArgs kTableOnlyArgs(yb::kExcludeFromServerLevelAggregation);
+
+yb::HistogramPrototype METRIC_table_handler_latency_yb_client_write_remote(
+    yb::MetricPrototype::CtorArgs(
+        "table", "handler_latency_yb_client_write_remote", "yb.client.Write remote call time",
+        yb::MetricUnit::kMicroseconds, "Microseconds spent in the remote Write call ",
+        yb::MetricLevel::kInfo, kTableOnlyArgs),
+    kRpcLatencyMaxMicros, kRpcLatencySigDigits);
+yb::HistogramPrototype METRIC_table_handler_latency_yb_client_read_remote(
+    yb::MetricPrototype::CtorArgs(
+        "table", "handler_latency_yb_client_read_remote", "yb.client.Read remote call time",
+        yb::MetricUnit::kMicroseconds, "Microseconds spent in the remote Read call ",
+        yb::MetricLevel::kInfo, kTableOnlyArgs),
+    kRpcLatencyMaxMicros, kRpcLatencySigDigits);
+yb::HistogramPrototype METRIC_table_handler_latency_yb_client_write_local(
+    yb::MetricPrototype::CtorArgs(
+        "table", "handler_latency_yb_client_write_local", "yb.client.Write local call time",
+        yb::MetricUnit::kMicroseconds, "Microseconds spent in the local Write call ",
+        yb::MetricLevel::kInfo, kTableOnlyArgs),
+    kRpcLatencyMaxMicros, kRpcLatencySigDigits);
+yb::HistogramPrototype METRIC_table_handler_latency_yb_client_read_local(
+    yb::MetricPrototype::CtorArgs(
+        "table", "handler_latency_yb_client_read_local", "yb.client.Read local call time",
+        yb::MetricUnit::kMicroseconds, "Microseconds spent in the local Read call ",
+        yb::MetricLevel::kInfo, kTableOnlyArgs),
+    kRpcLatencyMaxMicros, kRpcLatencySigDigits);
+yb::HistogramPrototype METRIC_table_handler_latency_yb_client_time_to_send(
+    yb::MetricPrototype::CtorArgs(
+        "table", "handler_latency_yb_client_time_to_send",
+        "Time (microseconds) taken for a Write/Read rpc to be sent to the server",
+        yb::MetricUnit::kMicroseconds,
+        "Microseconds spent before sending the request to the server",
+        yb::MetricLevel::kInfo, kTableOnlyArgs),
+    kRpcLatencyMaxMicros, kRpcLatencySigDigits);
+yb::CounterPrototype METRIC_table_yb_client_internal_retries(
+    yb::MetricPrototype::CtorArgs(
+        "table", "yb_client_internal_retries", "YB client internal retries",
+        yb::MetricUnit::kRequests, "Number of YB client internal tablet RPC retries.",
+        yb::MetricLevel::kInfo, kTableOnlyArgs));
+
+}  // namespace
 
 DEFINE_RUNTIME_int32(ybclient_print_trace_every_n, 0,
     "Controls the rate at which traces from ybclient are printed. Setting this to 0 "
@@ -154,18 +217,93 @@ void DoCheckResponseCount(
   }
 }
 
+const char* StatusCodeName(Status::Code code) {
+  switch (code) {
+#define YB_STATUS_CODE(name, pb_name, value, message) \
+    case Status::BOOST_PP_CAT(k, name): return #name;
+#include "yb/util/status_codes.h"
+#undef YB_STATUS_CODE
+  }
+  return "Unknown";
+}
+
+scoped_refptr<Counter> RetryReasonCounter(
+    const scoped_refptr<MetricEntity>& entity, AsyncRpcMetrics::Scope scope, Status::Code code) {
+  static simple_spinlock lock;
+  static std::unordered_map<std::string, std::shared_ptr<OwningCounterPrototype>> prototypes;
+
+  const char* entity_type = scope == AsyncRpcMetrics::Scope::kTable ? "table" : "server";
+  const char* code_name = StatusCodeName(code);
+  const auto metric_name = Format("yb_client_internal_retries_$0", code_name);
+  const auto key = Format("$0:$1", entity_type, metric_name);
+
+  std::shared_ptr<OwningCounterPrototype> proto;
+  {
+    std::lock_guard l(lock);
+    auto& slot = prototypes[key];
+    if (!slot) {
+      const uint32_t flags = scope == AsyncRpcMetrics::Scope::kTable
+          ? kExcludeFromServerLevelAggregation : 0;
+      slot = std::make_shared<OwningCounterPrototype>(
+          std::string(entity_type),
+          metric_name,
+          Format("YB client internal retries ($0)", code_name),
+          MetricUnit::kRequests,
+          Format("Number of YB client internal tablet RPC retries due to $0", code_name),
+          MetricLevel::kInfo,
+          flags);
+    }
+    proto = slot;
+  }
+  return entity->FindOrCreateMetric<Counter>(proto);
+}
+
+void IncrementRpcLatency(
+    const AsyncRpcMetricsPtr& server_metrics, const AsyncRpcMetricsPtr& table_metrics,
+    scoped_refptr<Histogram> AsyncRpcMetrics::* field, int64_t us) {
+  if (server_metrics) {
+    IncrementHistogram(server_metrics.get()->*field, us);
+  }
+  if (table_metrics) {
+    IncrementHistogram(table_metrics.get()->*field, us);
+  }
+}
+
 } // namespace
 
-AsyncRpcMetrics::AsyncRpcMetrics(const scoped_refptr<yb::MetricEntity>& entity)
-    : remote_write_rpc_time(METRIC_handler_latency_yb_client_write_remote.Instantiate(entity)),
-      remote_read_rpc_time(METRIC_handler_latency_yb_client_read_remote.Instantiate(entity)),
-      local_write_rpc_time(METRIC_handler_latency_yb_client_write_local.Instantiate(entity)),
-      local_read_rpc_time(METRIC_handler_latency_yb_client_read_local.Instantiate(entity)),
-      time_to_send(METRIC_handler_latency_yb_client_time_to_send.Instantiate(entity)),
-      consistent_prefix_successful_reads(
-          METRIC_consistent_prefix_successful_reads.Instantiate(entity)),
-      consistent_prefix_failed_reads(METRIC_consistent_prefix_failed_reads.Instantiate(entity)),
-      skip_intents_writes(METRIC_skip_intents_writes.Instantiate(entity)) {
+AsyncRpcMetrics::AsyncRpcMetrics(const scoped_refptr<yb::MetricEntity>& metric_entity, Scope scope)
+    : entity(metric_entity), scope(scope) {
+  if (scope == Scope::kTable) {
+    remote_write_rpc_time =
+        METRIC_table_handler_latency_yb_client_write_remote.Instantiate(metric_entity);
+    remote_read_rpc_time =
+        METRIC_table_handler_latency_yb_client_read_remote.Instantiate(metric_entity);
+    local_write_rpc_time =
+        METRIC_table_handler_latency_yb_client_write_local.Instantiate(metric_entity);
+    local_read_rpc_time =
+        METRIC_table_handler_latency_yb_client_read_local.Instantiate(metric_entity);
+    time_to_send = METRIC_table_handler_latency_yb_client_time_to_send.Instantiate(metric_entity);
+    internal_retries = METRIC_table_yb_client_internal_retries.Instantiate(metric_entity);
+    return;
+  }
+  remote_write_rpc_time = METRIC_handler_latency_yb_client_write_remote.Instantiate(metric_entity);
+  remote_read_rpc_time = METRIC_handler_latency_yb_client_read_remote.Instantiate(metric_entity);
+  local_write_rpc_time = METRIC_handler_latency_yb_client_write_local.Instantiate(metric_entity);
+  local_read_rpc_time = METRIC_handler_latency_yb_client_read_local.Instantiate(metric_entity);
+  time_to_send = METRIC_handler_latency_yb_client_time_to_send.Instantiate(metric_entity);
+  consistent_prefix_successful_reads =
+      METRIC_consistent_prefix_successful_reads.Instantiate(metric_entity);
+  consistent_prefix_failed_reads =
+      METRIC_consistent_prefix_failed_reads.Instantiate(metric_entity);
+  skip_intents_writes = METRIC_skip_intents_writes.Instantiate(metric_entity);
+  internal_retries = METRIC_yb_client_internal_retries.Instantiate(metric_entity);
+}
+
+void AsyncRpcMetrics::IncrementRetry(const Status& status) {
+  IncrementCounter(internal_retries);
+  if (entity) {
+    IncrementCounter(RetryReasonCounter(entity, scope, status.code()));
+  }
 }
 
 AsyncRpc::AsyncRpc(
@@ -184,6 +322,8 @@ AsyncRpc::AsyncRpc(
                       trace_.get()),
       start_(CoarseMonoClock::Now()),
       async_rpc_metrics_(data.batcher->async_rpc_metrics()),
+      table_async_rpc_metrics_(
+          data.batcher->client_->data_->GetTableAsyncRpcMetrics(*table())),
       wait_state_(ash::WaitStateInfo::CurrentWaitState()) {
   mutable_retrier()->mutable_controller()->set_allow_local_calls_in_curr_thread(
       data.allow_local_calls_in_curr_thread);
@@ -258,6 +398,15 @@ void AsyncRpc::HandleFinished(RefCntBuffer data_holder, const Status& status) {
   ProcessResponseFromTserver(std::move(data_holder), status);
   batcher_->Flushed(ops_, status, MakeFlushExtraResult());
   retained_self_.reset();
+}
+
+void AsyncRpc::NotifyRetry(const Status& reason) {
+  if (async_rpc_metrics_) {
+    async_rpc_metrics_->IncrementRetry(reason);
+  }
+  if (table_async_rpc_metrics_) {
+    table_async_rpc_metrics_->IncrementRetry(reason);
+  }
 }
 
 void AsyncRpc::Failed(const Status& status) {
@@ -439,9 +588,9 @@ void SetFastPathObjectLockingTxnMetadata(
 } // namespace
 
 void AsyncRpc::SendRpcToTserver(int attempt_num) {
-  if (async_rpc_metrics_) {
-    async_rpc_metrics_->time_to_send->Increment(ToMicroseconds(CoarseMonoClock::Now() - start_));
-  }
+  IncrementRpcLatency(
+      async_rpc_metrics_, table_async_rpc_metrics_, &AsyncRpcMetrics::time_to_send,
+      ToMicroseconds(CoarseMonoClock::Now() - start_));
   auto callback = [this](const Status& status) {
     TRACE_TO(trace_, "AsyncRpc::SendRpcToTserver WaitForAsyncWrites completed");
     if (!status.ok()) {
@@ -780,12 +929,11 @@ WriteRpc::WriteRpc(const AsyncRpcData& data, rpc::ThreadPoolTag pool_tag)
 }
 
 WriteRpc::~WriteRpc() {
-  if (async_rpc_metrics_) {
-    scoped_refptr<EventStats> write_rpc_time = IsLocalCall() ?
-                                                    async_rpc_metrics_->local_write_rpc_time :
-                                                    async_rpc_metrics_->remote_write_rpc_time;
-    write_rpc_time->Increment(ToMicroseconds(CoarseMonoClock::Now() - start_));
-  }
+  IncrementRpcLatency(
+      async_rpc_metrics_, table_async_rpc_metrics_,
+      IsLocalCall() ? &AsyncRpcMetrics::local_write_rpc_time
+                    : &AsyncRpcMetrics::remote_write_rpc_time,
+      ToMicroseconds(CoarseMonoClock::Now() - start_));
 }
 
 void WriteRpc::CallRemoteMethod() {
@@ -931,12 +1079,12 @@ ReadRpc::ReadRpc(
 
 ReadRpc::~ReadRpc() {
   // Get locality metrics if enabled, but skip for system tables as those go to the master.
-  if (async_rpc_metrics_ && !table()->name().is_system()) {
-    scoped_refptr<EventStats> read_rpc_time = IsLocalCall() ?
-                                                   async_rpc_metrics_->local_read_rpc_time :
-                                                   async_rpc_metrics_->remote_read_rpc_time;
-
-    read_rpc_time->Increment(ToMicroseconds(CoarseMonoClock::Now() - start_));
+  if (!table()->name().is_system()) {
+    IncrementRpcLatency(
+        async_rpc_metrics_, table_async_rpc_metrics_,
+        IsLocalCall() ? &AsyncRpcMetrics::local_read_rpc_time
+                      : &AsyncRpcMetrics::remote_read_rpc_time,
+        ToMicroseconds(CoarseMonoClock::Now() - start_));
   }
 }
 
@@ -1110,8 +1258,10 @@ void WaitForAsyncWriteRpc::FinishOrRetry(Status&& status, bool allow_retry) {
   // Other errors (network, etc.) are already handled by TabletInvoker's internal retries.
   if (allow_retry && !status.ok() && (status.IsNotFound() || status.IsTryAgain())) {
     const_cast<YBTable&>(*table_).MarkPartitionsAsStale();
+    const Status retry_reason = status;
     status = mutable_retrier()->DelayedRetry(this, status);
     if (status.ok()) {
+      NotifyRetry(retry_reason);
       return;
     }
   }
@@ -1130,6 +1280,15 @@ std::string WaitForAsyncWriteRpc::ToString() const {
 
 void WaitForAsyncWriteRpc::Failed(const Status& status) {
   VLOG_WITH_FUNC(4) << ToString() << " status: " << status;
+}
+
+void WaitForAsyncWriteRpc::NotifyRetry(const Status& reason) {
+  if (auto metrics = batcher_->async_rpc_metrics()) {
+    metrics->IncrementRetry(reason);
+  }
+  if (auto table_metrics = batcher_->client_->data_->GetTableAsyncRpcMetrics(*table_)) {
+    table_metrics->IncrementRetry(reason);
+  }
 }
 
 }  // namespace yb::client::internal
