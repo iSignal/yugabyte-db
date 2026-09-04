@@ -136,7 +136,8 @@ yb::HistogramPrototype METRIC_table_handler_latency_yb_client_time_to_send(
     yb::MetricPrototype::CtorArgs(
         "table", "handler_latency_yb_client_time_to_send",
         "Time (microseconds) taken for a Write/Read rpc to be sent to the server",
-        yb::MetricUnit::kMicroseconds, "Microseconds spent before sending the request to the server",
+        yb::MetricUnit::kMicroseconds,
+        "Microseconds spent before sending the request to the server",
         yb::MetricLevel::kInfo, kTableOnlyArgs),
     kRpcLatencyMaxMicros, kRpcLatencySigDigits);
 yb::CounterPrototype METRIC_table_yb_client_internal_retries(
