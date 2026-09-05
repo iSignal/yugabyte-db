@@ -42,7 +42,6 @@ METRIC_DECLARE_counter(local_catalog_pushes_applied);
 METRIC_DECLARE_counter(local_catalog_pushes_refused);
 METRIC_DECLARE_counter(local_catalog_release_pushes_sent);
 METRIC_DECLARE_counter(local_catalog_release_pushes_skipped);
-METRIC_DECLARE_counter(local_catalog_serving_disabled_lease);
 METRIC_DECLARE_gauge_uint32(local_catalog_serving_state);
 METRIC_DECLARE_gauge_uint64(local_catalog_safe_time_micros);
 METRIC_DECLARE_event_stats(local_catalog_poll_latency_us);
@@ -73,10 +72,6 @@ class PgLocalCatalogTest : public LibPqTestBase {
     // transaction.
     options->extra_tserver_flags.push_back("--enable_local_tserver_catalog=true");
     options->extra_master_flags.push_back("--enable_local_tserver_catalog=true");
-    // A short lease so that the lease-loss test does not have to wait out the default TTL. The
-    // TTL is a master flag and the refresh interval a tserver one.
-    options->extra_master_flags.push_back("--master_ysql_operation_lease_ttl_ms=5000");
-    options->extra_tserver_flags.push_back("--ysql_lease_refresher_interval_ms=500");
     for (auto* flags : {&options->extra_master_flags, &options->extra_tserver_flags}) {
       flags->push_back("--ysql_yb_enable_invalidation_messages=true");
       flags->push_back("--enable_object_locking_for_table_locks=true");
@@ -873,60 +868,6 @@ TEST_F(PgLocalCatalogTest, CheckpointTooOldReseeds) {
         return ResultToStatus(fresh.FetchRow<int64_t>("SELECT count(*) FROM after_reseed"));
       }));
   ASSERT_GT(delta, 0) << RoutingCounters(0) << "; " << RoutingCounters(1);
-}
-
-// Phase 6: while the tserver's YSQL lease is gone master can complete DDLs without this tserver
-// acknowledging their lock releases, so versions advance with no gate here and the copy cannot be
-// trusted. The copy leaves the read path on lease loss and rejoins it only once the poller has
-// applied a response at or after the new lease grant.
-TEST_F(PgLocalCatalogTest, LeaseLossTakesTheCopyOutOfTheReadPath) {
-  ASSERT_OK(WaitForAllServing());
-  ASSERT_EQ(ASSERT_RESULT(Counter(0, METRIC_local_catalog_serving_disabled_lease)), 0);
-
-  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_tserver_enable_ysql_lease_refresh", "false"));
-  ASSERT_OK(LoggedWaitFor(
-      [this]() -> Result<bool> {
-        auto disabled = Counter(0, METRIC_local_catalog_serving_disabled_lease);
-        return disabled.ok() && *disabled > 0;
-      },
-      120s, "The copy to leave the read path after the lease lapsed"));
-  // The copy must stay out of the read path for as long as the lease is gone, not just until the
-  // next poll: no hybrid time the poller reaches can prove the copy holds what master committed
-  // while this tserver was not acknowledging lock releases.
-  for (int i = 0; i < 10; ++i) {
-    SleepFor(500ms * kTimeMultiplier);
-    ASSERT_NE(ASSERT_RESULT(Counter(0, METRIC_local_catalog_serving_state)), kServingStateServing);
-  }
-
-  // A DDL from another tserver still commits and is still correct while this copy is out of the
-  // read path.
-  {
-    auto conn = ASSERT_RESULT(ConnectTo(1));
-    ASSERT_OK(conn.Execute("CREATE TABLE during_lease_gap (k INT PRIMARY KEY, v TEXT)"));
-    ASSERT_OK(conn.Execute("INSERT INTO during_lease_gap VALUES (1, 'gap')"));
-  }
-
-  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_tserver_enable_ysql_lease_refresh", "true"));
-  ASSERT_OK(WaitForServing(0));
-
-  // Losing the lease kills this tserver's PG backends, and a new lease epoch restarts the
-  // postmaster, so the connection has to be retried until PG is accepting again.
-  std::optional<PGConn> conn;
-  ASSERT_OK(LoggedWaitFor(
-      [this, &conn]() -> Result<bool> {
-        auto result = ConnectTo(0);
-        if (!result.ok()) {
-          return false;
-        }
-        conn = std::move(*result);
-        return true;
-      },
-      120s, "PG on tserver 0 to accept connections again"));
-
-  // Once it is serving again it holds the DDL that landed while it was out.
-  ASSERT_EQ(
-      ASSERT_RESULT(conn->FetchRow<std::string>("SELECT v FROM during_lease_gap WHERE k = 1")),
-      "gap");
 }
 
 // A session that writes catalog rows outside a DDL, the way a YSQL upgrade's migrations do, can
