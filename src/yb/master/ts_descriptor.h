@@ -42,6 +42,7 @@
 
 #include "yb/common/common_net.pb.h"
 #include "yb/common/hybrid_time.h"
+#include "yb/common/opid.h"
 
 #include "yb/gutil/thread_annotations.h"
 
@@ -150,6 +151,11 @@ class TSDescriptor : public MetadataCowWrapper<PersistentTServerInfo> {
 
   // Return the amount of time since the last heartbeat received from this TS.
   MonoDelta TimeSinceHeartbeat() const;
+
+  // The position in master's system catalog WAL that this tserver's local copy had applied as of
+  // the returned time. An invalid op id means the tserver has never reported one, which is the
+  // state of every tserver until it heartbeats a new master leader.
+  std::pair<OpId, MonoTime> LocalCatalogAppliedOpId() const;
   MonoTime LastHeartbeatTime() const;
 
   Result<TSDescriptor::WriteLock> UpdateRegistration(
@@ -431,6 +437,9 @@ class TSDescriptor : public MetadataCowWrapper<PersistentTServerInfo> {
 
   // The last time a heartbeat was received for this node.
   MonoTime last_heartbeat_ GUARDED_BY(mutex_);
+
+  OpId local_catalog_applied_op_id_ GUARDED_BY(mutex_);
+  MonoTime local_catalog_applied_op_id_time_ GUARDED_BY(mutex_);
   const bool registered_through_heartbeat_;
 
   // True after the first heartbeat from this tserver is received by this master leader.

@@ -330,7 +330,8 @@ Status GetChangesForXCluster(const XClusterGetChangesContext& context) {
   //     computed last_apply_safe_time and apply_safe_time_checkpoint_op_id
   if (transactional && !stream_tablet_metadata->last_apply_safe_time_.is_valid()) {
     // See if its time to update the apply safe time.
-    if (txn_participant->GetNumRunningTransactions() == 0 ||
+    if (context.force_apply_safe_time ||
+        txn_participant->GetNumRunningTransactions() == 0 ||
         !stream_tablet_metadata->last_apply_safe_time_update_time_ ||
         stream_tablet_metadata->last_apply_safe_time_update_time_ +
                 (FLAGS_xcluster_consistent_wal_safe_time_frequency_ms * 1ms) <
@@ -393,9 +394,15 @@ Status GetChangesForXCluster(const XClusterGetChangesContext& context) {
   OpId previous_checkpoint = context.from_op_id;
 
   bool exit_early = false;
+  // The system catalog change stream's consumers need to know which operation each record came
+  // from, because master slices one batch across tservers sitting at different positions. Other
+  // streams have one consumer that always reads from its own position, so they pay nothing for it.
+  const bool stamp_record_op_ids = context.stream_metadata->IsSysCatalogChangeStream();
+
   for (const auto& msg_ptr : messages) {
     const auto& msg = *msg_ptr;
     checkpoint = OpId::FromPB(msg.id());
+    const auto records_before = context.resp->records_size();
     switch (msg.op_type()) {
       case consensus::OperationType::UPDATE_TRANSACTION_OP:
         RETURN_NOT_OK(PopulateTransactionRecord(context, msg));
@@ -415,6 +422,13 @@ Status GetChangesForXCluster(const XClusterGetChangesContext& context) {
       default:
         // Nothing to do for other operation types.
         break;
+    }
+    if (stamp_record_op_ids) {
+      // One message can produce several records, one per row it wrote, and they all share its
+      // position.
+      for (auto i = records_before; i < context.resp->records_size(); ++i) {
+        checkpoint.ToPB(context.resp->mutable_records(i)->mutable_op_id());
+      }
     }
     ht_of_last_returned_message = HybridTime(msg.hybrid_time());
 

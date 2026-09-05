@@ -80,9 +80,26 @@ std::shared_ptr<StreamMetadata> SysCatalogChangeServiceImpl::GetOrCreateStream(
   return streams_.emplace(requestor_uuid, StreamEntry{std::move(stream), now}).first->second.stream;
 }
 
+namespace {
+
+// The requestor name master uses for its own stream, which cannot collide with a tserver uuid.
+const char* const kReleasePushRequestor = "master-release-push";
+
+}  // namespace
+
+Status SysCatalogChangeServiceImpl::GetChangesForRelease(
+    const OpId& from_op_id, GetSysCatalogChangesResponsePB* resp, CoarseTimePoint deadline) {
+  GetSysCatalogChangesRequestPB req;
+  req.set_requestor_uuid(kReleasePushRequestor);
+  if (!from_op_id.empty()) {
+    from_op_id.ToPB(req.mutable_from_checkpoint()->mutable_op_id());
+  }
+  return DoGetSysCatalogChanges(req, resp, deadline, /* force_apply_safe_time= */ true);
+}
+
 Status SysCatalogChangeServiceImpl::DoGetSysCatalogChanges(
     const GetSysCatalogChangesRequestPB& req, GetSysCatalogChangesResponsePB* resp,
-    CoarseTimePoint deadline) {
+    CoarseTimePoint deadline, bool force_apply_safe_time) {
   SCHECK(
       !req.requestor_uuid().empty(), InvalidArgument,
       "System catalog change request must carry the requesting tserver's uuid");
@@ -119,6 +136,7 @@ Status SysCatalogChangeServiceImpl::DoGetSysCatalogChanges(
       .resp = resp->mutable_changes(),
       .have_more_messages = &have_more_messages,
       .last_readable_opid_index = &last_readable_index,
+      .force_apply_safe_time = force_apply_safe_time,
   };
 
   RETURN_NOT_OK(GetChangesForXCluster(context));

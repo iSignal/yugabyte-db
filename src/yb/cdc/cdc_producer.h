@@ -68,6 +68,11 @@ struct XClusterGetChangesContext {
   GetChangesResponsePB* resp;
   HaveMoreMessages* have_more_messages;
   int64_t* last_readable_opid_index;
+
+  // Compute a new apply safe time on this call even if the throttle interval has not elapsed. Set
+  // by the system catalog release path, where master is calling itself for a DDL that has just
+  // committed and a safe time from before that commit is of no use.
+  bool force_apply_safe_time = false;
 };
 
 Status GetChangesForCDCSDK(

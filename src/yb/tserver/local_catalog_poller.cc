@@ -58,6 +58,7 @@
 #include "yb/util/path_util.h"
 #include "yb/util/pb_util.h"
 #include "yb/util/status_format.h"
+#include "yb/util/unique_lock.h"
 #include "yb/util/status_log.h"
 
 DEFINE_RUNTIME_uint32(local_catalog_poll_interval_ms, 100,
@@ -78,8 +79,13 @@ DEFINE_RUNTIME_uint32(local_catalog_apply_write_timeout_ms, 60000,
 DECLARE_uint32(local_catalog_bootstrap_retry_delay_ms);
 
 DEFINE_test_flag(bool, local_catalog_pause_poller, false,
-    "Stop the tserver-local catalog copy from fetching or applying anything. C stops advancing, "
-    "so the version gate blocks and reads that carry a newer version wait.");
+    "Stop the tserver-local catalog copy from fetching from master. C stops advancing on its own, "
+    "so the version gate blocks and reads that carry a newer version wait. Records that arrive on "
+    "a lock release are still applied, which is how the push path is tested without pulls.");
+
+DEFINE_test_flag(uint32, local_catalog_pushed_batch_apply_delay_ms, 0,
+    "Sleep this long inside the apply of a batch that arrived on a lock release, so that the "
+    "release handler waiting on it gives up first and the handoff outlives its caller.");
 
 DEFINE_test_flag(bool, local_catalog_fail_poll, false,
     "Make every change request to the master system catalog tablet fail.");
@@ -153,6 +159,11 @@ MonoDelta LocalCatalogPoller::IntervalToNextPoll(int32_t consecutive_failures) {
 }
 
 Status LocalCatalogPoller::Poll() {
+  // First, so that a release waiting on a pushed batch is answered as early as possible, and so
+  // that pushed and pulled batches never interleave. A pushed batch is applied even while pulling
+  // is paused: the pause exists to stop this copy fetching, and a release that carried records
+  // has a caller of its own waiting on it.
+  ApplyPendingPush();
   if (PREDICT_FALSE(FLAGS_TEST_local_catalog_pause_poller)) {
     return Status::OK();
   }
@@ -176,6 +187,7 @@ Status LocalCatalogPoller::LoadCheckpoint() {
     auto consensus = VERIFY_RESULT(tablet_peer_->GetConsensus());
     checkpoint_ = tablet_peer_->log()->GetLatestEntryOpId();
     persisted_checkpoint_ = OpId();
+    replica_.SetAppliedOpId(checkpoint_);
     LOG_WITH_PREFIX(INFO) << "No recorded WAL position; resuming from the last entry of the copied "
                           << "log: " << checkpoint_;
     return PersistCheckpoint(/* force= */ true);
@@ -186,6 +198,7 @@ Status LocalCatalogPoller::LoadCheckpoint() {
       Format("Unable to read the local catalog copy's WAL position from $0", path));
   checkpoint_ = OpId::FromPB(pb.checkpoint());
   persisted_checkpoint_ = checkpoint_;
+  replica_.SetAppliedOpId(checkpoint_);
   LOG_WITH_PREFIX(INFO) << "Resuming the poll from WAL position " << checkpoint_;
   return Status::OK();
 }
@@ -354,38 +367,18 @@ Status LocalCatalogPoller::FetchAndApplyOnce() {
   }
 
   const auto& changes = resp.changes();
-  if (changes.has_checkpoint() && changes.checkpoint().has_op_id()) {
-    auto new_checkpoint = OpId::FromPB(changes.checkpoint().op_id());
-    // Compared by index alone. This is a position in master's WAL, whose term changes on a master
-    // leader election, and an OpId comparison would then reject a newer position carrying a lower
-    // term and leave the poll re-requesting the same records forever.
-    if (new_checkpoint.index > checkpoint_.index) {
-      checkpoint_ = new_checkpoint;
-    }
-  }
   have_more_messages_ = resp.have_more_messages();
 
-  // Everything master certified as present at this safe time is now in the local regular store,
-  // so C may advance to it. A[db] is read from the copy at the same time, so the two are published
-  // together and a backend can never be told a version whose rows the copy does not hold.
   HybridTime new_c;
   std::unordered_map<uint32_t, uint64_t> applied_versions;
-  if (changes.has_safe_hybrid_time()) {
-    new_c = HybridTime(changes.safe_hybrid_time());
-    if (new_c.is_valid() && !new_c.is_special()) {
-      applied_versions = VERIFY_RESULT(ReadLocalCatalogVersions(new_c));
-    } else {
-      new_c = HybridTime::kInvalid;
-    }
-  }
-  if (!resp.changes().records().empty()) {
-    VLOG_WITH_PREFIX(1) << "Applied " << resp.changes().records().size() << " records ("
+  RETURN_NOT_OK(PublishAppliedBatch(changes, stats, &new_c, &applied_versions));
+  if (!changes.records().empty()) {
+    VLOG_WITH_PREFIX(1) << "Applied " << changes.records().size() << " records ("
                         << stats.ToString() << ") up to WAL position " << checkpoint_
                         << "; C is now " << LocalCatalogHybridTimeForLog(new_c) << ", versions "
                         << AsString(applied_versions)
                         << (have_more_messages_ ? ", master has more to send" : "");
   }
-  replica_.PublishAfterApply(new_c, applied_versions);
   replica_.RecordApplyLatency(MonoTime::Now() - apply_start);
   if (new_c.is_valid()) {
     replica_.RecordLag(server_.Clock()->Now().PhysicalDiff(new_c));
@@ -426,6 +419,154 @@ std::string LocalCatalogPoller::RecordTableName(const cdc::CDCRecordPB& record) 
     }
   }
   return table_id;
+}
+
+Status LocalCatalogPoller::PublishAppliedBatch(
+    const cdc::GetChangesResponsePB& changes, const AppliedRecordStats& stats, HybridTime* new_c,
+    std::unordered_map<uint32_t, uint64_t>* applied_versions) {
+  if (changes.has_checkpoint() && changes.checkpoint().has_op_id()) {
+    auto batch_end = OpId::FromPB(changes.checkpoint().op_id());
+    // Compared by index alone. This is a position in master's WAL, whose term changes on a master
+    // leader election, and an OpId comparison would then reject a newer position carrying a lower
+    // term and leave the poll re-requesting the same records forever.
+    if (batch_end.index > checkpoint_.index) {
+      checkpoint_ = batch_end;
+      replica_.SetAppliedOpId(checkpoint_);
+    }
+  }
+
+  // Everything master certified as present at this safe time is now in the local regular store,
+  // so C may advance to it. A[db] is read from the copy at the same time, so the two are published
+  // together and a backend can never be told a version whose rows the copy does not hold.
+  if (changes.has_safe_hybrid_time()) {
+    auto safe_time = HybridTime(changes.safe_hybrid_time());
+    if (safe_time.is_valid() && !safe_time.is_special()) {
+      *new_c = safe_time;
+      *applied_versions = VERIFY_RESULT(ReadLocalCatalogVersions(*new_c));
+    }
+  }
+  replica_.PublishAfterApply(*new_c, *applied_versions);
+  if (new_c->is_valid()) {
+    replica_.RecordLag(server_.Clock()->Now().PhysicalDiff(*new_c));
+    replica_.OnSafeTimePublished(*new_c);
+  }
+  return PersistCheckpoint(/* force= */ false);
+}
+
+Status LocalCatalogPoller::ApplyPushedBatch(
+    const cdc::GetSysCatalogChangesResponsePB& batch, CoarseTimePoint deadline) {
+  auto push = std::make_shared<PendingPush>();
+  push->batch = batch;
+  {
+    std::lock_guard lock(push_mutex_);
+    if (pending_push_) {
+      // One pushed batch at a time. A second release's records are of no use to this copy until
+      // the first has been applied, and its sender can wait for the poller instead.
+      return STATUS(TryAgain, "Another pushed system catalog batch is already being applied");
+    }
+    pending_push_ = push;
+  }
+  RequestImmediatePoll();
+  UniqueLock lock(push_mutex_);
+  while (!push->done) {
+    if (push_cond_.wait_until(GetLockForCondition(lock), deadline) == std::cv_status::timeout) {
+      // Withdraw it if the poll thread has not taken it yet; if it has, it owns a reference of
+      // its own and completes into the shared state, which this reference keeps alive. Either way
+      // this caller stops waiting and falls back to the gate wait.
+      if (pending_push_ == push) {
+        pending_push_.reset();
+      }
+      return STATUS(TimedOut, "Timed out waiting for a pushed system catalog batch to apply");
+    }
+  }
+  return push->result;
+}
+
+void LocalCatalogPoller::CompletePendingPush(
+    const std::shared_ptr<PendingPush>& push, const Status& status) {
+  {
+    std::lock_guard lock(push_mutex_);
+    push->result = status;
+    push->done = true;
+  }
+  push_cond_.notify_all();
+}
+
+void LocalCatalogPoller::ApplyPendingPush() {
+  std::shared_ptr<PendingPush> push;
+  {
+    std::lock_guard lock(push_mutex_);
+    // Moved out of the slot, so it is empty for the whole apply and a second release does not
+    // wait behind this one only to find its own batch stale.
+    push = std::move(pending_push_);
+    pending_push_.reset();
+  }
+  if (!push) {
+    return;
+  }
+  if (!tablet_peer_) {
+    // A re-seed took the tablet away between the handoff and now. There is nothing to apply into,
+    // and making the caller wait out its deadline for that would be pointless.
+    CompletePendingPush(
+        push, STATUS(IllegalState, "The local catalog copy has no tablet to apply a pushed batch"));
+    return;
+  }
+  CompletePendingPush(push, DoApplyPushedBatch(push->batch));
+}
+
+Status LocalCatalogPoller::DoApplyPushedBatch(const cdc::GetSysCatalogChangesResponsePB& batch) {
+  if (PREDICT_FALSE(FLAGS_TEST_local_catalog_pushed_batch_apply_delay_ms > 0)) {
+    SleepFor(MonoDelta::FromMilliseconds(FLAGS_TEST_local_catalog_pushed_batch_apply_delay_ms));
+  }
+  const auto& changes = batch.changes();
+
+  // What establishes that nothing is missing is where master sliced from, not where the first
+  // record sits. Master fetched everything above that position, so every record between it and
+  // the batch's end is in the slice; but plenty of WAL operations produce no record at all -- a
+  // history cutoff, the no-op of an election, a transaction status update that is not an apply --
+  // so the first record's position can be well above this copy's own and nothing be absent.
+  SCHECK(
+      batch.has_slice_from(), IllegalState,
+      "A pushed system catalog batch did not say which position it was sliced from");
+  const auto slice_from = OpId::FromPB(batch.slice_from());
+  SCHECK_LE(
+      slice_from.index, checkpoint_.index, IllegalState,
+      Format(
+          "A pushed system catalog batch was sliced from $0, above the applied position $1, so "
+          "records between them would be missing",
+          slice_from, checkpoint_));
+
+  // Master slices from a position it learned by heartbeat, which is up to one heartbeat old, so a
+  // slice normally repeats records this copy already has. Records carry the position of the
+  // operation that produced them and one operation's records all share it, so dropping on the
+  // index never splits an operation.
+  cdc::GetSysCatalogChangesResponsePB retained;
+  auto* retained_changes = retained.mutable_changes();
+  *retained_changes->mutable_checkpoint() = changes.checkpoint();
+  if (changes.has_safe_hybrid_time()) {
+    retained_changes->set_safe_hybrid_time(changes.safe_hybrid_time());
+  }
+  for (const auto& record : changes.records()) {
+    if (OpId::FromPB(record.op_id()).index > checkpoint_.index) {
+      *retained_changes->add_records() = record;
+    }
+  }
+
+  AppliedRecordStats stats;
+  auto apply_status = ApplyRecords(retained, &stats);
+  if (!apply_status.ok()) {
+    replica_.IncApplyFailures();
+    return apply_status;
+  }
+
+  HybridTime new_c;
+  std::unordered_map<uint32_t, uint64_t> applied_versions;
+  RETURN_NOT_OK(PublishAppliedBatch(*retained_changes, stats, &new_c, &applied_versions));
+  VLOG_WITH_PREFIX(1) << "Applied a pushed batch of " << retained_changes->records().size()
+                      << " records (" << stats.ToString() << ") up to WAL position " << checkpoint_
+                      << "; C is now " << LocalCatalogHybridTimeForLog(new_c) << ", versions "
+                      << AsString(applied_versions);
+  return Status::OK();
 }
 
 Status LocalCatalogPoller::ApplyRecords(

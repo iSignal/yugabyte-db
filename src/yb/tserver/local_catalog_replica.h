@@ -21,6 +21,7 @@
 
 #include "yb/common/entity_ids_types.h"
 #include "yb/common/hybrid_time.h"
+#include "yb/common/opid.h"
 
 #include "yb/gutil/thread_annotations.h"
 
@@ -32,6 +33,10 @@
 #include "yb/util/metrics_fwd.h"
 #include "yb/util/monotime.h"
 #include "yb/util/status_fwd.h"
+
+namespace yb::cdc {
+class GetSysCatalogChangesResponsePB;
+}  // namespace yb::cdc
 
 namespace yb::tserver {
 
@@ -149,6 +154,22 @@ class LocalCatalogReplica {
 
   TabletServer& server() { return server_; }
 
+  // The position in master's system catalog WAL that this copy has applied. Published by the
+  // poller after each batch, read by the heartbeat thread. Invalid until the copy exists.
+  void SetAppliedOpId(const OpId& op_id);
+  OpId applied_op_id() const;
+
+  // Applies change records that master carried on a lock release, so that this copy can reach the
+  // release's catalog version read time without waiting for a poll. Errors leave the copy
+  // untouched beyond what was applied and the caller waits for the poller as before.
+  Status ApplyPushedBatch(
+      const cdc::GetSysCatalogChangesResponsePB& batch, CoarseTimePoint deadline);
+  void RequestImmediatePoll();
+
+  void IncPushesReceived();
+  void IncPushesApplied();
+  void IncPushesRefused();
+
  private:
   friend class LocalCatalogPoller;
 
@@ -167,6 +188,12 @@ class LocalCatalogReplica {
   void OnSafeTimePublished(HybridTime c);
 
   TabletServer& server_;
+
+  OpId applied_op_id_ GUARDED_BY(mutex_);
+
+  scoped_refptr<Counter> pushes_received_;
+  scoped_refptr<Counter> pushes_applied_;
+  scoped_refptr<Counter> pushes_refused_;
   const scoped_refptr<MetricEntity> metric_entity_;
   const std::string log_prefix_;
 

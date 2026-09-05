@@ -339,14 +339,14 @@ Status Master::RegisterServices() {
     // copies of it current. It is high priority for the same reason the ysql lease service is: a
     // DDL's client is not told the DDL succeeded until every tserver has acknowledged the lock
     // release, and that acknowledgement waits for this service to have shipped the DDL's records.
+    sys_catalog_change_service_ = std::make_shared<cdc::SysCatalogChangeServiceImpl>(
+        metric_entity(),
+        [this]() -> Result<tablet::TabletPeerPtr> {
+          return master_tablet_server_->GetServingTablet(TabletId(kSysCatalogTabletId));
+        },
+        mem_tracker());
     RETURN_NOT_OK(RegisterService(
-        FLAGS_master_xrepl_svc_queue_length,
-        std::make_shared<cdc::SysCatalogChangeServiceImpl>(
-            metric_entity(),
-            [this]() -> Result<tablet::TabletPeerPtr> {
-              return master_tablet_server_->GetServingTablet(TabletId(kSysCatalogTabletId));
-            },
-            mem_tracker()),
+        FLAGS_master_xrepl_svc_queue_length, sys_catalog_change_service_,
         rpc::ServicePriority::kHigh));
   }
 

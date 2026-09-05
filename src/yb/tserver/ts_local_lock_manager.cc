@@ -29,6 +29,8 @@
 
 #include "yb/server/server_base.h"
 
+#include "yb/cdc/cdc_service.pb.h"
+
 #include "yb/tserver/local_catalog_replica.h"
 
 #include "yb/tserver/service_util.h"
@@ -66,6 +68,10 @@ DEFINE_test_flag(bool, make_global_lock_release_async, false,
 
 DECLARE_int32(tserver_yb_client_default_timeout_ms);
 DECLARE_uint64(refresh_waiter_timeout_ms);
+
+DEFINE_test_flag(bool, local_catalog_drop_pushed_batch, false,
+    "Discard the system catalog change records carried on a lock release instead of applying "
+    "them, so that the next release's records arrive with a gap and have to be refused.");
 
 namespace yb::tserver {
 
@@ -541,6 +547,33 @@ class TSLocalLockManager::Impl {
       // backends' catalog reads go to master, so there is nothing to gate and the versions are
       // published immediately.
       auto* local_catalog = server_->local_catalog_replica();
+
+      // Master may have carried the very records this copy is missing. Applying them here is what
+      // turns the wait below into a no-op; when they cannot be used, the wait does its job as
+      // before, so nothing about correctness rests on this.
+      if (local_catalog && local_catalog->IsServing() && req.has_local_catalog_changes()) {
+        local_catalog->IncPushesReceived();
+        cdc::GetSysCatalogChangesResponsePB batch;
+        Status push_status;
+        if (PREDICT_FALSE(FLAGS_TEST_local_catalog_drop_pushed_batch)) {
+          push_status = STATUS(Aborted, "TEST_local_catalog_drop_pushed_batch is set");
+        } else if (!batch.ParseFromString(req.local_catalog_changes())) {
+          push_status = STATUS(Corruption, "Could not parse the pushed system catalog batch");
+        } else {
+          push_status = local_catalog->ApplyPushedBatch(batch, deadline);
+        }
+        if (push_status.ok()) {
+          local_catalog->IncPushesApplied();
+          VLOG(1) << "Applied the system catalog change records carried by the release of txn "
+                  << txn;
+        } else {
+          local_catalog->IncPushesRefused();
+          local_catalog->RequestImmediatePoll();
+          VLOG(1) << "Could not use the system catalog change records carried by the release of "
+                  << "txn " << txn << ", falling back to the poller: " << push_status;
+        }
+      }
+
       if (local_catalog && local_catalog->IsServing() && req.has_catalog_versions_read_time()) {
         const auto target = HybridTime(req.catalog_versions_read_time());
         const auto wait_start = MonoTime::Now();

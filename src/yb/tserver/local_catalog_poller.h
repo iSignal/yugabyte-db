@@ -12,12 +12,15 @@
 
 #pragma once
 
+#include <condition_variable>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
 
+#include "yb/cdc/cdc_service.pb.h"
 #include "yb/cdc/cdc_service.proxy.h"
 
 #include "yb/common/hybrid_time.h"
@@ -57,6 +60,13 @@ class LocalCatalogPoller : public MasterLeaderPollerInterface {
   // out the idle interval.
   void RequestImmediatePoll();
 
+  // Applies a batch of change records that master carried on a lock release, on the poll thread,
+  // and waits for the outcome. Returns an error when the batch does not continue this copy's
+  // applied position, when the apply fails, or when the deadline passes; the caller then falls
+  // back to waiting for the poller.
+  Status ApplyPushedBatch(
+      const cdc::GetSysCatalogChangesResponsePB& batch, CoarseTimePoint deadline);
+
   // MasterLeaderPollerInterface.
   Status Poll() override;
   MonoDelta IntervalToNextPoll(int32_t consecutive_failures) override;
@@ -92,6 +102,30 @@ class LocalCatalogPoller : public MasterLeaderPollerInterface {
 
   Status ApplyRecords(
       const cdc::GetSysCatalogChangesResponsePB& resp, AppliedRecordStats* stats);
+
+  // Advances the applied position to the batch's end and publishes the safe time it carries, with
+  // the per-database versions read from the copy at that time. Shared by the poll and the pushed
+  // batch so that both publish on identical terms.
+  Status PublishAppliedBatch(
+      const cdc::GetChangesResponsePB& changes, const AppliedRecordStats& stats,
+      HybridTime* new_c, std::unordered_map<uint32_t, uint64_t>* applied_versions);
+
+  // Owned by both sides for the whole handoff: the waiter may give up on its deadline while the
+  // poll thread is still applying, and both the batch and the outcome have to outlive that.
+  struct PendingPush {
+    cdc::GetSysCatalogChangesResponsePB batch;
+    Status result;
+    bool done = false;
+  };
+
+  // Applies a batch that arrived on a lock release. Runs on the poll thread.
+  Status DoApplyPushedBatch(const cdc::GetSysCatalogChangesResponsePB& batch);
+
+  // Completes a handed-off batch with the given outcome and wakes whoever is waiting on it.
+  void CompletePendingPush(const std::shared_ptr<PendingPush>& push, const Status& status);
+
+  // Applies the batch a release handler is waiting on, if there is one. Runs on the poll thread.
+  void ApplyPendingPush();
 
   // The table a record belongs to, named if the copy's metadata knows the cotable and given as
   // the raw cotable id if it does not.
@@ -135,6 +169,13 @@ class LocalCatalogPoller : public MasterLeaderPollerInterface {
   // Whether a setup attempt has been made since this poller started. Only the poll thread reads
   // and writes it.
   bool setup_attempted_ = false;
+
+  // A batch of records that arrived on a lock release, handed from the release handler's thread to
+  // the poll thread. One at a time: a second release finds the slot taken and waits for the poller
+  // instead.
+  std::mutex push_mutex_;
+  std::condition_variable push_cond_;
+  std::shared_ptr<PendingPush> pending_push_ GUARDED_BY(push_mutex_);
 
   OpId checkpoint_;
   OpId persisted_checkpoint_;

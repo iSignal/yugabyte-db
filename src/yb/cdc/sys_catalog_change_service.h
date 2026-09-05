@@ -20,6 +20,8 @@
 
 #include "yb/cdc/cdc_service.service.h"
 
+#include "yb/common/opid.h"
+
 #include "yb/tablet/tablet_fwd.h"
 
 #include "yb/util/mem_tracker.h"
@@ -51,10 +53,18 @@ class SysCatalogChangeServiceImpl : public SysCatalogChangeServiceIf {
       const GetSysCatalogChangesRequestPB* req, GetSysCatalogChangesResponsePB* resp,
       rpc::RpcContext context) override;
 
+  // Fetches one batch for master's own use, without going through the RPC layer, for the change
+  // records a lock release carries. Uses a stream of its own, so it neither disturbs nor is
+  // disturbed by the tservers' streams, and demands a safe time computed on this call: the caller
+  // is releasing the locks of a transaction that has just committed, and a safe time from before
+  // that commit would not let any tserver publish the new versions.
+  Status GetChangesForRelease(
+      const OpId& from_op_id, GetSysCatalogChangesResponsePB* resp, CoarseTimePoint deadline);
+
  private:
   Status DoGetSysCatalogChanges(
       const GetSysCatalogChangesRequestPB& req, GetSysCatalogChangesResponsePB* resp,
-      CoarseTimePoint deadline);
+      CoarseTimePoint deadline, bool force_apply_safe_time = false);
 
   // Returns the requestor's stream, creating it on first use, and drops the streams of tservers
   // that have not polled for sys_catalog_change_stream_idle_timeout_sec. Without that, a

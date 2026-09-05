@@ -117,6 +117,21 @@ METRIC_DEFINE_event_stats(server, local_catalog_lag_us,
     "Local catalog lag", yb::MetricUnit::kMicroseconds,
     "The tserver clock minus C at the moment C is published.");
 
+METRIC_DEFINE_counter(server, local_catalog_pushes_received,
+    "Local catalog pushes received", yb::MetricUnit::kRequests,
+    "Number of lock releases that arrived carrying system catalog change records.");
+
+METRIC_DEFINE_counter(server, local_catalog_pushes_applied,
+    "Local catalog pushes applied", yb::MetricUnit::kRequests,
+    "Number of pushed system catalog batches this copy applied, each of which let a lock release "
+    "publish its catalog versions without waiting for a poll.");
+
+METRIC_DEFINE_counter(server, local_catalog_pushes_refused,
+    "Local catalog pushes refused", yb::MetricUnit::kRequests,
+    "Number of pushed system catalog batches this copy could not use, because the batch did not "
+    "continue its applied position, could not be parsed, or failed to apply. Each is followed by "
+    "an immediate poll and the release then waits for it.");
+
 METRIC_DEFINE_event_stats(server, local_catalog_gate_wait_us,
     "Local catalog version gate wait", yb::MetricUnit::kMicroseconds,
     "Time the object lock release handler waited for C to reach the hybrid time at which master "
@@ -171,6 +186,9 @@ void LocalCatalogReplica::Init() {
   apply_latency_ = METRIC_local_catalog_apply_latency_us.Instantiate(metric_entity_);
   lag_ = METRIC_local_catalog_lag_us.Instantiate(metric_entity_);
   gate_wait_ = METRIC_local_catalog_gate_wait_us.Instantiate(metric_entity_);
+  pushes_received_ = METRIC_local_catalog_pushes_received.Instantiate(metric_entity_);
+  pushes_applied_ = METRIC_local_catalog_pushes_applied.Instantiate(metric_entity_);
+  pushes_refused_ = METRIC_local_catalog_pushes_refused.Instantiate(metric_entity_);
 }
 
 bool LocalCatalogReplica::IsServing() const {
@@ -245,6 +263,28 @@ void LocalCatalogReplica::PublishAfterApply(
     }
   }
   cond_.notify_all();
+}
+
+Status LocalCatalogReplica::ApplyPushedBatch(
+    const cdc::GetSysCatalogChangesResponsePB& batch, CoarseTimePoint deadline) {
+  SCHECK(poller_, IllegalState, "The local catalog copy has no poller");
+  return poller_->ApplyPushedBatch(batch, deadline);
+}
+
+void LocalCatalogReplica::RequestImmediatePoll() {
+  if (poller_) {
+    poller_->RequestImmediatePoll();
+  }
+}
+
+void LocalCatalogReplica::SetAppliedOpId(const OpId& op_id) {
+  std::lock_guard lock(mutex_);
+  applied_op_id_ = op_id;
+}
+
+OpId LocalCatalogReplica::applied_op_id() const {
+  std::lock_guard lock(mutex_);
+  return applied_op_id_;
 }
 
 Status LocalCatalogReplica::WaitForAppliedVersion(
@@ -405,6 +445,12 @@ void LocalCatalogReplica::OnSafeTimePublished(HybridTime c) {
 void LocalCatalogReplica::IncPollFailures() { poll_failures_->Increment(); }
 void LocalCatalogReplica::IncApplyFailures() { apply_failures_->Increment(); }
 void LocalCatalogReplica::IncReadsServed() { reads_served_->Increment(); }
+
+void LocalCatalogReplica::IncPushesReceived() { pushes_received_->Increment(); }
+
+void LocalCatalogReplica::IncPushesApplied() { pushes_applied_->Increment(); }
+
+void LocalCatalogReplica::IncPushesRefused() { pushes_refused_->Increment(); }
 void LocalCatalogReplica::IncReadsWaitedForVersion() { reads_waited_for_version_->Increment(); }
 void LocalCatalogReplica::IncReadsWaitedForOwnWrites() {
   reads_waited_for_own_writes_->Increment();

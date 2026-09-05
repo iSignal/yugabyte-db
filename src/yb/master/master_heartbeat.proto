@@ -264,6 +264,11 @@ message TSHeartbeatRequestPB {
   // Per-database oldest read HybridTime pinned by live PG transactions on this tserver.
   // map[db_oid] -> earliest local live transaction registered for that db.
   map<uint32, YsqlDbOldestPinnedReadTime> ts_ysql_db_oldest_pinned_read_times = 24;
+
+  // The position in master's system catalog WAL that this tserver's local copy of that tablet has
+  // applied. Master uses it to decide which change records it can carry in a lock release to this
+  // tserver, and it is unset when the tserver has no copy.
+  optional OpIdPB local_catalog_applied_op_id = 25;
 }
 
 message TSHeartbeatResponsePB {

@@ -102,6 +102,13 @@ message GetSysCatalogChangesResponsePB {
   // Set when master stopped reading the WAL before its end, so the requestor should poll again
   // without waiting out its idle interval.
   optional bool have_more_messages = 3;
+
+  // The position the records were sliced from, set only when master carries this batch on a lock
+  // release rather than answering a poll. Everything above it and up to the batch's checkpoint is
+  // present, which is what lets the receiver decide whether the batch continues what it holds:
+  // not every WAL operation produces a record, so the first record's position says nothing about
+  // whether anything is missing.
+  optional OpIdPB slice_from = 4;
 }
 
 // Ships the master system catalog tablet's WAL to the tserver-local copies of it. Separate from
@@ -472,6 +479,12 @@ message CDCRecordPB {
   // Old vector IDs to tombstone on the target during UPDATE/DELETE.
   // See KeyValueWriteBatchPB.delete_vector_ids.
   optional bytes delete_vector_ids = 15;
+
+  // The WAL position of the operation this record came from. Populated only for the system catalog
+  // change stream, whose consumer needs it for two things a single-consumer stream does not: master
+  // slices one batch across tservers that sit at different positions, and a tserver receiving such
+  // a slice checks that it starts where its own applied position ends.
+  optional OpIdPB op_id = 16;
 }
 
 // CDCSDK: Column information used in case of DDL, as part of schema info

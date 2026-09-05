@@ -201,6 +201,14 @@ Status TSDescriptor::UpdateFromHeartbeat(const TSHeartbeatRequestPB& req,
       has_faulty_drive_ = req.faulty_drive();
     }
 
+    // How far this tserver's copy of the system catalog tablet has been applied, and when it said
+    // so. A lock release can carry change records only to a tserver whose report is recent enough
+    // to still describe where it is.
+    if (req.has_local_catalog_applied_op_id()) {
+      local_catalog_applied_op_id_ = OpId::FromPB(req.local_catalog_applied_op_id());
+      local_catalog_applied_op_id_time_ = last_heartbeat_;
+    }
+
     // Populate local per-tserver database pins from tserver heartbeat
     ts_ysql_db_oldest_pinned_read_times_.clear();
     for (const auto& [db_oid, pin] : req.ts_ysql_db_oldest_pinned_read_times()) {
@@ -219,6 +227,11 @@ Status TSDescriptor::UpdateFromHeartbeat(const TSHeartbeatRequestPB& req,
     lock.mutable_data()->pb.set_state(SysTabletServerEntryPB::LIVE);
   }
   return Status::OK();
+}
+
+std::pair<OpId, MonoTime> TSDescriptor::LocalCatalogAppliedOpId() const {
+  std::lock_guard l(mutex_);
+  return {local_catalog_applied_op_id_, local_catalog_applied_op_id_time_};
 }
 
 MonoDelta TSDescriptor::TimeSinceHeartbeat() const {

@@ -568,6 +568,17 @@ message ReleaseObjectLockRequestPB {
   // Distinct from apply_after_hybrid_time, which is a clock wait that orders this release after a
   // possibly outstanding acquire.
   optional fixed64 catalog_versions_read_time = 15;
+
+  // Change records for the receiving tserver's local copy of the master system catalog tablet, as
+  // a serialized cdc.GetSysCatalogChangesResponsePB: the records above that tserver's own applied
+  // position, the position they end at, and the safe time master certified for it. Applying them
+  // is what lets the receiving tserver pass the catalog_versions_read_time gate above without
+  // waiting for its own poll. Carried as bytes because tserver.proto cannot import
+  // cdc_service.proto, which already imports this file.
+  //
+  // Never persisted and never required: a tserver that receives none, or one it cannot use, waits
+  // for its poller exactly as it did before.
+  optional bytes local_catalog_changes = 16;
   // If any new field is added here. Do not forget to update
   // ReleaseRequestToPersist accordingly.
 }

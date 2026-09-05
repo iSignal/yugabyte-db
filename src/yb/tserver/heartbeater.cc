@@ -96,6 +96,10 @@ DEFINE_UNKNOWN_int32(heartbeat_max_failures_before_backoff, 3,
 TAG_FLAG(heartbeat_max_failures_before_backoff, advanced);
 
 DEFINE_test_flag(bool, tserver_disable_heartbeat, false, "Should heartbeat be disabled");
+
+DEFINE_test_flag(uint64, local_catalog_report_applied_op_id_ahead, 0,
+    "Add this many positions to the system catalog applied position this tserver reports, so that "
+    "master carries change records starting above what the local copy actually holds.");
 DEFINE_test_flag(bool, tserver_disable_catalog_refresh_on_heartbeat, false,
     "When set, disable trigger of catalog cache refresh from tserver-master heartbeat path.");
 
@@ -379,6 +383,20 @@ Status HeartbeatPoller::TryHeartbeat() {
     pins->clear();
     for (const auto& [db_oid, pin] : server_.GetYsqlDbOldestPinnedReadTimes()) {
       (*pins)[db_oid].set_db_level_oldest_read_time(pin.ToPB());
+    }
+  }
+
+  // Where the local copy has got to in master's system catalog WAL. Master needs it to decide
+  // which change records a lock release to this tserver can carry.
+  if (auto* local_catalog = server_.local_catalog_replica(); local_catalog) {
+    auto applied_op_id = local_catalog->applied_op_id();
+    if (!applied_op_id.empty()) {
+      // Reporting a position this copy has not reached is what a restart from a checkpoint file
+      // written before the last applies looks like to master, and it is the only way a pushed
+      // batch can arrive with a gap.
+      applied_op_id.index +=
+          static_cast<int64_t>(FLAGS_TEST_local_catalog_report_applied_op_id_ahead);
+      applied_op_id.ToPB(req.mutable_local_catalog_applied_op_id());
     }
   }
 

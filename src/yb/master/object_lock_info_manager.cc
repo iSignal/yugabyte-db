@@ -23,6 +23,8 @@
 
 #include <google/protobuf/util/message_differencer.h>
 
+#include "yb/cdc/sys_catalog_change_service.h"
+
 #include "yb/common/common_flags.h"
 #include "yb/common/pg_catversions.h"
 #include "yb/common/wire_protocol.h"
@@ -52,7 +54,9 @@
 #include "yb/util/countdown_latch.h"
 #include "yb/util/flags.h"
 #include "yb/util/format.h"
+
 #include "yb/util/logging.h"
+#include "yb/util/metrics.h"
 #include "yb/util/result.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/status_format.h"
@@ -86,10 +90,51 @@ DEFINE_test_flag(bool, allow_unknown_txn_release_request, false,
 DEFINE_test_flag(bool, pause_obj_lock_release_before_persist, false,
     "If true, pause before persisting release request acked from all tservers.");
 
+DEFINE_RUNTIME_bool(enable_local_catalog_release_push, false,
+    "Carry system catalog change records in the lock release sent to each tserver, so that a "
+    "tserver's local copy of the system catalog tablet can reach the release's catalog version "
+    "read time without waiting for its own poll of master. Off by default; correctness does not "
+    "depend on it, since a tserver that receives no records waits for its poller as before.");
+
+DEFINE_RUNTIME_uint32(local_catalog_release_push_max_bytes, 1024 * 1024,
+    "The most a lock release will carry in system catalog change records for one tserver. A "
+    "tserver whose records would exceed this is sent none and waits for its poller.");
+
+DEFINE_RUNTIME_uint32(local_catalog_release_push_max_lag_ops, 1000,
+    "How many system catalog WAL positions behind the furthest-ahead tserver a tserver may be and "
+    "still be carried change records. One tserver whose poller has stalled would otherwise drag "
+    "the fetch back to its position and leave master carrying nothing to anyone. Zero disables the "
+    "check.");
+
+DEFINE_RUNTIME_uint32(local_catalog_release_push_report_max_age_ms, 5000,
+    "How old a tserver's reported system catalog applied position may be and still be used to "
+    "decide which change records to carry to it. A tserver whose report is older than this, "
+    "including every tserver that has not yet heartbeated a new master leader, is sent none.");
+
+DECLARE_bool(enable_local_tserver_catalog);
 DECLARE_bool(enable_heartbeat_pg_catalog_versions_cache);
 DECLARE_int32(send_wait_for_report_interval_ms);
 DECLARE_bool(enable_object_locking_for_table_locks);
 DECLARE_bool(ysql_yb_enable_invalidation_messages);
+
+METRIC_DEFINE_counter(server, local_catalog_release_pushes_sent,
+    "Local catalog change pushes sent", yb::MetricUnit::kRequests,
+    "Number of lock releases that carried system catalog change records to a tserver.");
+
+METRIC_DEFINE_counter(server, local_catalog_release_pushes_skipped,
+    "Local catalog change pushes skipped", yb::MetricUnit::kRequests,
+    "Number of lock releases that carried no system catalog change records to a tserver that "
+    "could otherwise have had them: no fresh applied position reported, no safe time certified, "
+    "or a payload over local_catalog_release_push_max_bytes.");
+
+METRIC_DEFINE_event_stats(server, local_catalog_release_push_fetch_us,
+    "Local catalog change fetch time", yb::MetricUnit::kMicroseconds,
+    "Time master spends fetching system catalog change records for a lock release. This runs "
+    "synchronously on the release fan-out path, so it is added to every DDL's latency.");
+
+METRIC_DEFINE_counter(server, local_catalog_release_push_bytes,
+    "Local catalog change push bytes", yb::MetricUnit::kBytes,
+    "Total bytes of system catalog change records carried in lock releases.");
 
 namespace yb {
 namespace master {
@@ -147,10 +192,27 @@ class ObjectLockInfoManager::Impl {
         catalog_manager_(catalog_manager),
         clock_(master.clock()),
         poller_(std::bind(&Impl::CleanupExpiredLeaseEpochs, this)) {
+    pushes_sent_ = METRIC_local_catalog_release_pushes_sent.Instantiate(master_.metric_entity());
+    pushes_skipped_ =
+        METRIC_local_catalog_release_pushes_skipped.Instantiate(master_.metric_entity());
+    push_bytes_ = METRIC_local_catalog_release_push_bytes.Instantiate(master_.metric_entity());
+    push_fetch_us_ =
+        METRIC_local_catalog_release_push_fetch_us.Instantiate(master_.metric_entity());
     CHECK_OK(ThreadPoolBuilder("object_lock_info_manager").Build(&lock_manager_thread_pool_));
     local_lock_manager_ = std::make_shared<tserver::TSLocalLockManager>(
         clock_, master_.tablet_server(), master_, lock_manager_thread_pool_.get(),
         master_.metric_entity());
+  }
+
+  void IncLocalCatalogPushesSent(size_t bytes) {
+    pushes_sent_->Increment();
+    push_bytes_->IncrementBy(bytes);
+  }
+
+  void IncLocalCatalogPushesSkipped() { pushes_skipped_->Increment(); }
+
+  void RecordLocalCatalogPushFetch(MonoDelta duration) {
+    push_fetch_us_->Increment(duration.ToMicroseconds());
   }
 
   void Start() {
@@ -342,6 +404,11 @@ class ObjectLockInfoManager::Impl {
   std::unordered_map<TransactionId, TxnHostInfo> txn_host_info_map_ GUARDED_BY(mutex_);
   rpc::Poller poller_;
   std::unique_ptr<ThreadPool> lock_manager_thread_pool_;
+
+  scoped_refptr<Counter> pushes_sent_;
+  scoped_refptr<Counter> pushes_skipped_;
+  scoped_refptr<Counter> push_bytes_;
+  scoped_refptr<EventStats> push_fetch_us_;
   std::shared_ptr<tserver::TSLocalLockManager> local_lock_manager_ GUARDED_BY(mutex_);
   // Only accessed from a single thread for now, so no need for synchronization.
   std::unordered_map<TabletServerId, std::shared_ptr<CountDownLatch>>
@@ -361,6 +428,11 @@ class UpdateAll {
   virtual std::optional<uint64_t> GetLeaseEpoch(const std::string& uuid) = 0;
   virtual std::string LogPrefix() const = 0;
   virtual const ash::WaitStateInfoPtr& wait_state() const = 0;
+
+  // The system catalog change records this release carries to the named tserver, empty when it
+  // carries none. Serialized cdc::GetSysCatalogChangesResponsePB; see
+  // ReleaseObjectLockRequestPB::local_catalog_changes.
+  virtual std::string LocalCatalogPushFor(const std::string& uuid) const { return std::string(); }
 };
 
 template <class Req>
@@ -407,8 +479,18 @@ class UpdateAllTServers : public std::enable_shared_from_this<UpdateAllTServers<
 
   std::string LogPrefix() const override;
 
+  std::string LocalCatalogPushFor(const std::string& uuid) const override {
+    auto it = local_catalog_pushes_.find(uuid);
+    return it == local_catalog_pushes_.end() ? std::string() : it->second;
+  }
+
  private:
   void LaunchRpcs();
+
+  // Fetches one batch of system catalog change records covering every target that reported a
+  // fresh applied position, and slices it per target. Called once, before the release RPCs go
+  // out, and a no-op for anything but a release that carries catalog versions.
+  void PrepareLocalCatalogPushes();
   void LaunchRpcsFrom(size_t from_idx);
   void Done(size_t i, const Status& s);
   void CheckForDone();
@@ -425,6 +507,11 @@ class UpdateAllTServers : public std::enable_shared_from_this<UpdateAllTServers<
   CatalogManager& catalog_manager_;
   ObjectLockInfoManager::Impl& object_lock_info_manager_;
   TSDescriptorVector ts_descriptors_;
+
+  // Per-target change record payloads, keyed by tserver uuid. Filled once by
+  // PrepareLocalCatalogPushes and read by each target's task, so it is not mutated after the RPCs
+  // are launched.
+  std::unordered_map<std::string, std::string> local_catalog_pushes_;
   std::atomic<size_t> ts_pending_;
   std::vector<Status> statuses_;
   const Req req_;
@@ -591,6 +678,8 @@ bool CompareReleaseRequestsIgnoringCatalogFields(
   md.IgnoreField(req1.GetDescriptor()->FindFieldByName("populate_db_catalog_info"));
   // Set together with db_catalog_version_data, after the request has been persisted.
   md.IgnoreField(req1.GetDescriptor()->FindFieldByName("catalog_versions_read_time"));
+  // Per-recipient and transient: fetched at fan-out time and of no use to a retry after failover.
+  md.IgnoreField(req1.GetDescriptor()->FindFieldByName("local_catalog_changes"));
 
   if (diff_str) {
     md.ReportDifferencesToString(diff_str);
@@ -1680,10 +1769,137 @@ std::string UpdateAllTServers<Req>::LogPrefix() const {
 }
 
 template <class Req>
+void UpdateAllTServers<Req>::PrepareLocalCatalogPushes() {
+  if constexpr (!kIsReleaseRequest<Req>) {
+    return;
+  } else {
+    if (!FLAGS_enable_local_tserver_catalog || !FLAGS_enable_local_catalog_release_push) {
+      return;
+    }
+    // Only a release that publishes catalog versions has a gate to satisfy.
+    if (!req_.has_catalog_versions_read_time() || !req_.has_db_catalog_version_data()) {
+      return;
+    }
+    auto* change_service = master_.sys_catalog_change_service();
+    if (!change_service) {
+      return;
+    }
+
+    // A report older than this cannot be trusted to say where a tserver is, so that tserver is
+    // left to pull. Every tserver is in this state until it has heartbeated the current master
+    // leader.
+    const auto max_age =
+        MonoDelta::FromMilliseconds(FLAGS_local_catalog_release_push_report_max_age_ms);
+    const auto now = MonoTime::Now();
+    std::unordered_map<std::string, OpId> fresh_positions;
+    for (const auto& descriptor : ts_descriptors_) {
+      auto [op_id, reported_at] = descriptor->LocalCatalogAppliedOpId();
+      if (op_id.empty() || !reported_at.Initialized() || now - reported_at > max_age) {
+        // No usable statement of where that copy is, so it is left to pull.
+        object_lock_info_manager_.IncLocalCatalogPushesSkipped();
+        continue;
+      }
+      fresh_positions.emplace(descriptor->permanent_uuid(), op_id);
+    }
+    if (fresh_positions.empty()) {
+      return;
+    }
+
+    // One tserver whose poller has stalled but whose heartbeats still arrive would otherwise drag
+    // the fetch back to its position, and a batch that far back is truncated by the producer's
+    // own limits, comes back without a safe time, and leaves master carrying nothing to anyone.
+    // Stragglers are dropped instead and pull on their own.
+    int64_t highest = 0;
+    for (const auto& [uuid, op_id] : fresh_positions) {
+      highest = std::max(highest, op_id.index);
+    }
+    const auto max_lag = FLAGS_local_catalog_release_push_max_lag_ops;
+    OpId lowest;
+    for (auto it = fresh_positions.begin(); it != fresh_positions.end();) {
+      if (max_lag > 0 && it->second.index + static_cast<int64_t>(max_lag) < highest) {
+        VLOG_WITH_PREFIX(1) << "Not carrying system catalog change records to " << it->first
+                            << ", which is at " << it->second << " while others are at " << highest;
+        object_lock_info_manager_.IncLocalCatalogPushesSkipped();
+        it = fresh_positions.erase(it);
+        continue;
+      }
+      if (lowest.empty() || it->second.index < lowest.index) {
+        lowest = it->second;
+      }
+      ++it;
+    }
+    if (fresh_positions.empty()) {
+      return;
+    }
+
+    VLOG_WITH_PREFIX(1) << "Fetching system catalog change records from " << lowest << " for "
+                        << fresh_positions.size() << " of " << ts_descriptors_.size()
+                        << " targets with a fresh report";
+    cdc::GetSysCatalogChangesResponsePB batch;
+    const auto fetch_start = MonoTime::Now();
+    auto status = change_service->GetChangesForRelease(lowest, &batch, deadline_);
+    object_lock_info_manager_.RecordLocalCatalogPushFetch(MonoTime::Now() - fetch_start);
+    if (!status.ok() || batch.has_error()) {
+      VLOG_WITH_PREFIX(1) << "Not carrying system catalog change records: "
+                          << (status.ok() ? StatusFromPB(batch.error().status()).ToString()
+                                          : status.ToString());
+      return;
+    }
+    // Without a safe time there is nothing for the receiver to publish, so the push could not let
+    // the gate pass and is not worth its bytes.
+    if (!batch.changes().has_safe_hybrid_time()) {
+      // Typically because the batch was truncated and more remains, so the producer withholds the
+      // safe time until it has shipped up to the position it captured with it.
+      VLOG_WITH_PREFIX(1) << "Not carrying system catalog change records: master certified no "
+                          << "safe time for this batch"
+                          << (batch.have_more_messages() ? ", more remains to ship" : "");
+      for (size_t i = 0; i < fresh_positions.size(); ++i) {
+        object_lock_info_manager_.IncLocalCatalogPushesSkipped();
+      }
+      return;
+    }
+    const auto end = OpId::FromPB(batch.changes().checkpoint().op_id());
+
+    for (const auto& [uuid, applied] : fresh_positions) {
+      // Records are stamped with the position of the operation that produced them, and one
+      // operation's records all share it, so slicing on the index never splits an operation.
+      cdc::GetSysCatalogChangesResponsePB slice;
+      auto* changes = slice.mutable_changes();
+      changes->set_safe_hybrid_time(batch.changes().safe_hybrid_time());
+      *changes->mutable_checkpoint() = batch.changes().checkpoint();
+      // The receiver needs to know where this was sliced from: not every operation between here
+      // and the batch's end produced a record, so an empty or late-starting slice is not evidence
+      // that anything is missing.
+      applied.ToPB(slice.mutable_slice_from());
+      for (const auto& record : batch.changes().records()) {
+        if (OpId::FromPB(record.op_id()).index > applied.index) {
+          *changes->add_records() = record;
+        }
+      }
+      auto payload = slice.SerializeAsString();
+      if (payload.size() > FLAGS_local_catalog_release_push_max_bytes) {
+        VLOG_WITH_PREFIX(1) << "Not carrying " << payload.size() << " bytes of system catalog "
+                            << "change records to " << uuid << ", over the cap";
+        object_lock_info_manager_.IncLocalCatalogPushesSkipped();
+        continue;
+      }
+      VLOG_WITH_PREFIX(1) << "Carrying " << changes->records().size() << " system catalog change "
+                          << "records (" << payload.size() << " bytes) to " << uuid
+                          << ", which reported " << applied << "; batch is "
+                          << batch.changes().records().size() << " records ending at " << end;
+      object_lock_info_manager_.IncLocalCatalogPushesSent(payload.size());
+      local_catalog_pushes_.emplace(uuid, std::move(payload));
+    }
+  }
+}
+
+template <class Req>
 void UpdateAllTServers<Req>::LaunchRpcs() {
   // todo(zdrudi): special case for 0 tservers with a live lease. This doesn't work.
   ts_descriptors_ = object_lock_info_manager_.GetAllTSDescriptorsWithALiveLease();
   statuses_ = std::vector<Status>{ts_descriptors_.size(), STATUS(Uninitialized, "")};
+
+  PrepareLocalCatalogPushes();
 
   LaunchRpcsFrom(0);
 }
@@ -1892,10 +2108,16 @@ Req AddRecipientLeaseEpoch(const Req& req, uint64_t recipient_lease_epoch) {
 template <class Req, class Resp>
 Req UpdateTServer<Req, Resp>::request() const {
   auto recipient_lease_epoch = shared_all_tservers_->GetLeaseEpoch(permanent_uuid_);
-  if (recipient_lease_epoch.has_value()) {
-    return AddRecipientLeaseEpoch(shared_all_tservers_->request(), *recipient_lease_epoch);
+  auto req = recipient_lease_epoch.has_value()
+                 ? AddRecipientLeaseEpoch(shared_all_tservers_->request(), *recipient_lease_epoch)
+                 : shared_all_tservers_->request();
+  if constexpr (kIsReleaseRequest<Req>) {
+    auto push = shared_all_tservers_->LocalCatalogPushFor(permanent_uuid_);
+    if (!push.empty()) {
+      req.set_local_catalog_changes(std::move(push));
+    }
   }
-  return shared_all_tservers_->request();
+  return req;
 }
 
 template <class Req, class Resp>
