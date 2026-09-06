@@ -1343,3 +1343,56 @@ target mode without them. Carrying them in the diff changed the default mode for
 in the tree on the debug lanes, which is a plausible source of part of the 09-03 failure counts.
 Both files are therefore back to master's content, and the change no longer alters any flag
 default. The stack is rebased onto `002a8169830`.
+
+### What the 2026-09-03 run actually found
+
+Three of the four failure clusters on that run trace to the flag defaults above, and the fourth is
+a defect in this change.
+
+The flag-default cluster is the one that hurts. `ysql_enable_concurrent_ddl` carries
+`FLAG_REQUIRES_FLAG_VALIDATOR(enable_object_locking_for_table_locks)`, so once the change made it
+default to true, every test that starts a daemon with `--enable_object_locking_for_table_locks=false`
+failed flag validation and the daemon aborted before the test began:
+
+    [m-1] E0903 common_flags.cc:246] Invalid value '0' for flag
+      'enable_object_locking_for_table_locks': Required by ysql_enable_concurrent_ddl to be true
+    [m-1] F0903 flags.cc:689] Check failed: _s.ok()
+    Bad status: Failed to start masters.: Unable to start Master at index 0: rc=134
+
+That is `PgConcurrentCreateOrReplaceCrashTest.ConcurrentCreateOrReplaceWithDropCrash`,
+`TestPgRegressDDLIsolationNoTxnDDLNoObjectLocking.testWithHighHeartbeatDelay`,
+`PgMasterDDLReadRestartProbeTest.DDLStaleSafeTimeReadRestart` and
+`PgWaitQueuesTestWithoutObjectLocking.TestDDLHaveWaitStartTimeSet`.
+
+The residual failures -- `PgRowLockTest` (three tests), `TestPgExplicitLocks`,
+`PgObjecLocksTestOutOfOrderMessageHandling`, `PgCatalogVersionTest.DBCatalogVersion`,
+`SkipIntentsBasicTest` (two), the `PgLibPqTest` transaction-conflict tests and
+`YbAdminSnapshotScheduleTest.PgsqlCreateTable` -- were checked against the three scheduled master
+builds of the same day, on the same three lanes. None of them fails on master, which failed 2 to 6
+tests per lane against this change's 18, 16 and 14. They are all in lock or catalog-version
+semantics, which the reverted defaults changed for every test in the tree, so the next CI run is
+what settles whether the revert takes them with it.
+
+### `BootstrapReachesServing`: a pre-election poll cycle was counted as an apply failure
+
+The test asserts `local_catalog_apply_failures` is zero once every copy is serving, and CI saw 3 on
+the fastdebug lane and 4 on the release lane. The count matched, exactly, the number of times one
+tserver logged
+
+    LocalCatalogPoller: Failed to poll: Illegal state: The local catalog copy is not the leader of
+    its own single-peer group yet: -1 vs 0
+
+`MakeLocalCatalogTabletLeader` started the copy's election and then waited for
+`LeaderTerm() > 0` with `tablet_start_warn_threshold_ms`, a warning threshold of 500 ms pressed
+into service as a wait budget. Winning a single-voter election is decided locally but the term is
+only established when the new term's no-op commits, which on a loaded CI host takes longer than
+that. The wait then timed out, but the tablet peer was already stored, so the next cycle skipped
+setup, fetched records, and had every apply rejected for want of leadership -- once per second
+until the no-op committed, each rejection counted as a failure to apply catalog data.
+
+The fix removes the budget rather than raising it, because any value is wrong: a poll thread
+blocked on the commit applies nothing either. Both apply paths now check the condition before
+attempting anything. The poll path ends the cycle with `TryAgain`, which the scheduler already
+backs off on, and the push path answers the release with `IllegalState` so it waits for the poll,
+as it does whenever a copy cannot take a push. Neither touches the apply-failure counter, which
+goes back to meaning what the test asserts: catalog data that could not be applied.

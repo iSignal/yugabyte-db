@@ -168,6 +168,13 @@ Status LocalCatalogPoller::Poll() {
     return Status::OK();
   }
   RETURN_NOT_OK(EnsureLocalTablet());
+  // Nothing can be applied until this copy leads its own single-peer group, and winning that
+  // election is asynchronous: the term is only established once the new term's no-op commits. A
+  // cycle that runs before then would fetch records it must reject, so it ends here instead.
+  if (tablet_peer_->LeaderTerm() <= 0) {
+    VLOG_WITH_PREFIX(1) << "Waiting to lead the local catalog copy's own group before applying";
+    return STATUS(TryAgain, "The local catalog copy does not yet lead its own group");
+  }
   return FetchAndApplyOnce();
 }
 
@@ -509,6 +516,13 @@ void LocalCatalogPoller::ApplyPendingPush() {
     // and making the caller wait out its deadline for that would be pointless.
     CompletePendingPush(
         push, STATUS(IllegalState, "The local catalog copy has no tablet to apply a pushed batch"));
+    return;
+  }
+  if (tablet_peer_->LeaderTerm() <= 0) {
+    // Same condition the poll path checks, answered rather than attempted: the release that pushed
+    // this batch waits for the poll instead, and a rejection here is not a failure to apply.
+    CompletePendingPush(
+        push, STATUS(IllegalState, "The local catalog copy does not yet lead its own group"));
     return;
   }
   CompletePendingPush(push, DoApplyPushedBatch(push->batch));

@@ -2698,11 +2698,10 @@ Status TSTabletManager::MakeLocalCatalogTabletLeader(const TabletPeerPtr& tablet
         "Unable to make the local catalog copy leader of its own group");
   }
   // The election is asynchronous and LeaderTerm() stays unset until the new term's no-op is
-  // committed, so the poller's first apply would still race it and be rejected.
-  return WaitFor(
-      [&tablet_peer]() -> Result<bool> { return tablet_peer->LeaderTerm() > 0; },
-      MonoDelta::FromMilliseconds(FLAGS_tablet_start_warn_threshold_ms),
-      Format("Local catalog copy $0 to lead its own group", tablet_peer->tablet_id()));
+  // committed. Waiting for that here would need a budget, and any budget is wrong: on a loaded
+  // host the commit can take seconds, and a poll thread blocked on it applies nothing anyway. The
+  // poller checks the same condition before each apply instead.
+  return Status::OK();
 }
 
 Status TSTabletManager::DeleteLocalCatalogTablet(
