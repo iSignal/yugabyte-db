@@ -1306,3 +1306,40 @@ What should replace it is recorded as a TODO in implementation2.md: a tserver pa
 master long enough to lose its lease and to miss a DDL, then rejoining, with its copy withholding
 reads until it can prove it holds what it missed, asserting where the reads went rather than a
 counter.
+
+### CI on Phorge: the first run died in the rebase step, and why the flag defaults left the change
+
+The 2026-09-03 CI run of D57801 (diff 314667, the 44-file state) did execute the suites, 13.0k to
+13.8k items per lane, and failed 16 tests on `alma8-clang21-release`, 27 on `alma8-gcc15-fastdebug`
+and 28 on `alma9-clang21-asan`. The 2026-09-06 run (diff 315026, the 66-file state) never reached
+a test: each of the three lanes failed within minutes in a build step named `Rebase`, with one
+failed item and no `base_commit_id` attribute recorded.
+
+The Jenkins console shows the sequence. The job checks out the diff's base commit
+`94f5a6cd7dd`, applies all 66 files of the patch cleanly, and then merges the current tip of
+`origin/master` on top, because `yugabyte-db-phabricator` sets `YB_AUTO_REBASE=auto` for itself
+whatever the trigger asked for:
+
+    [18:18:09] YB_AUTO_REBASE=auto
+    [18:18:09] Setting YB_AUTO_REBASE=auto by default for job yugabyte-db-phabricator
+    [18:18:11] + git merge -m 'Merge origin/master' origin/master
+               CONFLICT (content): Merge conflict in src/yb/common/common_flags.cc
+               Automatic merge failed; fix conflicts and then commit the result.
+    [18:18:11] MERGE FAILED
+
+The conflicting file is one this change should never have touched. The first commit removed the
+`#ifdef NDEBUG` guards around `kEnableDdlTransactionBlocks` and
+`kEnableObjectLockingForTableLocks` in `src/yb/common/common_flags.cc`, and around the mirrored
+`kEnableDdlTransactionBlocks` macro in `src/yb/yql/pggate/util/ybc_guc.h`, and set
+`ysql_enable_concurrent_ddl` to true, so that a debug build would default to the object-locking
+plus concurrent-DDL mode this feature requires. Master's `bfa38fee338` ("[#29490] YSQL: Enable
+concurrent DDL by default [Part-2]") now rewrites the same two regions, hence the conflict.
+
+Those flips were never needed: the test fixture already passes
+`--enable_object_locking_for_table_locks=true`, `--ysql_enable_concurrent_ddl=true` and
+`--ysql_yb_ddl_transaction_block_enabled=true` to its own cluster
+(`src/yb/yql/pgwrapper/pg_local_catalog-test.cc:77-80`), so every test in this change runs in the
+target mode without them. Carrying them in the diff changed the default mode for every other test
+in the tree on the debug lanes, which is a plausible source of part of the 09-03 failure counts.
+Both files are therefore back to master's content, and the change no longer alters any flag
+default. The stack is rebased onto `002a8169830`.
