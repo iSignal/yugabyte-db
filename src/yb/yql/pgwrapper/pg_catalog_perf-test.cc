@@ -60,6 +60,7 @@ DECLARE_bool(ysql_enable_auto_analyze);
 DECLARE_string(ysql_catalog_preload_additional_table_list);
 DECLARE_uint64(TEST_pg_response_cache_catalog_read_time_usec);
 DECLARE_uint64(TEST_committed_history_cutoff_initial_value_usec);
+DECLARE_int32(TEST_ysql_catalog_read_delay_ms);
 DECLARE_uint32(pg_cache_response_renew_soft_lifetime_limit_ms);
 DECLARE_uint64(pg_response_cache_size_bytes);
 DECLARE_uint32(pg_response_cache_size_percentage);
@@ -497,10 +498,12 @@ TEST_F(PgCatalogPerfTest, StartupRPCCount) {
   ASSERT_EQ(subsequent_connect_rpc_count, kSubsequentConnectionRPCCount);
 }
 
-TEST_F(PgCatalogPerfTest, LargeSchemaCatalogPreloadRPCCount) {
+TEST_F(PgCatalogPerfTest, LargeSchemaCatalogPreloadWithLatency) {
+  google::FlagSaver flag_saver;
   auto conn = ASSERT_RESULT(Connect());
   constexpr size_t kTableCount = 100;
   constexpr size_t kMaterializedViewCount = 20;
+  constexpr int32_t kCatalogReadDelayMs = 100;
   for (size_t i = 0; i < kTableCount; ++i) {
     ASSERT_OK(conn.ExecuteFormat(
         "CREATE TABLE t_$0 (c0 INT, c1 INT, c2 INT, c3 INT, c4 INT, "
@@ -512,14 +515,18 @@ TEST_F(PgCatalogPerfTest, LargeSchemaCatalogPreloadRPCCount) {
   }
   ASSERT_OK(conn.Execute("ALTER TABLE t_0 ADD COLUMN c10 INT"));
 
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_ysql_catalog_read_delay_ms) = kCatalogReadDelayMs;
   const auto start = MonoTime::Now();
   const auto metrics = ASSERT_RESULT(metrics_->Delta([this] {
     RETURN_NOT_OK(Connect());
     return static_cast<Status>(Status::OK());
   }));
-  LOG(INFO) << "Large-schema connection after DDL took " << MonoTime::Now() - start;
+  const auto elapsed = MonoTime::Now() - start;
+  LOG(INFO) << "Large-schema connection after DDL took " << elapsed;
   // Two startup RPCs plus one batched catalog preload.
   ASSERT_EQ(metrics.master_read_rpc, kFirstConnectionRPCCountDefault);
+  ASSERT_GE(elapsed, kFirstConnectionRPCCountDefault * kCatalogReadDelayMs * 1ms);
+  ASSERT_LT(elapsed, 700ms);
 }
 
 // Test checks number of RPC in case of cache refresh without partitioned tables.
