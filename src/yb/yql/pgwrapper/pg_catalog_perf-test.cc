@@ -434,11 +434,11 @@ class PgCatalogWithStaleResponseCacheTest : public PgCatalogWithUnlimitedCachePe
   }
 };
 
-constexpr uint64_t kFirstConnectionRPCCountDefault = 6;
-constexpr uint64_t kFirstConnectionRPCCountWithAdditionalTables = 7;
-constexpr uint64_t kFirstConnectionRPCCountWithSmallPreload = 6;
+constexpr uint64_t kFirstConnectionRPCCountDefault = 3;
+constexpr uint64_t kFirstConnectionRPCCountWithAdditionalTables = 3;
+constexpr uint64_t kFirstConnectionRPCCountWithSmallPreload = 3;
 constexpr uint64_t kSubsequentConnectionRPCCount = 2;
-constexpr uint64_t kFirstConnectionRPCCountNoRelcacheFile = 7;
+constexpr uint64_t kFirstConnectionRPCCountNoRelcacheFile = 4;
 static_assert(kFirstConnectionRPCCountDefault <= kFirstConnectionRPCCountWithAdditionalTables);
 
 // Helper class to fetch number of client connection via pgsql proxy webserver.
@@ -519,7 +519,7 @@ TEST_F(PgCatalogPerfTest, LargeSchemaCatalogPreloadRPCCount) {
   }));
   LOG(INFO) << "Large-schema connection after DDL took " << MonoTime::Now() - start;
   // Two startup RPCs plus one batched catalog preload.
-  ASSERT_EQ(metrics.master_read_rpc, 3);
+  ASSERT_EQ(metrics.master_read_rpc, kFirstConnectionRPCCountDefault);
 }
 
 // Test checks number of RPC in case of cache refresh without partitioned tables.
