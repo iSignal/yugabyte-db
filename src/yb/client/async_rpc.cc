@@ -43,6 +43,7 @@
 #include "yb/rpc/outbound_call.h"
 #include "yb/rpc/rpc_controller.h"
 
+#include "yb/tserver/tserver_error.h"
 #include "yb/tserver/tserver_service.messages.h"
 #include "yb/tserver/tserver_service.proxy.h"
 
@@ -227,14 +228,32 @@ const char* StatusCodeName(Status::Code code) {
   return "Unknown";
 }
 
+// Prefer the tablet/RPC error code when present. Status::Code is too coarse: "not the leader"
+// is IllegalState, which also covers unrelated retries.
+std::string RetryReasonLabel(
+    const Status& status, tserver::TabletServerErrorPB::Code error_code) {
+  if (error_code == tserver::TabletServerErrorPB::UNKNOWN_ERROR) {
+    if (auto from_status = tserver::TabletServerError::ValueFromStatus(status)) {
+      error_code = *from_status;
+    }
+  }
+  if (error_code != tserver::TabletServerErrorPB::UNKNOWN_ERROR) {
+    return tserver::TabletServerErrorPB::Code_Name(error_code);
+  }
+  if (auto rpc_code = rpc::RpcError::ValueFromStatus(status)) {
+    return rpc::ErrorStatusPB::RpcErrorCodePB_Name(*rpc_code);
+  }
+  return StatusCodeName(status.code());
+}
+
 scoped_refptr<Counter> RetryReasonCounter(
-    const scoped_refptr<MetricEntity>& entity, AsyncRpcMetrics::Scope scope, Status::Code code) {
+    const scoped_refptr<MetricEntity>& entity, AsyncRpcMetrics::Scope scope,
+    const std::string& reason) {
   static simple_spinlock lock;
   static std::unordered_map<std::string, std::shared_ptr<OwningCounterPrototype>> prototypes;
 
   const char* entity_type = scope == AsyncRpcMetrics::Scope::kTable ? "table" : "server";
-  const char* code_name = StatusCodeName(code);
-  const auto metric_name = Format("yb_client_internal_retries_$0", code_name);
+  const auto metric_name = Format("yb_client_internal_retries_$0", reason);
   const auto key = Format("$0:$1", entity_type, metric_name);
 
   std::shared_ptr<OwningCounterPrototype> proto;
@@ -247,9 +266,9 @@ scoped_refptr<Counter> RetryReasonCounter(
       slot = std::make_shared<OwningCounterPrototype>(
           std::string(entity_type),
           metric_name,
-          Format("YB client internal retries ($0)", code_name),
+          Format("YB client internal retries ($0)", reason),
           MetricUnit::kRequests,
-          Format("Number of YB client internal tablet RPC retries due to $0", code_name),
+          Format("Number of YB client internal tablet RPC retries due to $0", reason),
           MetricLevel::kInfo,
           flags);
     }
@@ -299,10 +318,11 @@ AsyncRpcMetrics::AsyncRpcMetrics(const scoped_refptr<yb::MetricEntity>& metric_e
   internal_retries = METRIC_yb_client_internal_retries.Instantiate(metric_entity);
 }
 
-void AsyncRpcMetrics::IncrementRetry(const Status& status) {
+void AsyncRpcMetrics::IncrementRetry(
+    const Status& status, tserver::TabletServerErrorPB::Code error_code) {
   IncrementCounter(internal_retries);
   if (entity) {
-    IncrementCounter(RetryReasonCounter(entity, scope, status.code()));
+    IncrementCounter(RetryReasonCounter(entity, scope, RetryReasonLabel(status, error_code)));
   }
 }
 
@@ -400,12 +420,13 @@ void AsyncRpc::HandleFinished(RefCntBuffer data_holder, const Status& status) {
   retained_self_.reset();
 }
 
-void AsyncRpc::NotifyRetry(const Status& reason) {
+void AsyncRpc::NotifyRetry(
+    const Status& reason, tserver::TabletServerErrorPB::Code error_code) {
   if (async_rpc_metrics_) {
-    async_rpc_metrics_->IncrementRetry(reason);
+    async_rpc_metrics_->IncrementRetry(reason, error_code);
   }
   if (table_async_rpc_metrics_) {
-    table_async_rpc_metrics_->IncrementRetry(reason);
+    table_async_rpc_metrics_->IncrementRetry(reason, error_code);
   }
 }
 
@@ -1261,7 +1282,7 @@ void WaitForAsyncWriteRpc::FinishOrRetry(Status&& status, bool allow_retry) {
     const Status retry_reason = status;
     status = mutable_retrier()->DelayedRetry(this, status);
     if (status.ok()) {
-      NotifyRetry(retry_reason);
+      NotifyRetry(retry_reason, ErrorCode(response_error()));
       return;
     }
   }
@@ -1282,12 +1303,13 @@ void WaitForAsyncWriteRpc::Failed(const Status& status) {
   VLOG_WITH_FUNC(4) << ToString() << " status: " << status;
 }
 
-void WaitForAsyncWriteRpc::NotifyRetry(const Status& reason) {
+void WaitForAsyncWriteRpc::NotifyRetry(
+    const Status& reason, tserver::TabletServerErrorPB::Code error_code) {
   if (auto metrics = batcher_->async_rpc_metrics()) {
-    metrics->IncrementRetry(reason);
+    metrics->IncrementRetry(reason, error_code);
   }
   if (auto table_metrics = batcher_->client_->data_->GetTableAsyncRpcMetrics(*table_)) {
-    table_metrics->IncrementRetry(reason);
+    table_metrics->IncrementRetry(reason, error_code);
   }
 }
 

@@ -76,7 +76,12 @@ class TabletRpc {
   virtual void Failed(const Status& status) = 0;
 
   // Called when TabletInvoker schedules an internal retry of this RPC.
-  virtual void NotifyRetry(const Status& reason) {}
+  // error_code is the tablet-server error from the RPC response when present; UNKNOWN_ERROR
+  // otherwise. Prefer that over Status::Code so "not the leader" is NOT_THE_LEADER rather than
+  // IllegalState.
+  virtual void NotifyRetry(
+      const Status& reason,
+      tserver::TabletServerErrorPB_Code error_code = tserver::TabletServerErrorPB::UNKNOWN_ERROR) {}
 
   // attempt_num starts with 1.
   virtual void SendRpcToTserver(int attempt_num) = 0;

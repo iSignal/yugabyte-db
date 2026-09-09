@@ -371,7 +371,7 @@ Status TabletInvoker::FailToNewReplica(const Status& reason,
   if (!status.ok()) {
     LOG(WARNING) << "Failed to schedule retry on new replica: " << status;
   } else {
-    rpc_->NotifyRetry(reason);
+    rpc_->NotifyRetry(reason, error_code);
   }
   return status;
 }
@@ -513,7 +513,7 @@ bool TabletInvoker::Done(Status* status) {
       if (!retry_status.ok()) {
         command_->Finished(retry_status);
       } else {
-        rpc_->NotifyRetry(*status);
+        rpc_->NotifyRetry(*status, error_code);
       }
     }
     return false;

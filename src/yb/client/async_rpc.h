@@ -55,7 +55,9 @@ struct AsyncRpcMetrics {
   explicit AsyncRpcMetrics(
       const scoped_refptr<MetricEntity>& metric_entity, Scope scope = Scope::kServer);
 
-  void IncrementRetry(const Status& status);
+  void IncrementRetry(
+      const Status& status,
+      tserver::TabletServerErrorPB_Code error_code = tserver::TabletServerErrorPB::UNKNOWN_ERROR);
 
   scoped_refptr<Histogram> remote_write_rpc_time;
   scoped_refptr<Histogram> remote_read_rpc_time;
@@ -141,7 +143,8 @@ class AsyncRpc : public rpc::Rpc, public TabletRpc {
 
   void Failed(const Status& status) override;
 
-  void NotifyRetry(const Status& reason) override;
+  void NotifyRetry(
+      const Status& reason, tserver::TabletServerErrorPB_Code error_code) override;
 
   // Is this a local call?
   bool IsLocalCall() const;
@@ -264,7 +267,8 @@ class WaitForAsyncWriteRpc : public rpc::Rpc, public TabletRpc {
 
   void Failed(const Status& status) override;
 
-  void NotifyRetry(const Status& reason) override;
+  void NotifyRetry(
+      const Status& reason, tserver::TabletServerErrorPB_Code error_code) override;
 
  private:
   void OnKeyLookup(const Result<internal::RemoteTabletPtr>& result);
