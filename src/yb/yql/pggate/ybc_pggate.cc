@@ -120,7 +120,7 @@ namespace yb::pggate {
 namespace {
 
 constexpr uint64_t kCatalogPrefetchRowLimit = 0;
-constexpr uint64_t kCatalogPrefetchSizeLimit = 10_MB;
+constexpr uint64_t kCatalogPrefetchSizeLimit = 10 * 1024 * 1024;
 
 } // namespace
 
