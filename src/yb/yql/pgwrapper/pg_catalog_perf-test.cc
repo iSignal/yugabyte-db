@@ -515,7 +515,7 @@ TEST_F(PgCatalogPerfTest, LargeSchemaCatalogPreloadRPCCount) {
   const auto start = MonoTime::Now();
   const auto metrics = ASSERT_RESULT(metrics_->Delta([this] {
     RETURN_NOT_OK(Connect());
-    return Status::OK();
+    return static_cast<Status>(Status::OK());
   }));
   LOG(INFO) << "Large-schema connection after DDL took " << MonoTime::Now() - start;
   ASSERT_EQ(metrics.master_read_rpc, kFirstConnectionRPCCountDefault);
