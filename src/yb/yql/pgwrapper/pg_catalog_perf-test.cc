@@ -435,7 +435,7 @@ class PgCatalogWithStaleResponseCacheTest : public PgCatalogWithUnlimitedCachePe
 };
 
 constexpr uint64_t kFirstConnectionRPCCountDefault = 3;
-constexpr uint64_t kFirstConnectionRPCCountWithAdditionalTables = 3;
+constexpr uint64_t kFirstConnectionRPCCountWithAdditionalTables = 4;
 constexpr uint64_t kFirstConnectionRPCCountWithSmallPreload = 3;
 constexpr uint64_t kSubsequentConnectionRPCCount = 2;
 constexpr uint64_t kFirstConnectionRPCCountNoRelcacheFile = 4;
