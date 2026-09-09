@@ -497,6 +497,30 @@ TEST_F(PgCatalogPerfTest, StartupRPCCount) {
   ASSERT_EQ(subsequent_connect_rpc_count, kSubsequentConnectionRPCCount);
 }
 
+TEST_F(PgCatalogPerfTest, LargeSchemaCatalogPreloadRPCCount) {
+  auto conn = ASSERT_RESULT(Connect());
+  constexpr size_t kTableCount = 100;
+  constexpr size_t kMaterializedViewCount = 20;
+  for (size_t i = 0; i < kTableCount; ++i) {
+    ASSERT_OK(conn.ExecuteFormat(
+        "CREATE TABLE t_$0 (c0 INT, c1 INT, c2 INT, c3 INT, c4 INT, "
+        "c5 INT, c6 INT, c7 INT, c8 INT, c9 INT)", i));
+  }
+  for (size_t i = 0; i < kMaterializedViewCount; ++i) {
+    ASSERT_OK(conn.ExecuteFormat(
+        "CREATE MATERIALIZED VIEW mv_$0 AS SELECT * FROM t_$0 WITH NO DATA", i));
+  }
+  ASSERT_OK(conn.Execute("ALTER TABLE t_0 ADD COLUMN c10 INT"));
+
+  const auto start = MonoTime::Now();
+  const auto metrics = ASSERT_RESULT(metrics_->Delta([this] {
+    RETURN_NOT_OK(Connect());
+    return Status::OK();
+  }));
+  LOG(INFO) << "Large-schema connection after DDL took " << MonoTime::Now() - start;
+  ASSERT_EQ(metrics.master_read_rpc, kFirstConnectionRPCCountDefault);
+}
+
 // Test checks number of RPC in case of cache refresh without partitioned tables.
 TEST_F(PgCatalogPerfTest, CacheRefreshRPCCountWithoutPartitionTables) {
   const auto cache_refresh_rpc_count = ASSERT_RESULT(CacheRefreshRPCCount());
