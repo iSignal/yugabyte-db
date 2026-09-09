@@ -518,7 +518,8 @@ TEST_F(PgCatalogPerfTest, LargeSchemaCatalogPreloadRPCCount) {
     return static_cast<Status>(Status::OK());
   }));
   LOG(INFO) << "Large-schema connection after DDL took " << MonoTime::Now() - start;
-  ASSERT_EQ(metrics.master_read_rpc, kFirstConnectionRPCCountDefault);
+  // Two startup RPCs plus one batched catalog preload.
+  ASSERT_EQ(metrics.master_read_rpc, 3);
 }
 
 // Test checks number of RPC in case of cache refresh without partitioned tables.
