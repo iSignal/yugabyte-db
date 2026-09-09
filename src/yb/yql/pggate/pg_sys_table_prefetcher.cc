@@ -440,7 +440,7 @@ class Loader {
       Status remove_predicate_status;
       ResultFunctorAdapter<bool, OperationInfo&> remove_predicate(
           &remove_predicate_status,
-          [&response, data_container](OperationInfo& op_info) -> Result<bool> {
+          [&response, data_container, &options = options_](OperationInfo& op_info) -> Result<bool> {
             if (yb_debug_log_catcache_events) {
               LOG(INFO) << "Completed prefetch for op for table "
                         << op_info.table->table_name().table_name();
@@ -453,7 +453,13 @@ class Loader {
                        op_info.index ? op_info.index->relfilenode_id() : PgObjectId(),
                        &op_info.index_targets,
                        std::move(sidecar));
-            return !VERIFY_RESULT(PrepareNextRequest(*op_info.table, op_info.operation.get()));
+            if (!VERIFY_RESULT(PrepareNextRequest(*op_info.table, op_info.operation.get()))) {
+              return true;
+            }
+            auto& req = op_info.operation->read_request();
+            req.set_limit(options.fetch_row_limit);
+            req.set_size_limit(options.fetch_size_limit);
+            return false;
           }, true /* bad_status_value */);
       std::erase_if(op_info_, remove_predicate);
       RETURN_NOT_OK(remove_predicate_status);
@@ -466,6 +472,7 @@ class Loader {
     req->set_return_paging_state(true);
     req->set_is_forward_scan(true);
     req->set_limit(options_.fetch_row_limit);
+    req->set_size_limit(options_.fetch_size_limit);
   }
 
   PgSession* session_;
@@ -485,7 +492,7 @@ std::string PrefetcherOptions::CachingInfo::ToString() const {
 }
 
 std::string PrefetcherOptions::ToString() const {
-  return YB_STRUCT_TO_STRING(caching_info, fetch_row_limit);
+  return YB_STRUCT_TO_STRING(caching_info, fetch_row_limit, fetch_size_limit);
 }
 
 class PgSysTablePrefetcher::Impl {

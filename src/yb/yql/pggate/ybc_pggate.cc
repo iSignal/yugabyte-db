@@ -117,6 +117,13 @@ YbcRecordTempRelationDDL_hook_type YBCRecordTempRelationDDL_hook =
 
 namespace yb::pggate {
 
+namespace {
+
+constexpr uint64_t kCatalogPrefetchRowLimit = 0;
+constexpr uint64_t kCatalogPrefetchSizeLimit = 10_MB;
+
+} // namespace
+
 //--------------------------------------------------------------------------------------------------
 // C++ Implementation.
 // All C++ objects and structures in this module are listed in the following namespace.
@@ -279,7 +286,8 @@ Status GetSplitPoints(YbcPgTableDesc table_desc,
 }
 
 void YBCStartSysTablePrefetchingImpl(std::optional<PrefetcherOptions::CachingInfo> caching_info) {
-  pgapi->StartSysTablePrefetching({caching_info, implicit_cast<uint64_t>(yb_fetch_row_limit)});
+  pgapi->StartSysTablePrefetching(
+      {caching_info, kCatalogPrefetchRowLimit, kCatalogPrefetchSizeLimit});
 }
 
 PrefetchingCacheMode YBCMapPrefetcherCacheMode(YbcPgSysTablePrefetcherCacheMode mode) {
