@@ -1670,6 +1670,12 @@ TEST_F(PgLocalCatalogPushTest, AStragglerDoesNotDisableThePushForOthers) {
   ASSERT_OK(WaitForAppliedPositionReports());
   ASSERT_OK(cluster_->SetFlag(
       cluster_->GetLeaderMaster(), "local_catalog_release_push_max_lag_ops", "5"));
+  // Master skips a target whose reported position is older than this, and a heartbeat delayed
+  // past the five second default would then skip a healthy tserver for staleness rather than for
+  // the lag cap under test. The straggler is dropped by the cap either way: its heartbeats keep
+  // arriving, only the position they carry stops advancing.
+  ASSERT_OK(cluster_->SetFlag(
+      cluster_->GetLeaderMaster(), "local_catalog_release_push_report_max_age_ms", "60000"));
 
   ASSERT_OK(cluster_->SetFlag(&TServer(1), "TEST_local_catalog_disable_serving", "true"));
   ASSERT_OK(cluster_->SetFlag(&TServer(1), "TEST_local_catalog_pause_poller", "true"));
@@ -1679,8 +1685,23 @@ TEST_F(PgLocalCatalogPushTest, AStragglerDoesNotDisableThePushForOthers) {
       ASSERT_OK(conn.ExecuteFormat("CREATE TABLE straggler_$0 (k INT PRIMARY KEY)", i));
     }
   }
-  // Long enough for the straggler's now far-behind position to reach master.
-  SleepFor(3s * kTimeMultiplier);
+
+  // The straggler's frozen position has to reach master before the measured DDL, and a heartbeat
+  // carrying it can take seconds on a loaded host. Master drops a target only while preparing a
+  // release, so the wait runs its own DDLs and ends when master reports having dropped one.
+  {
+    auto conn = ASSERT_RESULT(ConnectTo(0));
+    int probe = 0;
+    ASSERT_OK(LoggedWaitFor(
+        [this, &conn, &probe]() -> Result<bool> {
+          const auto before = VERIFY_RESULT(
+              MasterCounter(METRIC_local_catalog_release_pushes_skipped));
+          RETURN_NOT_OK(conn.ExecuteFormat(
+              "CREATE TABLE straggler_probe_$0 (k INT PRIMARY KEY)", probe++));
+          return VERIFY_RESULT(MasterCounter(METRIC_local_catalog_release_pushes_skipped)) > before;
+        },
+        60s * kTimeMultiplier, "Master to drop the straggler from the fetch"));
+  }
 
   std::vector<int64_t> applied_before(GetNumTabletServers());
   for (int i = 0; i < GetNumTabletServers(); ++i) {

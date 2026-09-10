@@ -1396,3 +1396,35 @@ attempting anything. The poll path ends the cycle with `TryAgain`, which the sch
 backs off on, and the push path answers the release with `IllegalState` so it waits for the poll,
 as it does whenever a copy cannot take a push. Neither touches the apply-failure counter, which
 goes back to meaning what the test asserts: catalog data that could not be applied.
+
+### The straggler test's timing, and what the first clean CI run showed
+
+The run on diff 315613 (2026-09-10, base `dbbd541e661`) is the first that tested this change in
+master's own mode. One test failed unrecovered across the three lanes,
+`TestPgRegressParallel#testPgRegressBigParallel`, which was already failing on scheduled master
+builds b436 to b438. None of the eighteen failures from the 09-03 run came back, which settles the
+question left open there: the whole cluster was the flag defaults, including the three tests that
+neither `bfa38fee338` adapted nor a flag of their own protected.
+
+Getting there took two fixes the rebase itself demanded. Master's tip had moved 64 commits, and
+`remote_bootstrap_client.h` conflicted where both sides had added private members at the same
+point, which is a keep-both. Then `TSHeartbeatResponsePB` field 34, taken here for
+`db_catalog_versions_read_time`, had been taken upstream for `cluster_ysql_db_pins_ready`. Git
+merged that cleanly because the two declarations are different lines; `protoc` refused it. The
+field is renumbered to 36, and 35 and the request's 25 are clear, since master's response tops out
+at 34 and its request at 24.
+
+`AStragglerDoesNotDisableThePushForOthers` failed three of ten asan attempts on the same
+assertion, that a healthy tserver's `local_catalog_pushes_applied` moved. The cause is a second
+reason master can skip a target, distinct from the lag cap the test exercises: a reported position
+older than `local_catalog_release_push_report_max_age_ms`, five seconds by default, is not trusted
+and that target is left to pull. On a loaded sanitizer build a heartbeat can arrive later than
+that, so a healthy tserver was skipped for staleness and the test read it as the cap denying the
+push. The test now pins the age bound to 60 s, which does not weaken it: the straggler keeps
+heartbeating and is dropped by the cap on the position those heartbeats carry, not by staleness.
+
+The fixed three second sleep that preceded the measurement is also gone. It was waiting for the
+straggler's frozen position to reach master with no way to observe whether it had. Master drops a
+target only while preparing a release, so the wait now runs its own DDLs and ends when master's
+`local_catalog_release_pushes_skipped` moves, which is the direct evidence that the drop is
+happening.
