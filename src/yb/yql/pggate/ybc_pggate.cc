@@ -80,6 +80,7 @@
 #include "yb/yql/pggate/pg_global_view_read.h"
 #include "yb/yql/pggate/util/ybc-internal.h"
 #include "yb/yql/pggate/util/ybc_util.h"
+#include "yb/yql/pggate/ybc_gflags.h"
 #include "yb/yql/pggate/ybc_pg_typedefs.h"
 
 DEFINE_UNKNOWN_int32(pggate_num_connections_to_server, 1,
