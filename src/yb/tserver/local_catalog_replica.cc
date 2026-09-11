@@ -34,7 +34,16 @@
 DECLARE_bool(enable_object_locking_for_table_locks);
 DECLARE_bool(ysql_enable_concurrent_ddl);
 
-DEFINE_NON_RUNTIME_bool(enable_local_tserver_catalog, false,
+// CI EXPERIMENT, NOT FOR LANDING: default on wherever the mode this feature requires is on.
+// This mirrors the default of enable_object_locking_for_table_locks and ysql_enable_concurrent_ddl
+// in common_flags.cc, so the copy is on for the release lanes and the debug lanes, where object
+// locking is off, run as before.
+#ifdef NDEBUG
+constexpr bool kLocalTserverCatalogDefault = true;
+#else
+constexpr bool kLocalTserverCatalogDefault = false;
+#endif
+DEFINE_NON_RUNTIME_bool(enable_local_tserver_catalog, kLocalTserverCatalogDefault,
     "Serve YSQL catalog reads from a tserver-local DocDB copy of the master system catalog "
     "tablet instead of sending them to master. The copy is kept current by pulling the master "
     "system catalog tablet's WAL; master remains the only writer.");
