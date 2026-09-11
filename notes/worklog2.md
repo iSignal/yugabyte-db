@@ -1428,3 +1428,45 @@ straggler's frozen position to reach master with no way to observe whether it ha
 target only while preparing a release, so the wait now runs its own DDLs and ends when master's
 `local_catalog_release_pushes_skipped` moves, which is the direct evidence that the drop is
 happening.
+
+### What running the whole suite with the feature on found
+
+D57801's own CI says little about the feature, because `enable_local_tserver_catalog` defaults off
+and only `pg_local_catalog-test` turns it on. D58090 is a throwaway revision carrying this stack
+plus a commit that defaults the flag on under `NDEBUG`, so the release lane ran its entire suite
+with catalog reads served from the copy. Against a no-flip run of the same stack, which had one
+unrecovered failure, the release lane failed 201, of which 188 were new. They fall into four
+groups, and only one of them is a defect in the feature.
+
+**Tests that turn object locking off, about 80 of them.** The flip left the copy serving in a mode
+the design does not support, since its correctness rests on object locking serializing DDL against
+catalog readers. 68 are in `pg_vector_index-test`, whose fixture sets
+`enable_object_locking_for_table_locks = false`. Their signature is a backend timing out after 30 s
+in `Database <oid> is not ready in Yugabyte shared memory`. This is the experiment's own doing, but
+it exposed a real gap: nothing stopped a user from the same configuration. Both start sites now
+check `LocalCatalogPrerequisitesMet()`.
+
+**A read point written into somebody else's transaction.** `YBSession::read_point()` returns the
+attached transaction's read point when there is one, so pinning a catalog snapshot to C set the
+transaction's read time to the copy's safe time. A serializable transaction must carry no read
+time at all, so its next write was rejected outright; a snapshot isolation transaction would have
+read user data at a time that trails the present by the poll interval and the change stream's
+throttle. The fix routes a catalog read to master when it would have to choose the time and a
+transaction is attached. Verified locally, each test run on its own: all four parameterisations of
+`PgReadAfterCommitVisibilityDdlTest.DeferredModeAddCheckConstraint` pass, including the
+serializable one that failed; `TransactionDuringPITR` and `Pgsql/DBColocated_PITR` pass, the latter
+being one of the 600 s connection hangs; and the feature's own 47 tests still pass, including every
+assertion on the routing counters.
+
+**Tests that count catalog RPCs to master.** `TestPgFollowerReads.testPgSysCatalogNoFollowerReads`
+reads `Expected 167 to be greater than 167` and
+`PgCatalogVersionConnManagerTest.TestConnectionManagerRelCacheInitRpcCount` reads `Which is: 0`.
+The count did not rise because the copy answered the read. These assertions become wrong the day
+the feature ships on, and are not wrong today.
+
+**Tests that dump every DocDB write on the node.** `conflict_resolve_keys_verification-itest` sets
+`TEST_file_to_dump_docdb_writes` and compares the dump against a golden file. The copy's applies
+are writes on that node, so five lines of a system catalog row appear that the golden file cannot
+contain, and all 17 of that binary's failures are this. Excluding the private copy from that dump
+would fix it, in the same spirit as its exclusion from `tablet_map_`, the metadata validator, CDC
+registration and load balancer moves.
