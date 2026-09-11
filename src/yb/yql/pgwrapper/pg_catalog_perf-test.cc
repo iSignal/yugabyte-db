@@ -60,7 +60,7 @@ DECLARE_bool(ysql_enable_auto_analyze);
 DECLARE_string(ysql_catalog_preload_additional_table_list);
 DECLARE_uint64(TEST_pg_response_cache_catalog_read_time_usec);
 DECLARE_uint64(TEST_committed_history_cutoff_initial_value_usec);
-DECLARE_int32(TEST_ysql_catalog_read_delay_ms);
+DECLARE_uint64(TEST_ysql_catalog_read_delay_ms);
 DECLARE_uint32(pg_cache_response_renew_soft_lifetime_limit_ms);
 DECLARE_uint64(pg_response_cache_size_bytes);
 DECLARE_uint32(pg_response_cache_size_percentage);
@@ -98,6 +98,7 @@ struct Configuration {
   const bool use_relcache_file = true;
   const bool enable_invalidation_messages = false;
   const bool enable_read_request_cache_for_connection_auth = false;
+  const uint64_t catalog_read_delay_ms = 0;
 };
 
 struct MetricCounters {
@@ -189,6 +190,8 @@ class PgCatalogPerfTestBase : public PgMiniTestBase {
     // queires. Disable auto-analyze for more stable test results.
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_enable_auto_analyze) = false;
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_enable_relcache_init_optimization) = false;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_ysql_catalog_read_delay_ms) =
+        config.catalog_read_delay_ms;
     PgMiniTestBase::SetUp();
     metrics_.emplace(*cluster_->mini_master()->master()->metric_entity(),
                      *cluster_->mini_tablet_server(0)->server()->metric_entity());
@@ -334,8 +337,12 @@ constexpr auto kExtendedTableList =
 constexpr auto kShortTableList = "pg_inherits"sv;
 constexpr auto kStatsTableList = "pg_statistic,pg_statistic_ext,pg_statistic_ext_data"sv;
 constexpr auto kAggregateTableList = "pg_aggregate"sv;
+constexpr uint64_t kCatalogReadDelayMs = 100;
 
 constexpr Configuration kConfigDefault;
+
+constexpr Configuration kConfigCatalogReadDelay{
+    .catalog_read_delay_ms = kCatalogReadDelayMs};
 
 constexpr Configuration kConfigMinPreload{.minimal_catalog_caches_preload = true};
 
@@ -397,6 +404,8 @@ class ConfigurableTest : public Base {
 };
 
 using PgCatalogPerfTest = ConfigurableTest<PgCatalogPerfBasicTest, kConfigDefault>;
+using PgCatalogLatencyTest =
+    ConfigurableTest<PgCatalogPerfBasicTest, kConfigCatalogReadDelay>;
 using PgCatalogMinPreloadTest = ConfigurableTest<PgCatalogPerfBasicTest, kConfigMinPreload>;
 using PgStatsPreloadTest = ConfigurableTest<PgCatalogPerfBasicTest, kConfigStatsPreload>;
 using PgAggregatePreloadTest = ConfigurableTest<PgCatalogPerfBasicTest, kConfigAggregatePreload>;
@@ -498,12 +507,10 @@ TEST_F(PgCatalogPerfTest, StartupRPCCount) {
   ASSERT_EQ(subsequent_connect_rpc_count, kSubsequentConnectionRPCCount);
 }
 
-TEST_F(PgCatalogPerfTest, LargeSchemaCatalogPreloadWithLatency) {
-  google::FlagSaver flag_saver;
+TEST_F_EX(PgCatalogPerfTest, LargeSchemaCatalogPreloadWithLatency, PgCatalogLatencyTest) {
   auto conn = ASSERT_RESULT(Connect());
   constexpr size_t kTableCount = 100;
   constexpr size_t kMaterializedViewCount = 20;
-  constexpr int32_t kCatalogReadDelayMs = 100;
   for (size_t i = 0; i < kTableCount; ++i) {
     ASSERT_OK(conn.ExecuteFormat(
         "CREATE TABLE t_$0 (c0 INT, c1 INT, c2 INT, c3 INT, c4 INT, "
@@ -515,7 +522,6 @@ TEST_F(PgCatalogPerfTest, LargeSchemaCatalogPreloadWithLatency) {
   }
   ASSERT_OK(conn.Execute("ALTER TABLE t_0 ADD COLUMN c10 INT"));
 
-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_ysql_catalog_read_delay_ms) = kCatalogReadDelayMs;
   const auto start = MonoTime::Now();
   const auto metrics = ASSERT_RESULT(metrics_->Delta([this] {
     RETURN_NOT_OK(Connect());

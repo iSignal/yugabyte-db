@@ -73,8 +73,6 @@
 #include "yb/gutil/stringprintf.h"
 #include "yb/gutil/strings/escaping.h"
 
-#include "yb/master/sys_catalog_constants.h"
-
 #include "yb/qlexpr/index.h"
 #include "yb/qlexpr/ql_rowblock.h"
 
@@ -182,9 +180,6 @@ DEFINE_RUNTIME_bool(yb_fail_catalog_write_on_catalog_version_mismatch, false,
     "other catalog write) bumps the catalog version, even on a completely different table. "
     "If enable_object_locking_for_table_locks is true, then this safety check is not required and "
     "has no effect even if enabled.");
-
-DEFINE_test_flag(int32, ysql_catalog_read_delay_ms, 0,
-    "Delay reads from the YSQL sys catalog tablet.");
 
 DEFINE_test_flag(bool, tserver_noop_read_write, false, "Respond NOOP to read/write.");
 
@@ -2800,11 +2795,6 @@ void TabletServiceImpl::WaitForAsyncWrite(
 void TabletServiceImpl::Read(const ReadRequestMsg* req,
                              ReadResponseMsg* resp,
                              rpc::RpcContext context) {
-  if (PREDICT_FALSE(
-          FLAGS_TEST_ysql_catalog_read_delay_ms > 0 &&
-          req->tablet_id() == master::kSysCatalogTabletId)) {
-    SleepFor(FLAGS_TEST_ysql_catalog_read_delay_ms * 1ms);
-  }
 #ifndef NDEBUG
   if (PREDICT_FALSE(FLAGS_TEST_wait_row_mark_exclusive_count > 0)) {
     for (const auto& pgsql_req : req->pgsql_batch()) {
