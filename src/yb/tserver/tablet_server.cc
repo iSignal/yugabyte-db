@@ -285,6 +285,7 @@ DEFINE_validator(history_retention_pins_persist_interval_sec, FLAG_GT_VALUE_VALI
 
 DECLARE_bool(enable_db_history_retention_pins);
 DECLARE_bool(enable_object_locking_for_table_locks);
+DECLARE_bool(ysql_enable_concurrent_ddl);
 DECLARE_bool(enable_object_lock_fastpath);
 DECLARE_bool(enable_qos);
 DECLARE_bool(qos_system_dbs_use_shared_pool);
@@ -931,8 +932,18 @@ Status TabletServer::Start() {
   // Created before the services so that PgClientServiceImpl can capture it; the poll thread is
   // started further down, once the tablet manager can open the copy's tablet.
   if (FLAGS_enable_local_tserver_catalog) {
-    local_catalog_replica_ = std::make_unique<LocalCatalogReplica>(*this, metric_entity());
-    local_catalog_replica_->Init();
+    if (LocalCatalogPrerequisitesMet()) {
+      local_catalog_replica_ = std::make_unique<LocalCatalogReplica>(*this, metric_entity());
+      local_catalog_replica_->Init();
+    } else {
+      LOG(WARNING) << "Not serving catalog reads from a local copy of the master system catalog "
+                   << "tablet: enable_local_tserver_catalog is set, but the copy's correctness "
+                   << "rests on object locking serializing DDL against catalog readers, and "
+                   << "enable_object_locking_for_table_locks is "
+                   << FLAGS_enable_object_locking_for_table_locks
+                   << " with ysql_enable_concurrent_ddl " << FLAGS_ysql_enable_concurrent_ddl
+                   << ". Catalog reads go to master.";
+    }
   }
 
   RETURN_NOT_OK(RegisterServices());

@@ -76,6 +76,12 @@ std::string LocalCatalogHybridTimeForLog(HybridTime ht);
 //                and no row committed above C is.
 //   A[db_oid]  - the highest catalog version of database db_oid whose DDL transaction has been
 //                applied locally.
+// Whether the flags the tserver-local copy of the master system catalog tablet depends on are
+// set. The copy's correctness rests on object locking serializing DDL against catalog readers and
+// on DDL running in the user's transaction, so with either off the copy must not serve and
+// catalog reads stay on the master path.
+bool LocalCatalogPrerequisitesMet();
+
 class LocalCatalogReplica {
  public:
   LocalCatalogReplica(TabletServer& server, const scoped_refptr<MetricEntity>& metric_entity);

@@ -31,6 +31,9 @@
 #include "yb/util/thread.h"
 #include "yb/util/unique_lock.h"
 
+DECLARE_bool(enable_object_locking_for_table_locks);
+DECLARE_bool(ysql_enable_concurrent_ddl);
+
 DEFINE_NON_RUNTIME_bool(enable_local_tserver_catalog, false,
     "Serve YSQL catalog reads from a tserver-local DocDB copy of the master system catalog "
     "tablet instead of sending them to master. The copy is kept current by pulling the master "
@@ -138,6 +141,10 @@ METRIC_DEFINE_event_stats(server, local_catalog_gate_wait_us,
     "read the catalog versions it is publishing.");
 
 namespace yb::tserver {
+
+bool LocalCatalogPrerequisitesMet() {
+  return FLAGS_enable_object_locking_for_table_locks && FLAGS_ysql_enable_concurrent_ddl;
+}
 
 const char* const kLocalCatalogTabletId = "00000000000000000000000000000001";
 

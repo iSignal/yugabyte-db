@@ -52,6 +52,8 @@
 #include "yb/master/clone/clone_state_manager.h"
 #include "yb/master/flush_manager.h"
 #include "yb/master/master_auto_flags_manager.h"
+
+#include "yb/tserver/local_catalog_replica.h"
 #include "yb/master/master_backup.service.h"
 #include "yb/master/master_cluster_handler.h"
 #include "yb/master/master_cluster.proxy.h"
@@ -334,7 +336,7 @@ Status Master::RegisterServices() {
     RETURN_NOT_OK(RegisterService(FLAGS_master_xrepl_svc_queue_length, cdc_service));
   }
 
-  if (FLAGS_enable_local_tserver_catalog) {
+  if (FLAGS_enable_local_tserver_catalog && tserver::LocalCatalogPrerequisitesMet()) {
     // Tservers pull the system catalog tablet's WAL through this service to keep their local
     // copies of it current. It is high priority for the same reason the ysql lease service is: a
     // DDL's client is not told the DDL succeeded until every tserver has acknowledged the lock
