@@ -1446,17 +1446,85 @@ in `Database <oid> is not ready in Yugabyte shared memory`. This is the experime
 it exposed a real gap: nothing stopped a user from the same configuration. Both start sites now
 check `LocalCatalogPrerequisitesMet()`.
 
-**A read point written into somebody else's transaction.** `YBSession::read_point()` returns the
-attached transaction's read point when there is one, so pinning a catalog snapshot to C set the
-transaction's read time to the copy's safe time. A serializable transaction must carry no read
-time at all, so its next write was rejected outright; a snapshot isolation transaction would have
-read user data at a time that trails the present by the poll interval and the change stream's
-throttle. The fix routes a catalog read to master when it would have to choose the time and a
-transaction is attached. Verified locally, each test run on its own: all four parameterisations of
-`PgReadAfterCommitVisibilityDdlTest.DeferredModeAddCheckConstraint` pass, including the
-serializable one that failed; `TransactionDuringPITR` and `Pgsql/DBColocated_PITR` pass, the latter
-being one of the 600 s connection hangs; and the feature's own 47 tests still pass, including every
-assertion on the routing counters.
+**The catalog snapshot's time was taken from, and written to, the attached transaction's read
+point.** `YBSession::read_point()` (`src/yb/client/session.cc:305-312`) returns the attached
+transaction's own `ConsistentReadPoint` whenever a transaction exists, and
+`TryServeCatalogReadsLocally` used that read point for both halves of its work. Each half was
+wrong in a different way.
+
+Reading it. A PG catalog snapshot carries its own read time serial number, separate from the
+transaction's, and the session moves between the two by saving the read point under the outgoing
+serial number and restoring it under the incoming one in `SetupPlainSessionReadTime`
+(`src/yb/tserver/pg_client_session.cc:4287-4304`). `ReadPointHistory::Restore`
+(`src/yb/tserver/pg_client_session_util.h:123-136`) leaves the read point untouched when the
+incoming serial number has no saved entry, which is the case on a catalog snapshot's first read.
+The read point therefore still held the transaction's read time, and the code took that as the
+catalog snapshot's existing time: it either read the copy at the transaction's snapshot time or
+compared the transaction's time against C and routed to master. The catalog snapshot's time must
+come from the catalog snapshot.
+
+Writing it. `session.SetReadPoint(read_time)` put C on the transaction's read point. A
+serializable transaction must carry no read time at all, so the next operation on that session was
+rejected at `src/yb/client/async_rpc.cc:496`, "Read time should NOT be specified for serializable
+isolation", and the process aborted. A snapshot isolation transaction would instead have its read
+point replaced by a `ReadHybridTime::SingleTime`, which drops the local, global and in-transaction
+limits that bound its uncertainty window.
+
+The fix holds the pinned time in the session against the catalog snapshot's own read time serial
+number, in `local_catalog_read_time_serial_no_` and `local_catalog_read_time_`. With a transaction
+attached that record is the only source consulted and the session's read point is not touched.
+With no transaction attached the session's read point still carries the catalog snapshot's time,
+because there is no other snapshot on it, so it is read and written exactly as before; that is what
+makes a later read of the same snapshot that master has to answer run at the same time.
+`ResetReadPoint` drops the record along with the read point. Nothing else needed the read point:
+`PrepareLocalCatalogRead` already receives the time as an argument.
+
+The failing parameterisation is
+`DeferredModeAddCheckConstraint/TransactionalDdlInSerializableTxn`, not the serializable one
+without transactional DDL. `PgReadAfterCommitVisibilityDdlTest::SetUp` drives
+`enable_object_locking_for_table_locks` and `ysql_enable_concurrent_ddl` from its `transactional_ddl`
+parameter, so only the two `TransactionalDdl*` parameterisations meet `LocalCatalogPrerequisitesMet()`
+and start the copy at all.
+
+Verified locally against the fix, each binary run on its own, never two at a time, with
+`--enable_local_tserver_catalog=true`:
+
+- All four parameterisations of `PgReadAfterCommitVisibilityDdlTest.DeferredModeAddCheckConstraint`
+  pass, including `TransactionalDdlInSerializableTxn`, which is the one that aborted. No
+  `Read time should NOT be specified for serializable isolation` fatal appears in any of the four
+  runs.
+- `pg_local_catalog-test` passes all 47 of its tests.
+- `YbAdminSnapshotScheduleTestWithYsql.TransactionDuringPITR` passes, with the copy confirmed
+  serving on all three tservers.
+- `TransactionDuringPITRRepro23399` and `Pgsql/DBColocated_PITR` in
+  `yb-admin-snapshot-schedule-test` are still to be re-run.
+
+Reproducing the D58090 lane in a fastdebug build takes more than
+`--enable_local_tserver_catalog=true`. Both prerequisites default to the value of
+`kEnableDdlTransactionBlocks`, which `src/yb/common/common_flags.cc:169-173` defines as true only
+under `NDEBUG`, so in a fastdebug build they are off and `LocalCatalogPrerequisitesMet()`
+(`src/yb/tserver/local_catalog_replica.cc:154`) refuses to start the copy. A test that does not set
+them itself, which is every test outside `pg_local_catalog-test` and
+`pg_read_after_commit_visibility-test`, therefore runs with no copy at all, and its pass proves
+nothing about the feature. The first `TransactionDuringPITR` run here was void for exactly that
+reason: it passed in 17.7 s with zero `local_catalog_replica` lines in the log. The daemons need the
+whole ladder, which is the one `pg_local_catalog-test` installs:
+
+```
+--enable_local_tserver_catalog=true
+--ysql_yb_enable_invalidation_messages=true
+--enable_object_locking_for_table_locks=true
+--allowed_preview_flags_csv=ysql_enable_concurrent_ddl
+--ysql_enable_concurrent_ddl=true
+--ysql_yb_ddl_transaction_block_enabled=true
+```
+
+`yb_build.sh --extra-daemon-flags` carries them to master and tserver through the
+`YB_EXTRA_DAEMON_FLAGS` environment variable, which `ExternalDaemon::StartProcess`
+(`src/yb/integration-tests/external_daemon.cc:333`) appends last, after the fixture's own flags, so
+they win. Every run below is confirmed against the
+`local_catalog_replica.cc:227 Serving state kBootstrapping -> kServing` line in the log rather than
+against the test's exit status alone.
 
 **Tests that count catalog RPCs to master.** `TestPgFollowerReads.testPgSysCatalogNoFollowerReads`
 reads `Expected 167 to be greater than 167` and
@@ -1470,3 +1538,342 @@ are writes on that node, so five lines of a system catalog row appear that the g
 contain, and all 17 of that binary's failures are this. Excluding the private copy from that dump
 would fix it, in the same spirit as its exclusion from `tablet_map_`, the metadata validator, CDC
 registration and load balancer moves.
+
+**Tests that restore master's system catalog with PITR.** `yb-admin-snapshot-schedule-test` failed
+39 of the 188. The two that were held back above were run here, and the first one names a pair of
+real defects.
+
+### A master PITR restore never reaches the copy, and the version wait then holds the query for the whole request deadline
+
+`YbAdminSnapshotScheduleTestWithYsql.TransactionDuringPITRRepro23399` fails with the ladder on and
+passes in 16399 ms with `--enable_local_tserver_catalog=false` on the same fixture, with no
+`local_catalog` line in the log. The account below comes from one failing
+run with `--vmodule=pg_client_session=2,local_catalog_replica=2,local_catalog_poller=1` plus a gdb
+thread dump of all three tservers taken while the stall was in progress.
+
+A point-in-time restore of master's system catalog raises `pg_yb_catalog_version` as part of the
+restore itself. On m-3 at 02:51:40.974220, `restore_sys_catalog_state.cc:206` logged `PITR:
+Incrementing pg_yb_catalog version of DocPath(DocKey(CoTableId=...1f4a, [], [16384]), [ColumnId(1)])
+to 4`, and all three masters logged the same increment, because each of them recomputes the restored
+rows locally while it applies the restore.
+
+That is the point: the restore's rows are computed during apply and written straight to RocksDB,
+never as a replicated write. `CatalogManager::RestoreSysCatalogFastPitr`
+(`src/yb/master/catalog_manager_ext.cc:3161-3216`) fills a `docdb::DocWriteBatch` while it applies
+the `RESTORE_SYS_CATALOG` operation, then hands it to `RestoreSysCatalogState::WriteToRocksDB`
+(`src/yb/master/restore_sys_catalog_state.cc:933-938`), which calls `yb::WriteToRocksDB`
+(`src/yb/tablet/restore_util.cc:346-365`). That helper moves the batch into a `rocksdb::WriteBatch`,
+stamps hand-built consensus frontiers with the restore's own op id and hybrid time, and writes it
+through `Tablet::WriteToRocksDB`. No `WriteOperation` is submitted and no second consensus round
+happens, so the only WAL entry the whole restore leaves behind is the snapshot operation itself,
+op id 1.724 (`master_snapshot_coordinator.cc:605`, 02:51:40.928689), whose payload is the restore
+request and not the rows.
+
+The change stream discards that entry. `GetChangesForXCluster` switches on each replicate message's
+operation type and produces records only for `UPDATE_TRANSACTION_OP`, `WRITE_OP`, `SPLIT_OP` and
+`CHANGE_METADATA_OP` (`src/yb/cdc/xcluster_producer.cc:404-424`); a snapshot operation falls through
+to `default:` and yields nothing, while the loop still advances the checkpoint past it. ts-1's
+poller went from WAL position 1.723 to 1.728 in one cycle, applying four `sys.catalog` rows and
+nothing else (`local_catalog_poller.cc:383`, 02:51:42.559219), and its applied version for database
+16384 stayed at 3 from then on, still 3 in the last poll cycle of the run at 02:54:34.839058.
+
+Master meanwhile publishes version 4 to every tserver by heartbeat 1.1 s after the restore:
+`tablet_server.cc:2360`, `Invalidating db PgTableCache caches since catalog version incremented for
+[{16384, 4}]`, on ts-3 at 02:51:42.065953 and ts-2 at 02:51:42.096344. Every PG backend on the node
+therefore sends its next perform request with `backend_catalog_version = 4`, which the copy can
+never satisfy.
+
+```
+  master                     copy on ts-1                 PG backend on ts-1
+    |                             |                              |
+ 1.724 RESTORE_SYS_CATALOG        |                              |
+  apply: rows -> RocksDB         poll 1.723 -> 1.728            |
+  (no WAL row records)           4 sys.catalog rows,            |
+  pg_yb_catalog_version 3->4     applied {16384, 3}             |
+    |                             |                              |
+ heartbeat {16384, 4} ----------> tserver shared memory -------> perform, backend version 4
+    |                             |                              |
+    |                        WaitForAppliedVersion(16384, 4, deadline=600s)
+    |                             |   blocks; applied stays 3
+    |                             |                              |
+    |                             |                        600 s later: PG reports
+    |                             |                        "Timed out waiting kResponseSent"
+```
+
+The wait is the second defect. `TryServeCatalogReadsLocally` (`src/yb/tserver/pg_client_session.cc`
+:3588-3612) compares the request's `backend_catalog_version` against the copy's applied version for
+that database and, when the copy is behind, calls
+`replica->WaitForAppliedVersion(db_oid, backend_version, deadline)` with the perform request's own
+deadline. The fallback to master on a failed wait is therefore unreachable in practice: the client
+has already given up by the time the wait expires. The live stack shows exactly this, on ts-1
+thread 55 (LWP 3200607, `shmem_exchange_`):
+
+```
+pthread_cond_timedwait
+std::condition_variable::wait_until
+LocalCatalogReplica::WaitForAppliedVersion (db_oid=16384, version=4)  local_catalog_replica.cc:320
+PgClientSession::TryServeCatalogReadsLocally                          pg_client_session.cc:3602
+PgClientSession::DoPerform                                            pg_client_session.cc:3439
+PgClientSession::DoHandleSharedExchangeQuery                          pg_client_session.cc:2606
+PgClientSession::HandleSharedExchangeQuery                            pg_client_session.cc:2641
+PgClientSession::ProcessSharedRequest                                 pg_client_session.cc:2659
+                                                                      pg_client_service.cc:443
+SharedExchangeRunnable::Run                                           tserver_shared_mem.cc:511
+```
+
+In the run that carried the thread dump the wait ended only at cluster shutdown:
+`pg_client_session.cc:3603`, `Wait for version 4 of database 16384 ended after 176.865s: Shutdown in
+progress (yb/tserver/local_catalog_replica.cc:315): Local catalog replica is shutting down`. In the
+earlier, unperturbed run it consumed the whole 600 s perform deadline and PG raised `Timed out
+waiting kResponseSent, state: kProcessingRequest`.
+
+Two separate fixes follow, and neither is written yet.
+
+- **Divergence.** A restore of master's system catalog changes rows the copy cannot learn about
+  through the stream, so the copy has to be rebuilt. The re-seed machinery for this already exists:
+  `LocalCatalogPoller::EnsureLocalTablet` (`src/yb/tserver/local_catalog_poller.cc:261`) deletes the
+  local tablet and its checkpoint file and re-runs `OpenOrCreateLocalCatalogTablet` with
+  `force_reseed`, and today only a `CHECKPOINT_TOO_OLD` error from master triggers it. A restore
+  must trigger it too, either by the change service reporting that it crossed a snapshot operation
+  or by master carrying a restore marker in the poll response.
+- **Liveness.** The version wait must have its own short bound rather than the request deadline, so
+  that a version the copy cannot reach costs one bounded wait and then a read served by master,
+  instead of the client's entire timeout.
+
+### The same mechanism fails `Pgsql/DBColocated_PITR`
+
+`YbAdminSnapshotScheduleTestWithYsqlColocationRestoreParam.Pgsql/DBColocated_PITR` fails for the
+same reason, which rules out anything specific to the transaction the other test runs across the
+restore. The test creates a colocated table, takes a timestamp, updates the row, restores the
+schedule to that timestamp, and reconnects; the failure is at
+`src/yb/tools/yb-admin-snapshot-schedule-test.cc:1444`, the `ConnectToRestoredDb()` that follows the
+restore, after 602.4 s:
+
+```
+Bad status: Network error (yb/yql/pgwrapper/libpq_utils.cc:636): Connect failed:
+  connection to server at "127.35.28.1", port 20087 failed:
+  FATAL: Timed out waiting kResponseSent, state: kProcessingRequest, passed: 602.422s
+```
+
+The sequence in that run matches the account above line for line. Master restored at op id 1.734
+(03:01:42); the heartbeat published `{db 16384: version 4}` at 03:01:43; ts-2 logged
+`pg_client_session.cc:3596` `Waiting for the local catalog copy to apply version 4 of database
+16384; it has applied 3` at 03:01:44.188393; the copies' applied versions were still `{16384: 3}` at
+03:04:57 and remained there until the test tore the cluster down.
+
+### The fix: master tells a poller that its batch crossed a restore, and the poller re-seeds
+
+**Divergence.** The change service now watches for the restore operation itself and answers with an
+instruction to rebuild rather than with records.
+
+- `XClusterGetChangesContext` gains an optional callback, `update_on_snapshot_op_func`
+  (`src/yb/cdc/cdc_producer.h:58,70`). It is called for every snapshot operation the batch crosses
+  and returns whether the batch must stop at that operation. The existing `update_on_split_op_func`
+  is the pattern: only the caller knows what its stream must do with such an operation, so the
+  producer's loop asks rather than decides. The two other callers of `GetChangesForXCluster`
+  (xCluster's own `CDCServiceImpl::GetChanges`, master's release push) leave it empty and pay one
+  branch per snapshot operation.
+- `GetChangesForXCluster` gains `case consensus::OperationType::SNAPSHOT_OP`
+  (`src/yb/cdc/xcluster_producer.cc:422-427`), which invokes the callback when one is set. Before
+  this the operation fell through `default:` and the loop advanced the checkpoint past it, which is
+  precisely how the restore went unnoticed.
+- The system catalog change stream's callback (`src/yb/cdc/sys_catalog_change_service.cc:140-148`)
+  accepts a snapshot operation whose request is anything but `RESTORE_SYS_CATALOG` and stops the
+  batch on that one. The filter is necessary rather than defensive: master submits
+  `CREATE_ON_MASTER` and `DELETE_ON_MASTER` snapshot operations on its own system catalog tablet for
+  every scheduled snapshot (`src/yb/master/master_snapshot_coordinator.cc:1819,1849`), which in
+  these tests is every 6 s, and treating those as restores would put every copy in a re-seed loop.
+- `DoGetSysCatalogChanges` then clears the records it had collected and answers
+  `reseed_required` (`src/yb/cdc/cdc_service.proto`, `GetSysCatalogChangesResponsePB` field 5)
+  instead (`src/yb/cdc/sys_catalog_change_service.cc:159-169`). Records read before the restore are
+  discarded with the rest: the restore overwrote whatever they carried, and the requestor is about
+  to throw its copy away.
+- `LocalCatalogPoller::FetchAndApplyOnce` (`src/yb/tserver/local_catalog_poller.cc:368-377`) treats
+  `reseed_required` the way it already treats `CHECKPOINT_TOO_OLD`: it calls
+  `LocalCatalogReplica::RequestReseed()` and returns without applying anything. The next poll cycle
+  enters `EnsureLocalTablet`, which takes the request, deletes the local tablet and its checkpoint
+  file, and re-fetches master's tablet with `force_reseed`
+  (`src/yb/tserver/local_catalog_poller.cc:261-315`).
+- The applied versions correct themselves because they are read from the copy rather than
+  accumulated from records: `PublishAppliedBatch` calls `ReadLocalCatalogVersions` against the
+  copy's own `pg_yb_catalog_version` at each batch's safe time
+  (`src/yb/tserver/local_catalog_poller.cc:464`), and `OnReseedStarted` clears the published map
+  (`src/yb/tserver/local_catalog_replica.cc:433`). The first poll after the re-seed therefore
+  publishes `{16384: 4}` from the restored rows, and the waiting backends wake.
+- Master's release push path fetches one batch and slices it to each tserver
+  (`src/yb/master/object_lock_info_manager.cc:1839`). A batch that crossed a restore carries no
+  records and no safe time, so the push is skipped and the tservers' own pollers re-seed
+  (`src/yb/master/object_lock_info_manager.cc:1848-1854`). `DoApplyPushedBatch` also refuses such a
+  batch and requests a re-seed (`src/yb/tserver/local_catalog_poller.cc:547-553`), so a future
+  caller that does forward one cannot apply records across a restore.
+
+**Liveness.** `TryServeCatalogReadsLocally`'s two waits now have their own bound, so a copy that
+cannot reach what the backend was told costs one bounded wait and then a read served by master.
+
+- New flag `local_catalog_serve_wait_timeout_ms`, default 5000 ms
+  (`src/yb/tserver/pg_client_session.cc:164-168`). At the default poll interval of 100 ms that is
+  50 poll cycles and about five heartbeats, so a copy that is merely behind still catches up inside
+  the bound and keeps serving.
+- `LocalCatalogWaitDeadline` (`src/yb/tserver/pg_client_session.cc:224-229`) is the smaller of the
+  request's deadline and now plus that bound, so a request with a nearer deadline keeps its own.
+  Both the version wait (`pg_client_session.cc:3619`) and the wait for the session's own catalog
+  writes (`pg_client_session.cc:3649`) use it. The existing fallback on a failed wait -- count it
+  against serving and return false, which sends the read to master -- is now reachable.
+
+### The catalog snapshot's read time lives on the plain session's read point
+
+Review question: the pinned time was held in a side map keyed by read time serial number, and the
+write to the session's read point was skipped whenever a transaction was attached. That skip was
+wrong, and the side map hid the defect it was compensating for.
+
+**One counter, two snapshots, distinct numbers.** A YSQL backend draws every read time serial
+number from a single shared counter, `next_read_time_serial_no`
+(`src/yb/yql/pggate/pggate.cc:703`), through `PgTxnManager::SerialNo::NextReadTimeSerialNo`
+(`src/yb/yql/pggate/pg_txn_manager.cc:186-190`), which returns `fetch_add(1) + 1`. The two snapshot
+kinds take different values from it:
+
+- A transaction snapshot calls `IncReadTime` (`pg_txn_manager.cc:211`), which sets both `read_time_`
+  and `max_read_time_` to the new number, so the number becomes current immediately.
+- A catalog snapshot calls `IncMaxReadTime` (`pg_txn_manager.cc:216`), which advances only
+  `max_read_time_`. `read_time_` stays on the transaction snapshot's number, and the catalog
+  snapshot's number is returned to PostgreSQL as the snapshot's read point handle
+  (`PgTxnManager::ResetTransactionReadPoint`, `pg_txn_manager.cc:475-490`).
+
+The catalog snapshot's number becomes current only for the duration of a statement's catalog
+operations: `PgSession::RunAsync` calls `UpdateReadPointForCatalogOps`
+(`src/yb/yql/pggate/pg_session.cc:1203-1218, 1251-1253`), which restores the handle, and restores
+the previous read point after the flush (`pg_session.cc:1304`). Two snapshots therefore never hold
+the same serial number in non-legacy mode.
+
+**What the two snapshots do share is the register the time is kept in.** `YBSession::read_point()`
+returns the attached transaction's read point when there is a transaction, and the session's own
+otherwise (`src/yb/client/session.cc:306`). One `ConsistentReadPoint` object therefore holds
+whichever snapshot's time is current, and `PgClientSession::SetupPlainSessionReadTime`
+(`src/yb/tserver/pg_client_session.cc:4325-4342`) multiplexes the object between snapshots by serial
+number: on a change it saves the object's momento under the outgoing number
+(`ReadPointHistory::Save`, `src/yb/tserver/pg_client_session_util.h:140`) and restores the incoming
+number's momento into the same object (`Restore`, `pg_client_session_util.h:124`). The momento
+carries `read_time_`, `restart_read_ht_`, `local_limits_` and `restarts_`
+(`src/yb/common/consistent_read_point.h:95-118`), so the round trip loses nothing.
+
+With transaction serial 7 at time T7 and catalog serial 8 at time C:
+
+```
+PG backend sends          one ConsistentReadPoint on the tserver      ReadPointHistory
+------------------------  ------------------------------------------  ----------------
+stmt 1  serial 7  ----->  [ T7 ]                                     {}
+stmt 2  serial 8  ----->  save 7:T7 ; Restore(8) misses               {7:T7}
+                          ResetReadPoint -> [ ] ; clamp -> [ C ]
+stmt 3  serial 7  ----->  save 8:C ; Restore(7) hits -> [ T7 ]        {7:T7, 8:C}
+stmt 4  serial 8  ----->  save 7:T7 ; Restore(8) hits -> [ C ]        {7:T7, 8:C}
+```
+
+**Consequence for `TryServeCatalogReadsLocally`.** At the moment it runs, the read point never holds
+the transaction's time. `UpdateReadTime` ran first, and for a catalog snapshot's serial number it
+took one of three paths:
+
+| Path | Register contents on entry to `TryServeCatalogReadsLocally` |
+|---|---|
+| `Restore` missed (first read of the snapshot) | `ResetReadPoint` (`pg_client_session.cc:3990`) emptied it, then the clamp at `:4035-4039` filled it with a time taken from this server's clock |
+| `Restore` hit | the time an earlier read of this same catalog snapshot used |
+| serial unchanged from the previous request | the same, kept by the `else` branch at `:3991` |
+
+The condition that suppressed the write -- a transaction is attached, so the register must be
+holding the transaction's snapshot -- is therefore false in all three. The register holds the
+catalog snapshot's time, and writing the copy's time C to it is what the existing mechanism then
+saves under the catalog snapshot's serial number for the snapshot's later reads.
+
+**Damage the side map caused.** Within one catalog snapshot, a read the copy answered used C, while
+a read master had to answer -- a relation the copy does not hold, or a wait that reached
+`local_catalog_serve_wait_timeout_ms` -- used the clamped time, which is later than C. One snapshot
+had two read times, and the later one was on the reads that crossed to master.
+
+**The change.** The side storage (`local_catalog_read_time_serial_no_`, `local_catalog_read_time_`)
+is deleted, and so is the request-scoped flag (`catalog_read_time_picked_this_request_`) that a
+later draft used to tell a time this request had just clamped from this server's clock apart from a
+time an earlier read of the same snapshot had already used. Both existed only because the copy's
+time was written after the clamp had put a clock reading in the register. The time is now chosen
+once, at the single place where a catalog snapshot that has no time gets one.
+
+- `UpdateReadTime` reaches the clamp branch for a fresh catalog snapshot with the register empty,
+  because `ResetReadPoint` emptied it when `Restore` missed. The branch is guarded by
+  `!session.read_point()->GetReadTime()` and calls `SetFreshCatalogSnapshotReadTime`
+  (`pg_client_session.cc:4065-4071`), which writes the copy's complete time C when the copy may
+  answer this backend's catalog reads, and the clamped clock reading otherwise
+  (`pg_client_session.cc:3644-3658`).
+- `TryServeCatalogReadsLocally` no longer writes a read time. It reads the register and compares
+  the snapshot's time against C, so every read under one snapshot runs at that one time whether the
+  copy or master answers it.
+- A snapshot that took the clock reading is above C and reads from master, and is never pulled back
+  to C, which would show the backend an older state than the snapshot has already returned. C
+  advances at every poll and passes that time within about one poll interval, after which the copy
+  answers the same snapshot at the snapshot's own unchanged time.
+
+**The read restart keeps the clock reading.** An earlier draft also routed the read-restart branch
+of `UpdateReadTime` through the same choice, so that a restarted snapshot could land on C as well.
+That was a defect rather than a fix: at a restart the register still holds the snapshot's previous
+time, and C can be below it, so writing C there moves the snapshot backwards to a state older than
+one of its own earlier reads returned. The branch keeps the plain clamped clock reading
+(`pg_client_session.cc:3958-3973`), and the copy treats that new time exactly as it treats a fresh
+snapshot's clock reading: master answers until C passes it.
+
+### Serializable isolation no longer serves catalog reads from the copy
+
+`PgTxnManager::SetupReadTimeOptions` returns before the catalog clamp for a serializable transaction
+(`src/yb/yql/pggate/pg_txn_manager.cc:856-863`), so such a request carries neither a read time nor
+`clamp_uncertainty_window`. On the tserver the register stays empty for that serial number, and each
+catalog read reaches the master tablet with no read time, so the tablet picks its own latest safe
+time per operation. The copy cannot reproduce that, and pinning the snapshot to one time is what the
+two `RSTATUS_DCHECK`s in `UpdateReadTime` forbid for a serializable transaction
+(`pg_client_session.cc:3939-3941, 4036-4038`).
+
+- `TryServeCatalogReadsLocally` returns false when the attached transaction's isolation is
+  `SERIALIZABLE_ISOLATION` (`pg_client_session.cc:3591-3595`); every such catalog read goes to
+  master.
+- The new counter `local_catalog_reads_to_master_serializable`
+  (`src/yb/tserver/local_catalog_replica.cc:102,204-205,485-487`) counts them, so the exclusion is
+  visible in the metrics rather than inferred from a lower serve rate.
+- Legacy mode is unaffected because it never reaches this path. `YbSkipPgSnapshotManagement`
+  (`src/postgres/src/backend/utils/misc/pg_yb_utils.c:8808-8835`) skips PostgreSQL snapshot
+  management for serializable only in legacy mode, and in legacy mode a catalog snapshot gets no
+  read point handle at all (`src/postgres/src/backend/storage/ipc/procarray.c:2681`), so its catalog
+  reads run under the transaction snapshot's serial number. This is the only place where the two
+  snapshots do reuse one serial number, and the local copy is a non-legacy-mode feature.
+
+**Verification.** Both PITR tests pass with all the above in the build: `TransactionDuringPITRRepro23399`
+in 20786 ms, and `YbAdminSnapshotScheduleTestWithYsqlColocationRestoreParam.Pgsql/DBColocated_PITR`
+in 25411 ms.
+
+### Three test groups fail for reasons that have nothing to do with catalog correctness
+
+The 2026-09-03 default-on run's four failure groups are listed above. Two of them are the feature's
+own defects and are fixed above (the missing prerequisite check, the PITR re-seed). The remaining
+19 failures are tests whose assertions the copy's existence invalidates, and each is fixed in the
+test rather than in the feature.
+
+**`conflict_resolve_keys_verification-itest`, 17 failures: the copy's writes landed in a golden
+file.** `Tablet::WriteToRocksDB` appends every key/value pair it writes to the file named by
+`TEST_file_to_dump_docdb_writes`, and that test compares the whole file against an expected
+sequence of conflict-resolution keys. The copy is a tablet on the same tserver, so its applies of
+master's WAL records were dumped into the same file and the comparison failed on records the test
+never asked for. The dump now skips the copy (`src/yb/tablet/tablet.cc:2238`).
+
+That check needs the copy's tablet id in `yb/tablet`, which cannot link against `yb_tserver`, so
+`kLocalCatalogTabletId` moved from `src/yb/tserver/local_catalog_replica.{h,cc}` to
+`src/yb/common/constants.h:43`. Nothing else about the id changed.
+
+**`TestPgFollowerReads.testPgSysCatalogNoFollowerReads` and
+`PgCatalogVersionConnManagerTest.TestConnectionManagerRelCacheInitRpcCount`, 2 failures: both
+assert on a count of catalog reads that reach master.** The first asserts that system catalog reads
+do not take follower reads, by reading the master leader's read counters; the second asserts an
+exact number of catalog RPCs during a connection manager relcache build. A copy that answers those
+reads locally drops both counts, so each assertion now measures where the read went instead of
+whether the read happened. Both fixtures pin `enable_local_tserver_catalog=false`
+(`src/yb/yql/pgwrapper/pg_catalog_version-test.cc:3213`,
+`java/yb-pgsql/src/test/java/org/yb/pgsql/TestPgFollowerReads.java:66`). Coverage of the same
+assertions with the copy on is not lost by pinning the flag, because there is nothing to cover:
+with the copy serving, the RPC these tests count does not exist.
+
+**What is left.** Of the 39 `yb-admin-snapshot-schedule-test` failures, the mechanism is fixed and
+two of the binary's tests were run locally and pass; the other 37 have not been run with the fix.
+That binary is the one place where the next default-on run can still produce failures in numbers.
