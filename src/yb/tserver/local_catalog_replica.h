@@ -19,6 +19,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "yb/common/constants.h"
 #include "yb/common/entity_ids_types.h"
 #include "yb/common/hybrid_time.h"
 #include "yb/common/opid.h"
@@ -52,11 +53,6 @@ class LocalCatalogPoller;
 //                    has applied a response at or after the new lease grant.
 //   kReseeding     - the local tablet is being replaced by a fresh copy of master's.
 YB_DEFINE_ENUM(LocalCatalogServingState, (kBootstrapping)(kServing)(kDisabledLease)(kReseeding));
-
-// The tablet id under which the tserver keeps its copy of the master system catalog tablet. It is
-// deliberately different from master::kSysCatalogTabletId so that nothing on the tserver can
-// resolve a client request for the master's tablet to this copy.
-extern const char* const kLocalCatalogTabletId;
 
 // A hybrid time rendered for logs as the physical microseconds it carries followed by the time of
 // day they correspond to. Both are needed: the microseconds compare directly against the values in

@@ -63,6 +63,10 @@ public class TestPgFollowerReads extends BasePgSQLTest {
     flagMap.put("max_clock_skew_usec", "" + kMaxClockSkewMs * 1000);
     flagMap.put("raft_heartbeat_interval_ms", "" + kRaftHeartbeatIntervalMs);
     flagMap.put("yb_enable_read_committed_isolation", "true");
+    // testPgSysCatalogNoFollowerReads counts the catalog reads that reach master. A tserver-local
+    // copy of the master system catalog tablet answers those reads without an RPC, which makes the
+    // count measure where the read went rather than whether a read happened.
+    flagMap.put("enable_local_tserver_catalog", "false");
     return flagMap;
   }
 

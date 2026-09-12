@@ -40,6 +40,13 @@ YB_DEFINE_ENUM(SortingType,
 
 static const char* const kObsoleteShortPrimaryTableId = "sys.catalog.uuid";
 
+// The tablet id under which a tserver keeps its private copy of the master system catalog tablet.
+// It is deliberately different from master::kSysCatalogTabletId so that nothing on the tserver can
+// resolve a client request for master's tablet to the copy. Declared here rather than in
+// yb/tserver because the tablet layer, which cannot link against yb_tserver, also has to
+// recognize the copy.
+static const char* const kLocalCatalogTabletId = "00000000000000000000000000000001";
+
 constexpr auto kPitrFeatureName = "PITR";
 constexpr auto kXClusterFailoverFeatureName = "xCluster failover";
 

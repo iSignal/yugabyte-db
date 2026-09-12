@@ -45,6 +45,7 @@
 #include "yb/client/transaction.h"
 #include "yb/client/yb_op.h"
 
+#include "yb/common/constants.h"
 #include "yb/common/pgsql_error.h"
 #include "yb/common/schema.h"
 #include "yb/common/schema_pbutil.h"
@@ -2237,7 +2238,7 @@ void Tablet::WriteToRocksDB(
       << " key/value pairs to " << storage_db_type
       << " RocksDB:\n" << formatter->str();
     LOG_WITH_PREFIX(INFO) << oss.str();
-    if (!FLAGS_TEST_file_to_dump_docdb_writes.empty()) {
+    if (!FLAGS_TEST_file_to_dump_docdb_writes.empty() && tablet_id() != kLocalCatalogTabletId) {
       const std::string desc =
         storage_db_type == StorageDbType::kIntents ? "intent_write" : "regular_write";
       WARN_NOT_OK(TEST_DumpStringToFile(

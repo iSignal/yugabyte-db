@@ -154,8 +154,6 @@ bool LocalCatalogPrerequisitesMet() {
   return FLAGS_enable_object_locking_for_table_locks && FLAGS_ysql_enable_concurrent_ddl;
 }
 
-const char* const kLocalCatalogTabletId = "00000000000000000000000000000001";
-
 std::string LocalCatalogHybridTimeForLog(HybridTime ht) {
   if (!ht.is_valid()) {
     return "<invalid>";

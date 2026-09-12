@@ -3210,6 +3210,10 @@ class PgCatalogVersionConnManagerTest
     // against that 10 fallback.
     options->extra_tserver_flags.push_back(
         "--ysql_conn_mgr_reserve_internal_conns=5");
+    // This test counts the catalog reads that reach master. A tserver-local copy of the master
+    // system catalog tablet answers those reads without an RPC, which makes the count measure
+    // where the read went rather than whether a read happened.
+    options->extra_tserver_flags.push_back("--enable_local_tserver_catalog=false");
   }
 };
 

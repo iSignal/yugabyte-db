@@ -1199,7 +1199,7 @@ TEST_F(PgLocalCatalogTest, LocalCatalogCopyIsNotInTheReportableTabletSet) {
     auto tablets =
         ASSERT_RESULT(cluster_->ListTablets(&TServer(i), /* user_tablets_only= */ false));
     for (const auto& entry : tablets.status_and_schema()) {
-      ASSERT_NE(entry.tablet_status().tablet_id(), tserver::kLocalCatalogTabletId)
+      ASSERT_NE(entry.tablet_status().tablet_id(), kLocalCatalogTabletId)
           << "The local catalog copy is in tserver " << i << "'s tablet map, so it would be "
           << "offered to master in the tablet report";
     }
