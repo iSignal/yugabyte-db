@@ -90,6 +90,14 @@ METRIC_DEFINE_counter(server, local_catalog_reads_to_master_in_ddl,
     "or was in a transaction block in which a DDL had already run, so its own uncommitted catalog "
     "rows exist only on master.");
 
+METRIC_DEFINE_counter(server, local_catalog_reads_to_master_serializable,
+    "Local catalog reads routed to master because the transaction is SERIALIZABLE",
+    yb::MetricUnit::kRequests,
+    "Number of catalog read operations sent to master because a SERIALIZABLE transaction was "
+    "attached to the session. Such a transaction sends no read time and no clamp request, so its "
+    "catalog snapshot has no hybrid time of its own and each of its catalog reads runs at the "
+    "master tablet's own latest safe time.");
+
 METRIC_DEFINE_counter(server, local_catalog_reads_to_master_not_serving,
     "Local catalog reads routed to master because the copy is not serving",
     yb::MetricUnit::kRequests,
@@ -184,6 +192,8 @@ void LocalCatalogReplica::Init() {
   reads_waited_for_own_writes_ =
       METRIC_local_catalog_reads_waited_for_own_writes.Instantiate(metric_entity_);
   reads_to_master_in_ddl_ = METRIC_local_catalog_reads_to_master_in_ddl.Instantiate(metric_entity_);
+  reads_to_master_serializable_ =
+      METRIC_local_catalog_reads_to_master_serializable.Instantiate(metric_entity_);
   reads_to_master_not_serving_ =
       METRIC_local_catalog_reads_to_master_not_serving.Instantiate(metric_entity_);
   serving_state_ = METRIC_local_catalog_serving_state.Instantiate(
@@ -463,6 +473,9 @@ void LocalCatalogReplica::IncReadsWaitedForOwnWrites() {
   reads_waited_for_own_writes_->Increment();
 }
 void LocalCatalogReplica::IncReadsToMasterInDdl() { reads_to_master_in_ddl_->Increment(); }
+void LocalCatalogReplica::IncReadsToMasterSerializable() {
+  reads_to_master_serializable_->Increment();
+}
 void LocalCatalogReplica::IncReadsToMasterNotServing() {
   reads_to_master_not_serving_->Increment();
 }

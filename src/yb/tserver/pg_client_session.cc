@@ -161,6 +161,12 @@ DEFINE_test_flag(bool, pause_session_lock_after_release, false,
 DEFINE_test_flag(uint64, shared_exchange_big_response_delay_ms, 0,
     "Delay before sending response that does not fit into the shared exchange buffer.");
 
+DEFINE_RUNTIME_uint32(local_catalog_serve_wait_timeout_ms, 5000,
+    "How long a catalog read waits for the local system catalog copy to hold what the backend "
+    "was told before the read goes to master instead. The copy polls every "
+    "local_catalog_poll_interval_ms, so this is a bound on how far behind the copy may fall "
+    "before reads stop using it, not a bound on a healthy wait.");
+
 #ifdef __linux__
 DECLARE_bool(enable_qos);
 #endif
@@ -211,6 +217,15 @@ void SetFollowerReadTime(ConsistentReadPoint& read_point, uint32_t staleness_ms)
       ReadHybridTime::SingleTime(
           read_point.Now().AddMilliseconds(-static_cast<int64_t>(staleness_ms))),
       {});
+}
+
+// The request's own deadline is the fallback, so a request whose deadline is nearer than the
+// bound keeps its deadline.
+CoarseTimePoint LocalCatalogWaitDeadline(CoarseTimePoint request_deadline) {
+  return std::min(
+      request_deadline,
+      CoarseMonoClock::Now() +
+          MonoDelta::FromMilliseconds(FLAGS_local_catalog_serve_wait_timeout_ms));
 }
 
 constexpr const size_t kPgSequenceLastValueColIdx = 2;
@@ -3522,71 +3537,29 @@ class PgClientSession::Impl {
     return Status::OK();
   }
 
-  // Serves a request whose operations are all catalog reads from the tserver-local copy of the
-  // master system catalog tablet, when every condition below holds, and returns whether it did.
-  // A false return leaves the request to take the ordinary path to master.
+  // Returns the hybrid time up to which the local copy is complete for every writer and may
+  // answer this backend's catalog reads, or an invalid time when it may not. Waits, within
+  // LocalCatalogWaitDeadline, for the copy to apply the catalog version the backend was told and
+  // this session's own catalog writes.
   //
-  //  - The feature is on and the copy is serving. While it bootstraps, re-seeds or is disabled by
-  //    lease loss, the copy is either incomplete or unproven, so reads go to master.
-  //  - The request's read time serial number identifies a PG catalog snapshot. Catalog reads under
-  //    one such snapshot must all see one state, which is what pinning them to one hybrid time on
-  //    the copy achieves.
-  //  - The backend is not executing a DDL and is not in a transaction block in which a DDL already
-  //    ran. Such a backend's own uncommitted catalog rows exist only on master.
-  //  - Every operation is a read of a table the copy holds.
+  // The backend was told a catalog version, so the copy must already hold every catalog change up
+  // to it before it may answer a read. Two paths reach here without the exposure gate having done
+  // the work: a version this backend advanced itself at its own DDL commit before this tserver's
+  // poller had the commit, and a version published while the copy was not serving. This wait is
+  // where both are closed.
   //
-  // Relies on the read point being saved into the read point history under the outgoing serial
-  // before the catalog serial becomes current, so it never holds an attached transaction's own
-  // read time here.
-  //
-  // The read runs at exactly the catalog snapshot's hybrid time. On the snapshot's first read that
-  // time is set to C, the highest hybrid time for which the copy is complete for every writer, so
-  // every later read under the same snapshot restores the same time from the session's read point
-  // history and sees the same state. A snapshot whose first read went to master carries a time
-  // taken from the tserver clock instead, which is above C; that read is routed to master rather
-  // than answered from the copy at an earlier time, which would show the backend an older state
-  // than it has already seen.
-  Result<bool> TryServeCatalogReadsLocally(
-      const PerformQueryDataPtr& data, const SetupSessionResult& setup_session_result,
+  // The version comes from the request rather than from each operation's ysql_db_catalog_version,
+  // which PG leaves unset on internal scans of system relations -- that is, on catalog cache
+  // misses and relcache builds, the reads this feature exists to serve.
+  template <class ReadTimeOptionsPB>
+  HybridTime LocalCatalogCompleteTime(
+      LocalCatalogReplica* replica, const ReadTimeOptionsPB& read_time_options,
       CoarseTimePoint deadline) {
-    auto* replica = local_catalog_replica();
-    if (!replica) {
-      return false;
-    }
-    const auto& options = data->req.options();
-    if (!options.read_time_options().is_catalog_snapshot() ||
-        setup_session_result.kind != PgClientSessionKind::kPlain) {
-      return false;
-    }
-    if (options.ddl_mode() || options.ddl_use_regular_transaction_block() ||
-        options.yb_non_ddl_txn_for_sys_tables_allowed()) {
-      // A YSQL upgrade's migration session writes catalog rows outside a DDL, with
-      // yb_non_ddl_txn_for_sys_tables_allowed set, so like a DDL backend it can hold uncommitted
-      // catalog rows that exist only on master.
-      replica->IncReadsToMasterInDdl();
-      return false;
-    }
     if (!replica->IsServing()) {
       replica->IncReadsToMasterNotServing();
-      return false;
-    }
-    auto tablet_peer = replica->tablet_peer();
-    if (!tablet_peer || !AllOpsAreReadsOfLocalCatalogTables(tablet_peer, data->req)) {
-      replica->IncReadsToMasterNotServing();
-      return false;
+      return HybridTime::kInvalid;
     }
 
-    // The backend was told this catalog version, so the copy must already hold every catalog
-    // change up to it before it may answer the read. Two paths reach here without the exposure
-    // gate having done the work: a version this backend advanced itself at its own DDL commit
-    // before this tserver's poller had the commit, and a version published while the copy was not
-    // serving. This wait is where both are closed.
-    //
-    // The version comes from the request rather than from each operation's
-    // ysql_db_catalog_version, which PG leaves unset on internal scans of system relations --
-    // that is, on catalog cache misses and relcache builds, the reads this feature exists to
-    // serve.
-    const auto& read_time_options = options.read_time_options();
     const auto backend_version = read_time_options.backend_catalog_version();
     const auto db_oid = read_time_options.backend_catalog_version_db_oid();
     if (db_oid != kInvalidOid && backend_version > 0) {
@@ -3599,14 +3572,16 @@ class PgClientSession::Impl {
         const auto wait_start = MonoTime::Now();
         // A wait that runs out of time means the poller is not making progress, which is a
         // serving outage rather than a request error. Master can answer the read.
-        auto status = replica->WaitForAppliedVersion(db_oid, backend_version, deadline);
+        auto status =
+            replica->WaitForAppliedVersion(
+                db_oid, backend_version, LocalCatalogWaitDeadline(deadline));
         VLOG_WITH_PREFIX(1) << "Wait for version " << backend_version << " of database " << db_oid
                             << " ended after " << (MonoTime::Now() - wait_start) << ": " << status;
         if (!status.ok()) {
           VLOG_WITH_PREFIX(1) << "Routing a catalog read to master after waiting for version "
                               << backend_version << " of database " << db_oid << ": " << status;
           replica->IncReadsToMasterNotServing();
-          return false;
+          return HybridTime::kInvalid;
         }
       }
     }
@@ -3629,7 +3604,7 @@ class PgClientSession::Impl {
                           << "catalog writes at " << LocalCatalogHybridTimeForLog(own_write_floor)
                           << "; it holds " << LocalCatalogHybridTimeForLog(replica->safe_time());
       const auto wait_start = MonoTime::Now();
-      auto status = replica->WaitForSafeTime(own_write_floor, deadline);
+      auto status = replica->WaitForSafeTime(own_write_floor, LocalCatalogWaitDeadline(deadline));
       VLOG_WITH_PREFIX(1) << "Wait for own catalog writes at "
                           << LocalCatalogHybridTimeForLog(own_write_floor)
                           << " ended after " << (MonoTime::Now() - wait_start) << ": " << status;
@@ -3637,48 +3612,149 @@ class PgClientSession::Impl {
         VLOG_WITH_PREFIX(1) << "Routing a catalog read to master after waiting for the session's "
                             << "own catalog writes at " << own_write_floor << ": " << status;
         replica->IncReadsToMasterNotServing();
-        return false;
+        return HybridTime::kInvalid;
       }
     }
 
-    auto& session = *setup_session_result.session_data.session;
     const auto safe_time = replica->safe_time();
     if (!safe_time.is_valid()) {
       replica->IncReadsToMasterNotServing();
+    }
+    return safe_time;
+  }
+
+  // Chooses the read time of a catalog snapshot that has none yet. The local copy's complete time
+  // C is used when the copy may answer this backend's catalog reads, so that every read under the
+  // snapshot runs at a time the copy holds in full; otherwise the caller's clamped clock reading
+  // is used and the snapshot belongs to master for its whole life.
+  template <class OptionsPB>
+  HybridTime LocalCatalogReadTimeForFreshSnapshot(
+      const OptionsPB& options, PgClientSessionKind kind, CoarseTimePoint deadline) {
+    auto* replica = local_catalog_replica();
+    if (!replica || kind != PgClientSessionKind::kPlain ||
+        !options.read_time_options().is_catalog_snapshot() ||
+        options.ddl_mode() || options.ddl_use_regular_transaction_block() ||
+        options.yb_non_ddl_txn_for_sys_tables_allowed()) {
+      return HybridTime::kInvalid;
+    }
+    return LocalCatalogCompleteTime(replica, options.read_time_options(), deadline);
+  }
+
+  template <class OptionsPB>
+  void SetFreshCatalogSnapshotReadTime(
+      const OptionsPB& options, PgClientSessionKind kind, client::YBSession& session,
+      CoarseTimePoint deadline) {
+    const auto local_read_time = LocalCatalogReadTimeForFreshSnapshot(options, kind, deadline);
+    if (local_read_time.is_valid()) {
+      session.SetReadPoint(ReadHybridTime::SingleTime(local_read_time));
+      VLOG_WITH_PREFIX(1) << "Fixed this catalog snapshot to the local catalog copy's complete "
+                          << "time " << LocalCatalogHybridTimeForLog(local_read_time)
+                          << " for read time serial number "
+                          << options.read_time_options().read_time_serial_no();
+      return;
+    }
+    session.read_point()->SetCurrentReadTime(ClampUncertaintyWindow::kTrue);
+    VLOG_WITH_PREFIX(2) << "Clamping read time to " << session.read_point()->GetReadTime();
+  }
+
+  // Serves a request whose operations are all catalog reads from the tserver-local copy of the
+  // master system catalog tablet, when every condition below holds, and returns whether it did.
+  // A false return leaves the request to take the ordinary path to master.
+  //
+  //  - The feature is on and the copy is serving. While it bootstraps, re-seeds or is disabled by
+  //    lease loss, the copy is either incomplete or unproven, so reads go to master.
+  //  - The request's read time serial number identifies a PG catalog snapshot. Catalog reads under
+  //    one such snapshot must all see one state, which is what pinning them to one hybrid time on
+  //    the copy achieves.
+  //  - The backend is not executing a DDL and is not in a transaction block in which a DDL already
+  //    ran. Such a backend's own uncommitted catalog rows exist only on master.
+  //  - No SERIALIZABLE transaction is attached. PgTxnManager::SetupReadTimeOptions sends neither a
+  //    read time nor the clamp request for such a transaction, so its catalog snapshot has no
+  //    hybrid time of its own and each of its catalog reads takes the master tablet's own latest
+  //    safe time. The copy cannot reproduce that, and pinning the snapshot to one time instead is
+  //    what the two RSTATUS_DCHECKs in UpdateReadTime forbid for a SERIALIZABLE transaction.
+  //  - Every operation is a read of a table the copy holds.
+  //
+  // The read runs at exactly the catalog snapshot's hybrid time, which this function reads and
+  // never changes. The time is chosen once, where a snapshot without a time gets one:
+  // SetFreshCatalogSnapshotReadTime, called from UpdateReadTime before any read is issued, gives
+  // a fresh catalog snapshot the copy's complete time C when the copy may answer this backend's
+  // catalog reads, and the clamped tserver clock reading otherwise. A snapshot that got the clock
+  // reading is above C, so it reads from master until C passes it; it is never pulled back to C,
+  // which would show the backend an older state than the snapshot has already returned. A read
+  // restart replaces the snapshot's time with a new clamped clock reading, which the copy treats
+  // the same way.
+  //
+  // The snapshot's time is on the plain session's read point, which is the one place every
+  // snapshot's read time lives: SetupPlainSessionReadTime multiplexes that single
+  // ConsistentReadPoint between snapshots, saving the outgoing read time serial number's momento
+  // into read_point_history_ and restoring the incoming one's.
+  Result<bool> TryServeCatalogReadsLocally(
+      const PerformQueryDataPtr& data, const SetupSessionResult& setup_session_result,
+      CoarseTimePoint deadline) {
+    auto* replica = local_catalog_replica();
+    if (!replica) {
       return false;
     }
-    const auto existing_read_time = session.read_point()->GetReadTime();
-    ReadHybridTime read_time;
-    if (!existing_read_time || catalog_read_time_picked_this_request_) {
-      // This is the catalog snapshot's first read: either the read point is still empty, or the
-      // time on it was taken from this server's clock a few lines up in UpdateReadTime, for this
-      // very request. Pin the snapshot to C instead. C is a complete point for every writer, so
-      // all of the snapshot's reads see one state.
-      read_time = ReadHybridTime::SingleTime(safe_time);
-      VLOG_WITH_PREFIX(1) << "Pinning this catalog snapshot to the local copy's safe time "
-                          << LocalCatalogHybridTimeForLog(safe_time) << " (read point was "
-                          << (existing_read_time ? existing_read_time.ToString() : "unset") << ")";
-    } else if (existing_read_time.read > safe_time) {
-      // The time was chosen by an earlier read under the same snapshot that master answered, or
-      // the caller asked for an explicit time above what the copy holds (yb_read_time,
-      // ysql_dump --read-time). Reading the copy at C instead would move the snapshot backwards in
-      // the first case and answer a different question in the second.
+    const auto& options = data->req.options();
+    if (!options.read_time_options().is_catalog_snapshot() ||
+        setup_session_result.kind != PgClientSessionKind::kPlain) {
+      return false;
+    }
+    if (options.ddl_mode() || options.ddl_use_regular_transaction_block() ||
+        options.yb_non_ddl_txn_for_sys_tables_allowed()) {
+      // A YSQL upgrade's migration session writes catalog rows outside a DDL, with
+      // yb_non_ddl_txn_for_sys_tables_allowed set, so like a DDL backend it can hold uncommitted
+      // catalog rows that exist only on master.
+      replica->IncReadsToMasterInDdl();
+      return false;
+    }
+    const auto& transaction = setup_session_result.session_data.transaction;
+    if (transaction && transaction->isolation() == IsolationLevel::SERIALIZABLE_ISOLATION) {
+      replica->IncReadsToMasterSerializable();
+      return false;
+    }
+    if (!replica->IsServing()) {
+      replica->IncReadsToMasterNotServing();
+      return false;
+    }
+    auto tablet_peer = replica->tablet_peer();
+    if (!tablet_peer || !AllOpsAreReadsOfLocalCatalogTables(tablet_peer, data->req)) {
+      replica->IncReadsToMasterNotServing();
+      return false;
+    }
+
+    const auto& read_time_options = options.read_time_options();
+    const auto safe_time = LocalCatalogCompleteTime(replica, read_time_options, deadline);
+    if (!safe_time.is_valid()) {
+      return false;
+    }
+
+    auto& session = *setup_session_result.session_data.session;
+    const auto snapshot_read_time = session.read_point()->GetReadTime();
+    if (!snapshot_read_time) {
+      replica->IncReadsToMasterNotServing();
+      return false;
+    }
+    if (snapshot_read_time.read > safe_time) {
+      // The snapshot's time came from the tserver clock because the copy could not answer its
+      // first read, or the caller asked for an explicit time above what the copy holds
+      // (yb_read_time, ysql_dump --read-time). Reading the copy at C instead would move the
+      // snapshot backwards in the first case and answer a different question in the second.
       VLOG_WITH_PREFIX(1) << "Routing a catalog read at "
-                          << LocalCatalogHybridTimeForLog(existing_read_time.read)
+                          << LocalCatalogHybridTimeForLog(snapshot_read_time.read)
                           << " to master: the copy holds only "
                           << LocalCatalogHybridTimeForLog(safe_time);
       replica->IncReadsToMasterNotServing();
       return false;
-    } else {
-      read_time = ReadHybridTime::SingleTime(existing_read_time.read);
-      VLOG_WITH_PREFIX(2) << "Reading the local copy at this catalog snapshot's existing time "
-                          << LocalCatalogHybridTimeForLog(existing_read_time.read)
-                          << "; the copy holds " << LocalCatalogHybridTimeForLog(safe_time);
     }
+    const auto read_time = ReadHybridTime::SingleTime(snapshot_read_time.read);
+    VLOG_WITH_PREFIX(2) << "Reading the local copy at this catalog snapshot's time "
+                        << LocalCatalogHybridTimeForLog(snapshot_read_time.read)
+                        << "; the copy holds " << LocalCatalogHybridTimeForLog(safe_time);
 
     // The copy keeps history only back to its own retention cutoff. A read below it -- an explicit
-    // read time far in the past -- must go to master rather than fail. Checked before the read
-    // point is changed, so a request that falls through still carries the time it arrived with.
+    // read time far in the past -- must go to master rather than fail.
     auto read_op = PrepareLocalCatalogRead(tablet_peer, read_time, deadline);
     if (!read_op.ok()) {
       VLOG_WITH_PREFIX(2) << "Routing a catalog read at " << read_time
@@ -3686,11 +3762,6 @@ class PgClientSession::Impl {
       replica->IncReadsToMasterNotServing();
       return false;
     }
-
-    // Store the time on the read point. The session saves it into its read point history under
-    // this serial when the serial changes, so every later read under the same catalog snapshot
-    // restores this exact time.
-    session.SetReadPoint(read_time);
 
     auto status = ExecuteLocalCatalogReads(
         tablet_peer, *read_op, deadline, data->req, data->sidecars, &data->resp);
@@ -3881,7 +3952,6 @@ class PgClientSession::Impl {
     auto& session = *session_data.session;
     auto& txn = session_data.transaction;
 
-    catalog_read_time_picked_this_request_ = false;
     const auto& read_time_options = options.read_time_options();
     const auto txn_serial_no = options.txn_serial_no();
     const auto read_time_serial_no = read_time_options.read_time_serial_no();
@@ -3998,12 +4068,7 @@ class PgClientSession::Impl {
         RSTATUS_DCHECK(
           !(txn && txn->isolation() == SERIALIZABLE_ISOLATION),
           IllegalState, "Clamping does not apply to SERIALIZABLE txns.");
-        session.read_point()->SetCurrentReadTime(ClampUncertaintyWindow::kTrue);
-        // Remember that this request, and not an earlier one under the same snapshot, is where
-        // this time came from. A read served from the local catalog copy replaces it with C; a
-        // time an earlier read already used must be kept instead.
-        catalog_read_time_picked_this_request_ = read_time_options.is_catalog_snapshot();
-        VLOG_WITH_PREFIX(2) << "Clamping read time to " << session.read_point()->GetReadTime();
+        SetFreshCatalogSnapshotReadTime(options, kind, session, deadline);
       }
     }
 
@@ -4836,7 +4901,6 @@ class PgClientSession::Impl {
   // Set by UpdateReadTime when it takes the catalog snapshot's read time from this server's clock,
   // which it does only on the snapshot's first read. Single-threaded per session: written and read
   // within one Perform.
-  bool catalog_read_time_picked_this_request_ = false;
 };
 
 PgClientSession::PgClientSession(

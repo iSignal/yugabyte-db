@@ -150,6 +150,7 @@ class LocalCatalogReplica {
   void IncReadsWaitedForVersion();
   void IncReadsWaitedForOwnWrites();
   void IncReadsToMasterInDdl();
+  void IncReadsToMasterSerializable();
   void IncReadsToMasterNotServing();
   void RecordPollLatency(MonoDelta delta);
   void RecordApplyLatency(MonoDelta delta);
@@ -234,6 +235,7 @@ class LocalCatalogReplica {
   scoped_refptr<Counter> reads_waited_for_version_;
   scoped_refptr<Counter> reads_waited_for_own_writes_;
   scoped_refptr<Counter> reads_to_master_in_ddl_;
+  scoped_refptr<Counter> reads_to_master_serializable_;
   scoped_refptr<Counter> reads_to_master_not_serving_;
   scoped_refptr<AtomicGauge<uint32_t>> serving_state_;
   scoped_refptr<AtomicGauge<uint64_t>> safe_time_micros_;
