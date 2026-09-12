@@ -1845,6 +1845,13 @@ void UpdateAllTServers<Req>::PrepareLocalCatalogPushes() {
                                           : status.ToString());
       return;
     }
+    if (batch.reseed_required()) {
+      // The batch crossed a restore of master's system catalog. Every target has to discard its
+      // copy and fetch master's tablet again, which their pollers do on their own.
+      VLOG_WITH_PREFIX(1) << "Not carrying system catalog change records: the batch crossed a "
+                          << "restore, so every target re-seeds its copy instead";
+      return;
+    }
     // Without a safe time there is nothing for the receiver to publish, so the push could not let
     // the gate pass and is not worth its bytes.
     if (!batch.changes().has_safe_hybrid_time()) {

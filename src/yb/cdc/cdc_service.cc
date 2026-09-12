@@ -1875,6 +1875,7 @@ void CDCServiceImpl::GetChanges(
             std::bind(
                 &CDCServiceImpl::UpdateChildrenTabletsOnSplitOpForXCluster, this, producer_tablet,
                 _1),
+        .update_on_snapshot_op_func = {},
         .mem_tracker = mem_tracker,
         .deadline = get_changes_deadline,
         .stream_metadata = &record,

@@ -16,6 +16,7 @@
 #include "yb/cdc/cdc_producer.h"
 #include "yb/cdc/xrepl_stream_metadata.h"
 
+#include "yb/consensus/consensus.pb.h"
 #include "yb/consensus/replicate_msgs_holder.h"
 
 #include "yb/master/sys_catalog_constants.h"
@@ -23,6 +24,8 @@
 #include "yb/rpc/rpc_context.h"
 
 #include "yb/tablet/tablet_peer.h"
+
+#include "yb/tserver/backup.pb.h"
 
 #include "yb/util/flags.h"
 #include "yb/util/logging.h"
@@ -116,6 +119,7 @@ Status SysCatalogChangeServiceImpl::DoGetSysCatalogChanges(
   int64_t last_readable_index = 0;
   consensus::ReplicateMsgsHolder msgs_holder;
   consensus::HaveMoreMessages have_more_messages{false};
+  bool crossed_restore = false;
 
   XClusterGetChangesContext context = {
       .stream_id = stream_id,
@@ -129,6 +133,19 @@ Status SysCatalogChangeServiceImpl::DoGetSysCatalogChanges(
             return STATUS(
                 IllegalState, "System catalog tablet cannot be split; refusing to ship a SPLIT_OP");
           },
+      // A restore of master's system catalog rewrites catalog rows directly into master's RocksDB
+      // while master applies the restore operation, so those rows never become WAL records and no
+      // batch can carry them. The snapshot operation itself is the only entry in the WAL, and it
+      // is where the batch has to stop.
+      .update_on_snapshot_op_func =
+          [&crossed_restore](const consensus::ReplicateMsg& msg) -> Result<bool> {
+            if (msg.snapshot_request().operation() !=
+                tserver::TabletSnapshotOpRequestPB::RESTORE_SYS_CATALOG) {
+              return false;
+            }
+            crossed_restore = true;
+            return true;
+          },
       .mem_tracker = mem_tracker_,
       .deadline = deadline,
       .stream_metadata = stream.get(),
@@ -140,6 +157,16 @@ Status SysCatalogChangeServiceImpl::DoGetSysCatalogChanges(
   };
 
   RETURN_NOT_OK(GetChangesForXCluster(context));
+  if (crossed_restore) {
+    // Records read before the restore are of no use: the restore overwrote whatever they carried,
+    // and the requestor is about to discard its copy anyway.
+    resp->clear_changes();
+    resp->set_have_more_messages(false);
+    resp->set_reseed_required(true);
+    LOG(INFO) << "Telling " << req.requestor_uuid() << ", which polled from " << from_op_id
+              << ", to fetch a new copy of the system catalog: this batch crossed a restore";
+    return Status::OK();
+  }
   resp->set_have_more_messages(have_more_messages == consensus::HaveMoreMessages::kTrue);
   return Status::OK();
 }

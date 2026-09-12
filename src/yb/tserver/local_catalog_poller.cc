@@ -365,6 +365,18 @@ Status LocalCatalogPoller::FetchAndApplyOnce() {
     return error;
   }
 
+  if (resp.reseed_required()) {
+    // Master restored its system catalog at or above this copy's position. The restore wrote the
+    // restored rows straight into master's RocksDB while master applied the restore operation, so
+    // no WAL record carries them and no batch can bring this copy up to date. Only a fresh copy
+    // of master's tablet can.
+    LOG_WITH_PREFIX(WARNING) << "Master restored its system catalog at or after " << checkpoint_
+                             << "; re-seeding the local catalog copy";
+    have_more_messages_ = false;
+    replica_.RequestReseed();
+    return Status::OK();
+  }
+
   const auto apply_start = MonoTime::Now();
   AppliedRecordStats stats;
   auto apply_status = ApplyRecords(resp, &stats);
@@ -531,6 +543,13 @@ void LocalCatalogPoller::ApplyPendingPush() {
 Status LocalCatalogPoller::DoApplyPushedBatch(const cdc::GetSysCatalogChangesResponsePB& batch) {
   if (PREDICT_FALSE(FLAGS_TEST_local_catalog_pushed_batch_apply_delay_ms > 0)) {
     SleepFor(MonoDelta::FromMilliseconds(FLAGS_TEST_local_catalog_pushed_batch_apply_delay_ms));
+  }
+  if (batch.reseed_required()) {
+    LOG_WITH_PREFIX(WARNING) << "A pushed system catalog batch crossed a restore of master's "
+                             << "system catalog; re-seeding the local catalog copy";
+    replica_.RequestReseed();
+    return STATUS(
+        IllegalState, "A pushed system catalog batch crossed a restore of master's system catalog");
   }
   const auto& changes = batch.changes();
 

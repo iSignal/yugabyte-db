@@ -419,6 +419,12 @@ Status GetChangesForXCluster(const XClusterGetChangesContext& context) {
           exit_early = true;
         }
         break;
+      case consensus::OperationType::SNAPSHOT_OP:
+        if (context.update_on_snapshot_op_func &&
+            VERIFY_RESULT(context.update_on_snapshot_op_func(msg.ToGoogleProtobuf()))) {
+          exit_early = true;
+        }
+        break;
       default:
         // Nothing to do for other operation types.
         break;

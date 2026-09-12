@@ -109,6 +109,12 @@ message GetSysCatalogChangesResponsePB {
   // not every WAL operation produces a record, so the first record's position says nothing about
   // whether anything is missing.
   optional OpIdPB slice_from = 4;
+
+  // Set when the batch would have crossed a restore of master's system catalog. A restore rewrites
+  // catalog rows directly into master's RocksDB while it applies the restore operation, so those
+  // rows never appear as WAL records and no batch can carry them. The requestor must discard its
+  // copy and fetch master's tablet again. No records accompany this.
+  optional bool reseed_required = 5;
 }
 
 // Ships the master system catalog tablet's WAL to the tserver-local copies of it. Separate from

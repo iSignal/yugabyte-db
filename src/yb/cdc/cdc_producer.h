@@ -53,6 +53,10 @@ struct CDCThroughputMetrics {
 
 using UpdateOnSplitOpFunc = std::function<Status(const consensus::ReplicateMsg&)>;
 
+// Called for each snapshot operation the batch crosses, and returns whether the batch must end at
+// that operation rather than continue past it.
+using UpdateOnSnapshotOpFunc = std::function<Result<bool>(const consensus::ReplicateMsg&)>;
+
 class StreamMetadata;
 
 struct XClusterGetChangesContext {
@@ -61,6 +65,9 @@ struct XClusterGetChangesContext {
   const OpId& from_op_id;
   const std::shared_ptr<tablet::TabletPeer>& tablet_peer;
   UpdateOnSplitOpFunc update_on_split_op_func;
+  // Optional. A snapshot operation produces no record of its own, so a caller that must react to
+  // one supplies this; the others leave it empty and pay nothing.
+  UpdateOnSnapshotOpFunc update_on_snapshot_op_func;
   const std::shared_ptr<MemTracker>& mem_tracker;
   const CoarseTimePoint& deadline;
   StreamMetadata* stream_metadata;
