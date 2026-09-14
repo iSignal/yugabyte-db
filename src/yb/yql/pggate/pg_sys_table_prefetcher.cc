@@ -34,6 +34,7 @@
 #include "yb/util/flags/flag_tags.h"
 #include "yb/util/format.h"
 #include "yb/util/logging.h"
+#include "yb/util/monotime.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/status.h"
 #include "yb/util/status_fwd.h"
@@ -47,6 +48,7 @@
 #include "yb/yql/pggate/pg_tabledesc.h"
 #include "yb/yql/pggate/pg_tools.h"
 #include "yb/yql/pggate/pggate_flags.h"
+#include "yb/yql/pggate/ybc_gflags.h"
 #include "yb/yql/pggate/util/ybc_util.h"
 
 DEFINE_NON_RUNTIME_bool(ysql_enable_read_request_caching, true, "Enable read request caching");
@@ -436,11 +438,15 @@ class Loader {
       }
       LOG(INFO) << "Initiating prefetching for tables " << yb::ToString(table_names);
     }
+      const auto delay_ms = *YBCGetGFlags()->TEST_ysql_catalog_read_delay_ms;
+      if (PREDICT_FALSE(delay_ms > 0)) {
+        SleepFor(MonoDelta::FromMilliseconds(delay_ms));
+      }
       auto response = VERIFY_RESULT(Run(arena_.get(), session_, op_info_, options_));
       Status remove_predicate_status;
       ResultFunctorAdapter<bool, OperationInfo&> remove_predicate(
           &remove_predicate_status,
-          [&response, data_container](OperationInfo& op_info) -> Result<bool> {
+          [&response, data_container, &options = options_](OperationInfo& op_info) -> Result<bool> {
             if (yb_debug_log_catcache_events) {
               LOG(INFO) << "Completed prefetch for op for table "
                         << op_info.table->table_name().table_name();
@@ -453,7 +459,13 @@ class Loader {
                        op_info.index ? op_info.index->relfilenode_id() : PgObjectId(),
                        &op_info.index_targets,
                        std::move(sidecar));
-            return !VERIFY_RESULT(PrepareNextRequest(*op_info.table, op_info.operation.get()));
+            if (!VERIFY_RESULT(PrepareNextRequest(*op_info.table, op_info.operation.get()))) {
+              return true;
+            }
+            auto& req = op_info.operation->read_request();
+            req.set_limit(options.fetch_row_limit);
+            req.set_size_limit(options.fetch_size_limit);
+            return false;
           }, true /* bad_status_value */);
       std::erase_if(op_info_, remove_predicate);
       RETURN_NOT_OK(remove_predicate_status);
@@ -466,6 +478,7 @@ class Loader {
     req->set_return_paging_state(true);
     req->set_is_forward_scan(true);
     req->set_limit(options_.fetch_row_limit);
+    req->set_size_limit(options_.fetch_size_limit);
   }
 
   PgSession* session_;
@@ -485,7 +498,7 @@ std::string PrefetcherOptions::CachingInfo::ToString() const {
 }
 
 std::string PrefetcherOptions::ToString() const {
-  return YB_STRUCT_TO_STRING(caching_info, fetch_row_limit);
+  return YB_STRUCT_TO_STRING(caching_info, fetch_row_limit, fetch_size_limit);
 }
 
 class PgSysTablePrefetcher::Impl {
