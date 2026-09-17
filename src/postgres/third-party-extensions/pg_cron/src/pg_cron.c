@@ -154,7 +154,9 @@ static void bgw_generate_returned_message(StringInfoData *display_msg, ErrorData
 
 static long YbSecondsPassed(TimestampTz startTime, TimestampTz stopTime);
 static bool YbIsCronLeader();
+static bool YbIsCronLeaderActive();
 static void YbCheckLeadership(List *taskList, TimestampTz currentTime);
+static void YbMarkPendingRunsAsFailed(TimestampTz currentTime);
 static TimestampTz YbGetLastPersistedMinute(TimestampTz currentTime);
 static void YbPersistLastMinute();
 
@@ -205,7 +207,23 @@ static const struct config_enum_entry cron_message_level_options[] = {
  * Once distributed scheduling(#22336) is implemented the leader will schedule
  * the job and other nodes will execute jobs that have been scheduled on them.
  */
+/* ybIsLeader: active leader, may start new runs. ybCanRunJobs: holds a valid lease, may finish
+ * in-flight runs. While draining after a step down ybIsLeader is false but ybCanRunJobs is true. */
 bool ybIsLeader = false;
+static bool ybCanRunJobs = false;
+
+/*
+ * State for marking a previous leader's orphaned runs as failed after this node becomes leader.
+ * ybMinRunIdThisTerm is the first runid this leader assigned (0 until it starts a run); runs below
+ * it belong to previous leaders. ybMarkPendingRunsDeadline bounds how long we keep retrying the
+ * sweep, which is needed because just after a crash-induced tablet re-election the sweep can read a
+ * snapshot that predates the crashed leader's last write and match nothing.
+ */
+static int64 ybMinRunIdThisTerm = 0;
+static TimestampTz ybMarkPendingRunsDeadline = 0;
+
+/* Bounds the sweep-retry window (see ybMarkPendingRunsDeadline). */
+#define YB_MARK_PENDING_RUNS_WINDOW_MS (60 * 1000)
 
 static const char *cron_error_severity(int elevel);
 
@@ -628,7 +646,7 @@ PgCronLauncherMain(Datum arg)
 	 * YB Note: The cron leader will mark pending runs as failed.
 	 */
 	if (!IsYugaByteEnabled())
-		MarkPendingRunsAsFailed();
+		MarkPendingRunsAsFailed(0 /* runIdCeiling; mark all */);
 
 	/* Determine how many tasks we can run concurrently */
 	if (MaxConnections < MaxRunningTasks)
@@ -729,6 +747,9 @@ PgCronLauncherMain(Datum arg)
 
 		WaitForCronTasks(taskList);
 		ManageCronTasks(taskList, currentTime);
+
+		/* Sweep a previous leader's orphaned runs to failed (retried until the window closes). */
+		YbMarkPendingRunsAsFailed(currentTime);
 
 		/*
 		 * YB Note: Persist the new minute after any new job run details runs
@@ -1421,6 +1442,10 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 
 			/* Add new entry to audit table. */
 			task->runId = NextRunId();
+			/* Record the first runid of this leadership term; MarkPendingRunsAsFailed uses it to
+			 * avoid touching this leader's own runs. */
+			if (ybMinRunIdThisTerm == 0)
+				ybMinRunIdThisTerm = task->runId;
 			if (CronLogRun)
 				InsertJobRunDetail(task->runId, &cronJob->jobId,
 										cronJob->database,
@@ -2433,7 +2458,8 @@ ExecuteSqlString(const char *sql)
 static bool
 jobCanceled(CronTask *task)
 {
-	if (IsYugaByteEnabled() && !ybIsLeader)
+	/* Abort an in-flight job only once the lease is gone; while draining we let it finish. */
+	if (IsYugaByteEnabled() && !ybCanRunJobs)
 	{
 		task->errorMessage = "pg_cron leader changed";
 		task->state = CRON_TASK_ERROR;
@@ -2502,12 +2528,10 @@ YbSecondsPassed(TimestampTz startTime, TimestampTz stopTime)
 	return secondsPassed;
 }
 
+/* Whether the xCluster role of the cron database permits running cron jobs. */
 static bool
-YbIsCronLeader()
+YbCronXClusterAllowed()
 {
-	if (!YBCIsCronLeader())
-		return false;
-
 	if (YbEnableOnXClusterTarget)
 		return true;
 
@@ -2526,13 +2550,30 @@ YbIsCronLeader()
 	return xcluster_role != XCLUSTER_ROLE_AUTOMATIC_TARGET;
 }
 
+/* Whether this node holds a valid lease and may run cron jobs (true while draining). */
+static bool
+YbIsCronLeader()
+{
+	return YBCIsCronLeader() && YbCronXClusterAllowed();
+}
+
+/* Whether this node is the active leader and should start new runs (false once it steps down). */
+static bool
+YbIsCronLeaderActive()
+{
+	return YBCIsCronLeaderActive() && YbCronXClusterAllowed();
+}
+
 static void
 YbCheckLeadership(List *taskList, TimestampTz currentTime)
 {
 	if (!IsYugaByteEnabled())
 		return;
 
-	if (YbIsCronLeader())
+	/* Refreshed every iteration; jobCanceled reads it to decide whether to abort in-flight jobs. */
+	ybCanRunJobs = YbIsCronLeader();
+
+	if (YbIsCronLeaderActive())
 	{
 		if (!ybIsLeader)
 		{
@@ -2540,13 +2581,14 @@ YbCheckLeadership(List *taskList, TimestampTz currentTime)
 			ybIsLeader = true;
 
 			/*
-			 * The first time we detect that we are a leader, mark any inflight
-			 * job started by the previous leader as failed as that node might
-			 * still be alive. It will mark the job as completed and stop
-			 * scheduling new runs. This inconsistency will go away once
-			 * distributed job scheduling (#22336) is implemented.
+			 * Mark runs started by a previous leader (that node might still be alive, or crashed) as
+			 * failed. The actual sweep is driven by YbMarkPendingRunsAsFailed over the next
+			 * iterations rather than done once here, so it survives a stale post-failover read. This
+			 * inconsistency will go away once distributed job scheduling (#22336) is implemented.
 			 */
-			MarkPendingRunsAsFailed();
+			ybMinRunIdThisTerm = 0;
+			ybMarkPendingRunsDeadline =
+				TimestampTzPlusMilliseconds(currentTime, YB_MARK_PENDING_RUNS_WINDOW_MS);
 
 			/*
 			 * Reset the start time used for interval job. Check comment in
@@ -2564,8 +2606,13 @@ YbCheckLeadership(List *taskList, TimestampTz currentTime)
 	}
 	else if (ybIsLeader)
 	{
-		ereport(LOG, (errmsg("pg_cron switching to idle mode")));
+		/*
+		 * Stepped down. Stop starting new runs but let in-flight jobs drain while the lease is still
+		 * valid; jobCanceled aborts any that are still running once the lease expires.
+		 */
+		ereport(LOG, (errmsg("pg_cron switching to drain mode")));
 		ybIsLeader = false;
+		ybMarkPendingRunsDeadline = 0;
 
 		/*
 		 * Reset the pending run counts so that we do not start tasks that we
@@ -2578,6 +2625,26 @@ YbCheckLeadership(List *taskList, TimestampTz currentTime)
 			task->pendingRunCount = 0;
 		}
 	}
+}
+
+/*
+ * Sweeps a previous leader's orphaned runs to failed. Called every iteration while the sweep window
+ * is open (set when this node becomes leader). Retrying across iterations tolerates a stale read
+ * right after a crash-induced tablet re-election; scoping the sweep to runs below ybMinRunIdThisTerm
+ * keeps it from touching runs this leader has started, so retrying is safe. The window is closed
+ * once this leader has started a run of its own (which proves job_run_details is caught up, so the
+ * sweep read fresh data) or the deadline passes.
+ */
+static void
+YbMarkPendingRunsAsFailed(TimestampTz currentTime)
+{
+	if (ybMarkPendingRunsDeadline == 0)
+		return;
+
+	MarkPendingRunsAsFailed(ybMinRunIdThisTerm);
+
+	if (ybMinRunIdThisTerm != 0 || currentTime >= ybMarkPendingRunsDeadline)
+		ybMarkPendingRunsDeadline = 0;
 }
 
 static TimestampTz

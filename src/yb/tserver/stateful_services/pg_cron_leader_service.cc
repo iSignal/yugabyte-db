@@ -31,14 +31,20 @@ using namespace std::chrono_literals;
 
 DECLARE_bool(enable_pg_cron);
 
-DEFINE_RUNTIME_uint32(pg_cron_leader_lease_sec, 60,
-    "The time in seconds to hold the pg_cron leader lease.");
+DEFINE_RUNTIME_uint32(pg_cron_leader_lease_sec, 300,
+    "The time in seconds to hold the pg_cron leader lease. Also bounds how long a leader that "
+    "steps down keeps draining in-flight jobs, and how long a new leader waits before taking "
+    "over a crashed leader.");
 
 DEFINE_RUNTIME_uint32(pg_cron_leadership_refresh_sec, 10,
     "Frequency at which the leadership is revalidated. This should be less than "
     "pg_cron_leader_lease_sec");
 
 DEFINE_test_flag(bool, pg_cron_fail_setting_last_minute, false, "Fail setting the last minute");
+
+DEFINE_test_flag(bool, pg_cron_wipe_lease_on_deactivate, false,
+    "When true, breaking the lease on graceful deactivation reverts to the legacy behavior of "
+    "immediately aborting in-flight jobs instead of draining them.");
 
 DEFINE_validator(pg_cron_leadership_refresh_sec,
     FLAG_LT_FLAG_VALIDATOR(pg_cron_leader_lease_sec));
@@ -59,10 +65,12 @@ constexpr char kPgCronJsonLastMinute[] = "last_minute";
 
 PgCronLeaderService::PgCronLeaderService(
     std::function<void(MonoTime)> set_cron_leader_lease_fn,
+    std::function<void(bool)> set_cron_leader_active_fn,
     const scoped_refptr<MetricEntity>& metric_entity,
     const std::shared_future<client::YBClient*>& client_future)
     : StatefulRpcServiceBase(StatefulServiceKind::PG_CRON_LEADER, metric_entity, client_future),
-      set_cron_leader_lease_fn_(std::move(set_cron_leader_lease_fn)) {}
+      set_cron_leader_lease_fn_(std::move(set_cron_leader_lease_fn)),
+      set_cron_leader_active_fn_(std::move(set_cron_leader_active_fn)) {}
 
 void PgCronLeaderService::Activate() {
   if (!FLAGS_enable_pg_cron) {
@@ -94,9 +102,14 @@ void PgCronLeaderService::Activate() {
 
 void PgCronLeaderService::Deactivate() {
   std::lock_guard lock(mutex_);
-  // Break the lease immediately. This is best effort but still safe since new leader will not
-  // activate until the old leader lease has fully expired.
-  set_cron_leader_lease_fn_(MonoTime::kUninitialized);
+  // Go inactive so the scheduler stops starting new runs, but keep the lease so it can drain
+  // in-flight jobs until the lease expires. Safe because a new leader waits out the old lease.
+  set_cron_leader_active_fn_(false);
+
+  if (FLAGS_TEST_pg_cron_wipe_lease_on_deactivate) {
+    set_cron_leader_lease_fn_(MonoTime::kUninitialized);
+  }
+
   leader_activate_time_ = MonoTime::kUninitialized;
 
   LOG_WITH_FUNC(INFO) << "Deactivated";
@@ -136,10 +149,11 @@ void PgCronLeaderService::RefreshLeaderLease() {
     return;
   }
 
-  // We are the leader. Renew the lease.
+  // We are the leader. Renew the lease and mark ourselves active.
   const auto lease_end = now + MonoDelta::FromSeconds(FLAGS_pg_cron_leader_lease_sec);
   VLOG_WITH_FUNC(1) << "Setting leader lease to " << lease_end.ToFormattedString();
   set_cron_leader_lease_fn_(lease_end);
+  set_cron_leader_active_fn_(true);
 }
 
 Status PgCronLeaderService::SetLastMinute(int64_t last_minute, CoarseTimePoint deadline) {

@@ -515,6 +515,8 @@ class TabletServer : public DbServerBase, public TabletServerIf {
 
   void SetCronLeaderLease(MonoTime cron_leader_lease_end);
 
+  void SetCronLeaderActive(bool active);
+
   std::atomic<bool> initted_{false};
 
   // If true, all heartbeats will be seen as failed.

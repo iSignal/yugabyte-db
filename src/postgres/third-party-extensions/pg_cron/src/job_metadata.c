@@ -1417,8 +1417,14 @@ AlterJob(int64 jobId, text *scheduleText, text *commandText, text *databaseText,
 	InvalidateJobCache();
 }
 
+/*
+ * Marks every run still in a non-terminal state as failed. runIdCeiling bounds which runs are
+ * touched: only runs with runid < runIdCeiling are marked (pass 0 to mark all). The caller uses this
+ * to mark a previous leader's orphaned runs without touching runs the current leader has started
+ * (whose runids are >= runIdCeiling), which makes the call safe to retry.
+ */
 void
-MarkPendingRunsAsFailed(void)
+MarkPendingRunsAsFailed(int64 runIdCeiling)
 {
 	StringInfoData querybuf;
 	MemoryContext originalContext = CurrentMemoryContext;
@@ -1443,8 +1449,8 @@ MarkPendingRunsAsFailed(void)
 
 
 	appendStringInfo(&querybuf,
-		"update %s.%s set status = '%s', return_message = 'server restarted' where status in ('%s','%s')"
-		, CRON_SCHEMA_NAME, JOB_RUN_DETAILS_TABLE_NAME, GetCronStatus(CRON_STATUS_FAILED), GetCronStatus(CRON_STATUS_STARTING), GetCronStatus(CRON_STATUS_RUNNING));
+		"update %s.%s set status = '%s', return_message = 'server restarted' where status in ('%s','%s') and (" INT64_FORMAT " = 0 or runid < " INT64_FORMAT ")"
+		, CRON_SCHEMA_NAME, JOB_RUN_DETAILS_TABLE_NAME, GetCronStatus(CRON_STATUS_FAILED), GetCronStatus(CRON_STATUS_STARTING), GetCronStatus(CRON_STATUS_RUNNING), runIdCeiling, runIdCeiling);
 
 
 	if (SPI_exec(querybuf.data, 0) != SPI_OK_UPDATE)

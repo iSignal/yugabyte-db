@@ -59,7 +59,7 @@ extern void InsertJobRunDetail(int64 runId, int64 *jobId, char *database, char *
 extern void UpdateJobRunDetail(int64 runId, int32 *job_pid, char *status, char *return_message, TimestampTz *start_time,
 									TimestampTz *end_time);
 extern int64 NextRunId(void);
-extern void MarkPendingRunsAsFailed(void);
+extern void MarkPendingRunsAsFailed(int64 runIdCeiling);
 extern char *GetCronStatus(CronStatus cronstatus);
 
 extern void InvalidateJobCacheCallback(Datum argument, Oid relationId);

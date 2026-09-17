@@ -41,6 +41,8 @@ constexpr auto kDefaultJobName = "Job1";
 constexpr auto kJobListRefreshInterval = 10;
 constexpr auto kFailedJobStatus = "failed";
 constexpr auto kRunningJobStatus = "running";
+constexpr auto kSucceededJobStatus = "succeeded";
+constexpr auto kLeaderChangedMessage = "pg_cron leader changed";
 const client::YBTableName service_table_name =
     stateful_service::GetStatefulServiceTableName(StatefulServiceKind::PG_CRON_LEADER);
 const auto kTimeout = 60s * kTimeMultiplier;
@@ -180,6 +182,47 @@ class PgCronTest : public MiniClusterTestWithClient<ExternalMiniCluster> {
           "SELECT * FROM cron.job_run_details WHERE jobid = $0 ORDER BY start_time DESC", job_id),
           ",", "\n");
     return s;
+  }
+
+  // Returns the runid of the most recent run of the job that is currently in the 'running' state.
+  Result<int64_t> GetRunningRunId(int64 job_id) {
+    return conn_->FetchRow<int64_t>(Format(
+        "SELECT runid FROM cron.job_run_details WHERE jobid = $0 AND status = '$1' "
+        "ORDER BY start_time DESC LIMIT 1",
+        job_id, kRunningJobStatus));
+  }
+
+  // Waits for a specific run (identified by runid) to reach the given status. Unlike
+  // WaitForJobStatus this tracks a single run, so it is stable even as the job keeps rescheduling.
+  Status WaitForRunStatus(int64 runid, const std::string& status) {
+    Status s = LoggedWaitFor(
+        [this, runid, status]() -> Result<bool> {
+          return VERIFY_RESULT(conn_->FetchRow<pgwrapper::PGUint64>(Format(
+                     "SELECT COUNT(*) FROM cron.job_run_details WHERE runid = $0 AND status = '$1'",
+                     runid, status))) > 0;
+        },
+        kTimeout, Format("Wait for run $0 to have status '$1'", runid, status));
+    if (!s.ok()) {
+      LOG(INFO) << "job_run_details on failure:\n"
+                << conn_->FetchAllAsString(
+                       "SELECT runid, jobid, status, return_message FROM cron.job_run_details "
+                       "ORDER BY runid",
+                       " | ", "\n");
+    }
+    return s;
+  }
+
+  // Returns the number of tservers currently executing the given command in a backend.
+  Result<std::set<size_t>> NodesRunningQuery(const std::string& query) {
+    std::set<size_t> nodes;
+    for (size_t idx = 0; idx < cluster_->num_tablet_servers(); ++idx) {
+      auto conn = VERIFY_RESULT(cluster_->ConnectToDB("yugabyte", idx));
+      if (VERIFY_RESULT(conn.FetchRow<pgwrapper::PGUint64>(Format(
+              "SELECT COUNT(*) FROM pg_stat_activity WHERE query = '$0'", query))) > 0) {
+        nodes.insert(idx);
+      }
+    }
+    return nodes;
   }
 
   Status WaitForDataInPgCronLeaderTable() {
@@ -684,50 +727,96 @@ TEST_F(PgCronTest, KillRunningJob) {
   }
 }
 
-TEST_F(PgCronTest, CancelJobOnLeaderChange) {
+// On a graceful leader change the old (stepping-down) leader drains its in-flight jobs instead of
+// aborting them: a job that finishes within the lease is allowed to complete and is marked
+// 'succeeded', while a job that runs longer than the lease is aborted only once the lease expires
+// and is marked 'failed'. Either way the old leader is left running no jobs afterwards.
+TEST_F(PgCronTest, GracefulLeaderChangeDrainsRunningJobs) {
   // Disable load balancing to prevent interference from new system tablets.
   // When additional system tablets are added, the load balancer may move
   // the tablet leader back to the original node after an explicit leader move,
   // causing unexpected test failures.
   ASSERT_OK(cluster_->SetFlagOnMasters("enable_load_balancing", "false"));
-  // Start a job that will run for a long time.
-  ASSERT_OK(ScheduleJob("Sleep Job", "1 second", "SELECT pg_sleep(1000)"));
-  ASSERT_OK(Schedule1SecInsertJob());
 
-  ASSERT_OK(WaitForRowCountAbove(0));
+  // The lease is kJobListRefreshInterval (10s) seconds long (set in SetUp).
+  // The short job finishes well within the lease so it can be drained to completion.
+  const std::string short_query = "SELECT pg_sleep(5)";
+  const auto short_job_name = "Short Sleep";
+  const auto short_job_id = ASSERT_RESULT(ScheduleJob(short_job_name, "1 second", short_query));
+  // The long job runs much longer than the lease so it cannot be drained and must be aborted when
+  // the lease expires.
+  const std::string long_query = "SELECT pg_sleep(1000)";
+  const auto long_job_name = "Long Sleep";
+  const auto long_job_id = ASSERT_RESULT(ScheduleJob(long_job_name, "1 second", long_query));
 
-  auto nodes_running_sleep_jobs = [this]() -> Result<std::set<size_t>> {
-    std::set<size_t> nodes_running_job;
-    for (size_t idx = 0; idx < cluster_->num_tablet_servers(); ++idx) {
-      auto conn = VERIFY_RESULT(cluster_->ConnectToDB("yugabyte", idx));
-      if (VERIFY_RESULT(conn.FetchRow<pgwrapper::PGUint64>(
-              "SELECT COUNT(*) FROM pg_stat_activity WHERE query = 'SELECT pg_sleep(1000)'")) > 0) {
-        nodes_running_job.insert(idx);
-      }
-    }
-    return nodes_running_job;
-  };
+  // Wait for both jobs to be running and capture the specific runs that are in flight.
+  ASSERT_OK(WaitForJobStatus(short_job_id, short_job_name, kRunningJobStatus));
+  ASSERT_OK(WaitForJobStatus(long_job_id, long_job_name, kRunningJobStatus));
 
-  const auto initial_nodes_running_job = ASSERT_RESULT(nodes_running_sleep_jobs());
-  ASSERT_EQ(initial_nodes_running_job.size(), 1);
+  const auto initial_leader_idx = ASSERT_RESULT(cluster_->GetTabletLeaderIndex(tablet_id_));
+  const auto short_runid = ASSERT_RESULT(GetRunningRunId(short_job_id));
+  const auto long_runid = ASSERT_RESULT(GetRunningRunId(long_job_id));
 
+  // Gracefully move leadership away from the current leader.
   ASSERT_OK(cluster_->MoveTabletLeader(tablet_id_));
 
-  // Wait for the jobs to get killed.
-  SleepFor(kJobListRefreshInterval * 1s);
+  // The short job that was in flight is drained to completion on the old leader.
+  ASSERT_OK(WaitForRunStatus(short_runid, kSucceededJobStatus));
 
-  // Wait for the new leader to start running.
-  const auto initial_row_count = ASSERT_RESULT(GetRowCount());
-  ASSERT_OK(WaitForRowCountAbove(initial_row_count));
+  // The long job cannot finish within the lease, so it is aborted once the lease expires.
+  ASSERT_OK(WaitForRunStatus(long_runid, kFailedJobStatus));
+  // Aborted by the old leader at lease expiry ('pg_cron leader changed'), or by the new leader's
+  // sweep if it activates first ('server restarted').
+  const auto long_message = ASSERT_RESULT(conn_->FetchRow<std::string>(Format(
+      "SELECT return_message FROM cron.job_run_details WHERE runid = $0", long_runid)));
+  ASSERT_TRUE(long_message == kLeaderChangedMessage || long_message == "server restarted")
+      << "unexpected message: " << long_message;
 
-  const auto final_nodes_running_job = ASSERT_RESULT(nodes_running_sleep_jobs());
-  ASSERT_EQ(final_nodes_running_job.size(), 1);
-  ASSERT_NE(*final_nodes_running_job.begin(), *initial_nodes_running_job.begin());
+  // After the lease expires the old leader is no longer running any job; only the new leader is.
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        const auto nodes = VERIFY_RESULT(NodesRunningQuery(long_query));
+        return nodes.size() == 1 && nodes.count(initial_leader_idx) == 0;
+      },
+      kTimeout, "Wait for only the new leader to be running the long job"));
+}
 
-  const auto count_killed = ASSERT_RESULT(conn_->FetchRow<pgwrapper::PGUint64>(
-      "SELECT COUNT(*) FROM cron.job_run_details WHERE return_message = 'pg_cron leader changed'"));
-  ASSERT_TRUE(count_killed == 1 || count_killed == 2)
-      << count_killed << " rows found when only 1 or 2 is expected";
+// On an ungraceful leader change (the leader tserver is killed) the new leader takes over after the
+// old lease expires and marks the orphaned run as failed via MarkPendingRunsAsFailed, which is
+// retried across iterations (scoped to runs below this leader's first runid) so it tolerates a
+// stale post-failover read.
+TEST_F(PgCronTest, UngracefulLeaderChangeMarksJobFailed) {
+  ASSERT_OK(cluster_->SetFlagOnMasters("enable_load_balancing", "false"));
+
+  const auto job_name = "Sleep Job";
+  const auto job_id = ASSERT_RESULT(ScheduleJob(job_name, "1 second", "SELECT pg_sleep(1000)"));
+
+  ASSERT_OK(WaitForJobStatus(job_id, job_name, kRunningJobStatus));
+  const auto runid = ASSERT_RESULT(GetRunningRunId(job_id));
+  const auto initial_leader_idx = ASSERT_RESULT(cluster_->GetTabletLeaderIndex(tablet_id_));
+
+  // Hard kill (SIGKILL) the leader tserver. This takes down its postgres, so the job cannot be
+  // finalized by the old leader.
+  cluster_->tablet_server(initial_leader_idx)->Shutdown();
+
+  // Reconnect to a surviving node.
+  conn_ = std::make_unique<pgwrapper::PGConn>(ASSERT_RESULT(cluster_->ConnectToDB(
+      /*db_name=*/"yugabyte",
+      /*node_index=*/(initial_leader_idx + 1) % cluster_->num_tablet_servers())));
+
+  // Wait for a new leader to take over.
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        auto leader = cluster_->GetTabletLeaderIndex(tablet_id_);
+        return leader.ok() && *leader != initial_leader_idx;
+      },
+      kTimeout, "Wait for new leader"));
+
+  // The new leader marks the orphaned run as failed.
+  ASSERT_OK(WaitForRunStatus(runid, kFailedJobStatus));
+
+  // YBMiniClusterTestBase test-end verification will fail if the cluster is up with stopped nodes.
+  cluster_->Shutdown();
 }
 
 }  // namespace yb
