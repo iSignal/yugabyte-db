@@ -564,6 +564,13 @@ class YBClient::Data {
   std::unique_ptr<rpc::ProxyCache> proxy_cache_;
   scoped_refptr<internal::MetaCache> meta_cache_;
   scoped_refptr<MetricEntity> metric_entity_;
+  MetricRegistry* metric_registry_ = nullptr;
+
+  internal::AsyncRpcMetricsPtr GetTableAsyncRpcMetrics(const YBTable& table);
+
+  mutable simple_spinlock table_async_rpc_metrics_mutex_;
+  std::unordered_map<TableId, internal::AsyncRpcMetricsPtr> table_async_rpc_metrics_
+      GUARDED_BY(table_async_rpc_metrics_mutex_);
 
   // Flag name to fetch master addresses from flagfile.
   std::string master_address_flag_name_;

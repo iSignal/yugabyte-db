@@ -36,7 +36,8 @@ namespace client {
 AsyncClientInitializer::AsyncClientInitializer(
     const std::string& client_name, MonoDelta default_timeout, const std::string& tserver_uuid,
     const yb::server::ServerBaseOptions* opts, scoped_refptr<MetricEntity> metric_entity,
-    const std::shared_ptr<MemTracker>& parent_mem_tracker, rpc::Messenger* messenger)
+    MetricRegistry* metric_registry, const std::shared_ptr<MemTracker>& parent_mem_tracker,
+    rpc::Messenger* messenger)
     : client_builder_(std::make_unique<YBClientBuilder>()),
       messenger_(messenger),
       client_future_(client_promise_.get_future()) {
@@ -55,6 +56,7 @@ AsyncClientInitializer::AsyncClientInitializer(
   client_builder_->set_skip_master_leader_resolution(
       master_addresses.size() == 1 && !FLAGS_TEST_force_master_leader_resolution);
   client_builder_->set_metric_entity(metric_entity);
+  client_builder_->set_metric_registry(metric_registry);
   client_builder_->set_parent_mem_tracker(parent_mem_tracker);
 
   // Build cloud_info_pb.

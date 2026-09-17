@@ -105,6 +105,7 @@
 #include "yb/util/logging.h"
 #include "yb/util/mem_tracker.h"
 #include "yb/util/metric_entity.h"
+#include "yb/util/metrics.h"
 #include "yb/util/monotime.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/physical_time.h"
@@ -441,6 +442,11 @@ YBClientBuilder& YBClientBuilder::set_metric_entity(
   return *this;
 }
 
+YBClientBuilder& YBClientBuilder::set_metric_registry(MetricRegistry* metric_registry) {
+  data_->metric_registry_ = metric_registry;
+  return *this;
+}
+
 YBClientBuilder& YBClientBuilder::set_client_name(const std::string& name) {
   data_->client_name_ = name;
   return *this;
@@ -496,6 +502,7 @@ Status YBClientBuilder::DoBuild(rpc::Messenger* messenger,
   }
   c->data_->proxy_cache_ = std::make_unique<rpc::ProxyCache>(c->data_->messenger_);
   c->data_->metric_entity_ = data_->metric_entity_;
+  c->data_->metric_registry_ = data_->metric_registry_;
 
   c->data_->master_address_flag_name_ = data_->master_address_flag_name_;
   c->data_->master_address_sources_ = data_->master_address_sources_;
