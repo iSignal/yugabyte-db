@@ -261,7 +261,7 @@ Change the type of an existing column. The following semantics apply:
 
 ##### Table rewrites
 
-Altering a column's type requires a [full table rewrite](#alter-table-operations-that-involve-a-table-rewrite), and any indexes that contain this column when the underlying storage format changes or if the data changes.
+Altering a column's type requires a [full table rewrite](#alter-table-operations-that-involve-a-table-rewrite) when the underlying storage format changes or when the stored data changes. Indexes that include the column are handled separately; see [Index rewrites](#index-rewrites).
 
 The following type changes commonly require a table rewrite:
 
@@ -276,8 +276,9 @@ The following type changes commonly require a table rewrite:
 | BOOLEAN      | INTEGER        | Different sizes and encoding.                                         |
 | REAL         | NUMERIC        | Different precision and format.                                       |
 | NUMERIC(p,s) | NUMERIC(p2,s2) | Requires data changes if scale is changed or if precision is smaller. |
+| CHAR(n)      | CHAR(m) (m > n) | Stored values are blank-padded to the new length.                    |
 
-The following type changes do not require a rewrite when there is no associated index table on the column. When there is an associated index table on the column, a rewrite is performed on the index table alone but not on the main table.
+The following type changes do not require a table rewrite:
 
 | From              |  To                   | Notes                  |
 | ------------ | ------------------ | ------------------------------------------------------ |
@@ -285,8 +286,7 @@ The following type changes do not require a rewrite when there is no associated 
 | VARCHAR(n)   | TEXT               | Always compatible.                                     |
 | SERIAL       | INTEGER            | Underlying type is INTEGER; usually OK.                |
 | NUMERIC(p,s) | NUMERIC(p2,s2)     | If new precision is larger and scale remains the same. |
-| CHAR(n)      | CHAR(m) (m > n)    | PG stores it as padded TEXT, so often fine.            |
-| Domain types | Their base type    | Compatible, unless additional constraints exist.       |
+| Domain types | Their base type    | Compatible, unless the base type carries a type modifier (a domain over VARCHAR(n), for example), which forces every value to be re-checked. |
 
 Altering a column with a (non-trivial) USING clause always requires a rewrite.
 
@@ -304,6 +304,48 @@ For example, the following ALTER TYPE statements would cause a table rewrite:
 The following ALTER TYPE statement does not cause a table rewrite:
 
 - ALTER TABLE test ALTER COLUMN a TYPE VARCHAR(51); -- from VARCHAR(50)
+
+##### Index rewrites
+
+Altering a column's type doesn't necessarily rewrite the indexes on that column:
+
+- If the main table is rewritten, every index on the table is rewritten with it.
+- If the main table is not rewritten, an index that includes the altered column is rewritten only if the index isn't compatible with the new type. For a compatible index, YugabyteDB records the new type in the index metadata and leaves the index table itself untouched, so the index keeps its data and its split properties.
+- Indexes that don't include the altered column are never rewritten.
+
+An index is compatible with the new column type when all of the following are true:
+
+- It is neither an expression index nor a partial index.
+- It is valid; that is, it isn't an incomplete index left behind by a failed [CREATE INDEX](../ddl_create_index).
+- The operator class, operator class options, and collation of every key column are unchanged.
+- For an index backing an exclusion constraint, the exclusion operators are unchanged.
+
+Compatibility is decided for the index as a whole, so an index with multiple key columns is rewritten in full if any one of its key columns is incompatible.
+
+Because YugabyteDB stores the primary key with the table rather than in a separate index table, a compatible type change to a primary key column leaves the table in place as well.
+
+For example:
+
+```sql
+CREATE TABLE test (a VARCHAR(50));
+CREATE INDEX test_a_idx ON test (a);
+
+-- Compatible: the index metadata is updated, and the index is not rewritten.
+ALTER TABLE test ALTER COLUMN a TYPE VARCHAR(51);
+
+-- Incompatible (the collation changes): the index is rewritten.
+ALTER TABLE test ALTER COLUMN a TYPE VARCHAR(51) COLLATE "C";
+```
+
+Every rewrite, of a table or of an index, raises a notice, so you can use the output of the statement to tell whether anything was rewritten:
+
+```output
+NOTICE:  index rewrite may lead to inconsistencies
+DETAIL:  Concurrent DMLs may not be reflected in the new index.
+HINT:  See https://github.com/yugabyte/yugabyte-db/issues/19860. Set 'ysql_suppress_unsafe_alter_notice' yb-tserver gflag to true to suppress this notice.
+```
+
+Avoid running DML concurrently with an ALTER TABLE that rewrites a table or an index. For more information, refer to [TA-24007](/stable/releases/techadvisories/ta-24007/).
 
 #### DROP CONSTRAINT *constraint_name* [ RESTRICT | CASCADE ]
 
