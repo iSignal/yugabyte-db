@@ -310,12 +310,12 @@ The following ALTER TYPE statement does not cause a table rewrite:
 Altering a column's type doesn't necessarily rewrite the indexes on that column:
 
 - If the main table is rewritten, every index on the table is rewritten with it.
-- If the main table is not rewritten, an index that includes the altered column is rewritten only if the index isn't compatible with the new type. For a compatible index, YugabyteDB records the new type in the index metadata and leaves the index table itself untouched, so the index keeps its data and its split properties.
 - Indexes that don't include the altered column are never rewritten.
+- An expression index or a partial index that includes the altered column is always rewritten, whatever the type change. YugabyteDB doesn't evaluate whether the expression or the predicate is affected by the new type.
+- Any other index that includes the altered column is rewritten only if the index isn't compatible with the new type. For a compatible index, YugabyteDB records the new type in the index metadata and leaves the index table itself untouched, so the index keeps its data and its split properties.
 
-An index is compatible with the new column type when all of the following are true:
+An index that is neither an expression index nor a partial index is compatible with the new column type when all of the following are true:
 
-- It is neither an expression index nor a partial index.
 - It is valid; that is, it isn't an incomplete index left behind by a failed [CREATE INDEX](../ddl_create_index).
 - The operator class, operator class options, and collation of every key column are unchanged.
 - For an index backing an exclusion constraint, the exclusion operators are unchanged.
