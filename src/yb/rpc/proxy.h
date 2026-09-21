@@ -33,6 +33,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -62,11 +63,32 @@ class Message;
 
 namespace yb {
 
+class CountDownLatch;
 class MemTracker;
 
 namespace rpc {
 
 YB_DEFINE_ENUM(ResolveState, (kIdle)(kResolving)(kNotifying)(kFinished));
+
+// Returns a non-OK status when the thread blocked in Proxy::SyncRequest should give up on the
+// in-flight call. It lets a thread react to events the RPC layer knows nothing about - a postgres
+// backend, for example, learns about query cancellation and client disconnects through signals
+// that cannot unwind the C++ frames the call is parked in.
+//
+// Invoked on the thread that issued the call, at most once per
+// FLAGS_sync_rpc_abort_check_interval_ms, and only while the call has not completed.
+using SyncRequestAbortChecker = std::function<Status()>;
+
+// Installs a checker for the current thread for the lifetime of the object. Nesting is not
+// supported: a thread may have at most one checker installed at a time.
+class ScopedSyncRequestAbortChecker {
+ public:
+  explicit ScopedSyncRequestAbortChecker(SyncRequestAbortChecker checker);
+  ~ScopedSyncRequestAbortChecker();
+
+  ScopedSyncRequestAbortChecker(const ScopedSyncRequestAbortChecker&) = delete;
+  void operator=(const ScopedSyncRequestAbortChecker&) = delete;
+};
 
 // Interface to send calls to a remote or local service.
 //
@@ -187,6 +209,10 @@ class Proxy {
                        AnyMessagePtr resp,
                        RpcController* controller,
                        bool send_metadata);
+
+  // Blocks until the response callback for `controller`'s call has run, giving the current
+  // thread's abort checker, if any, a chance to cut the wait short.
+  static void WaitForSyncResponse(const CountDownLatch& latch, RpcController* controller);
 
   static void NotifyFailed(RpcController* controller, const Status& status);
 

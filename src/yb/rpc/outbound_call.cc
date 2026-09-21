@@ -913,6 +913,13 @@ Status OutboundCall::InitHeader(RequestHeader* header) {
   return Status::OK();
 }
 
+void OutboundCall::QueueAbort(const Status& status) {
+  auto connection = connection_weak_.lock();
+  if (connection) {
+    connection->QueueAbortCall(shared_from(this), status);
+  }
+}
+
 void OutboundCall::QueueDumpConnectionState() const {
   auto connection = connection_weak_.lock();
   if (connection) {

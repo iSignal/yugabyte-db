@@ -8328,6 +8328,11 @@ YbRedactPasswordIfExists(const char *queryStr, CommandTag commandTag)
  * Checks for pending interrupts which might abort execution and there are no blockers
  * to process them.
  * See ProcessInterrupts(), INTERRUPTS_CAN_BE_PROCESSED() for details.
+ *
+ * Called by pggate both after an RPC completes and, periodically, while one is still in flight.
+ * The latter is why the client connection check below is resolved here rather than being left to
+ * ProcessInterrupts: a backend parked in an RPC does not reach a CHECK_FOR_INTERRUPTS, so nothing
+ * else would turn a pending check into ClientConnectionLost.
  */
 bool
 YBHasProcessableAbortInterrupt()
@@ -8340,6 +8345,21 @@ YBHasProcessableAbortInterrupt()
 
 	if (ProcDiePending)
 		return true;
+
+	if (CheckClientConnectionPending)
+	{
+		CheckClientConnectionPending = false;
+
+		/* Kept in sync with ProcessInterrupts(). */
+		if (!DoingCommandRead && client_connection_check_interval > 0)
+		{
+			if (!pq_check_connection())
+				ClientConnectionLost = true;
+			else
+				enable_timeout_after(CLIENT_CONNECTION_CHECK_TIMEOUT,
+									 client_connection_check_interval);
+		}
+	}
 
 	if (ClientConnectionLost)
 		return true;

@@ -177,6 +177,17 @@ void RpcController::MarkCallAsFailed() {
   }
 }
 
+void RpcController::QueueAbort(const Status& status) {
+  OutboundCallPtr call;
+  {
+    std::lock_guard l(lock_);
+    call = call_;
+  }
+  if (call) {
+    call->QueueAbort(status);
+  }
+}
+
 CallResponsePtr RpcController::response() const {
   return CallResponsePtr(call_, &call_->call_response_);
 }

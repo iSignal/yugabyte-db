@@ -33,6 +33,7 @@
 #include "yb/gutil/casts.h"
 #include "yb/gutil/ref_counted.h"
 
+#include "yb/rpc/proxy.h"
 #include "yb/rpc/rpc_fwd.h"
 
 #include "yb/server/hybrid_clock.h"
@@ -1021,6 +1022,11 @@ class PgApiImpl {
   // TODO Rename to client_ when YBClient is removed.
   PgClient pg_client_;
   std::unique_ptr<Interrupter> interrupter_;
+
+  // Lets a synchronous RPC issued by this backend give up when postgres has a pending interrupt.
+  // Only covers the thread that constructed PgApiImpl, i.e. the backend's main thread, which is
+  // also the only thread allowed to look at postgres' interrupt state.
+  rpc::ScopedSyncRequestAbortChecker sync_request_abort_checker_{&CheckForPgInterrupts};
 
   scoped_refptr<server::HybridClock> clock_;
 

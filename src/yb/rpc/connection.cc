@@ -83,12 +83,15 @@ namespace yb::rpc {
 
 namespace {
 
+// Completes an active call ahead of receiving its response and drops it from the connection's
+// bookkeeping. `abort_status`, when set, is reported instead of a timeout.
 template<typename ContainerIndex>
 void ActiveCallExpired(
     ContainerIndex& index,
     typename ContainerIndex::iterator iter,
     Reactor* reactor,
-    Stream* stream) ON_REACTOR_THREAD {
+    Stream* stream,
+    const Status* abort_status = nullptr) ON_REACTOR_THREAD {
   auto call = iter->call;
   if (!call) {
     LOG(DFATAL) << __func__ << ": call is null in " << iter->ToString();
@@ -97,7 +100,11 @@ void ActiveCallExpired(
   auto handle = iter->handle;
   auto erase = false;
   if (!call->IsFinished()) {
-    call->SetTimedOut();
+    if (abort_status) {
+      call->SetFailed(*abort_status);
+    } else {
+      call->SetTimedOut();
+    }
     if (handle != kUnknownCallHandle) {
       erase = stream->Cancelled(handle);
     }
@@ -682,6 +689,22 @@ void Connection::ForceCallExpiration(const OutboundCallPtr& call) {
     ActiveCallExpired(active_calls_, it, reactor_, stream_.get());
   } else if (!call->IsFinished()) {
     call->SetTimedOut();
+  }
+}
+
+void Connection::QueueAbortCall(const OutboundCallPtr& call, const Status& status) {
+  auto task = MakeFunctorReactorTask(
+      std::bind(&Connection::AbortCall, this, call, status), shared_from_this(),
+      SOURCE_LOCATION());
+  WARN_NOT_OK(reactor_->ScheduleReactorTask(task), "Failed to schedule outbound call abort");
+}
+
+void Connection::AbortCall(const OutboundCallPtr& call, const Status& status) {
+  auto it = active_calls_.find(call->call_id());
+  if (it != active_calls_.end()) {
+    ActiveCallExpired(active_calls_, it, reactor_, stream_.get(), &status);
+  } else if (!call->IsFinished()) {
+    call->SetFailed(status);
   }
 }
 

@@ -217,6 +217,11 @@ class Connection final : public StreamContext, public std::enable_shared_from_th
   // Used in Reactor-based stuck outbound call monitoring mechanism.
   void ForceCallExpiration(const OutboundCallPtr& call) ON_REACTOR_THREAD;
 
+  // Completes `call` with `status` without waiting for its response. May be called from any
+  // thread; the work is deferred to the reactor thread, which is also the only thread that
+  // completes calls, so this cannot race with the response arriving.
+  void QueueAbortCall(const OutboundCallPtr& call, const Status& status);
+
   void ReportQueueTime(MonoDelta delta);
 
   void ListenShutdown(const std::function<void()>& listener) EXCLUDES(outbound_data_queue_mtx_);
@@ -253,6 +258,8 @@ class Connection final : public StreamContext, public std::enable_shared_from_th
       ON_REACTOR_THREAD override;
   Status Connected() override;
   StreamReadBuffer& ReadBuffer() override;
+
+  void AbortCall(const OutboundCallPtr& call, const Status& status) ON_REACTOR_THREAD;
 
   void CleanupExpirationQueue(CoarseTimePoint now) ON_REACTOR_THREAD;
   // call_ptr is used only for logging to correlate with OutboundCall trace.

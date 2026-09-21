@@ -1136,6 +1136,51 @@ TEST_F(RpcStubTest, OutboundSidecars) {
   }
 }
 
+// A thread blocked in a synchronous call must be able to give up on it: the abort checker below
+// stands in for a postgres backend learning about a query cancellation or a client disconnect
+// while parked in Proxy::SyncRequest.
+TEST_F(RpcStubTest, SyncRequestAbortedByChecker) {
+  constexpr auto kAbortAfter = 300ms;
+  constexpr auto kSleep = 3s;
+
+  CalculatorServiceProxy p(proxy_cache_.get(), server_hostport_);
+
+  RpcController controller;
+  controller.set_timeout(kSleep * 2);
+  SleepRequestPB req;
+  req.set_sleep_micros(narrow_cast<uint32_t>(MonoDelta(kSleep).ToMicroseconds()));
+  SleepResponsePB resp;
+
+  const auto abort_at = CoarseMonoClock::now() + kAbortAfter;
+  ScopedSyncRequestAbortChecker abort_checker([abort_at] {
+    return CoarseMonoClock::now() < abort_at
+        ? Status::OK() : STATUS(Aborted, "Simulated postgres interrupt");
+  });
+
+  auto start = MonoTime::Now();
+  auto status = p.Sleep(req, &resp, &controller);
+  auto elapsed = MonoTime::Now() - start;
+
+  ASSERT_TRUE(status.IsAborted()) << status;
+  ASSERT_LT(elapsed, kSleep / 2);
+  ASSERT_TRUE(controller.finished());
+}
+
+// Without a checker installed the wait must stay exactly as it was: driven by the call's own
+// deadline.
+TEST_F(RpcStubTest, SyncRequestWithoutAbortChecker) {
+  CalculatorServiceProxy p(proxy_cache_.get(), server_hostport_);
+
+  RpcController controller;
+  controller.set_timeout(300ms);
+  SleepRequestPB req;
+  req.set_sleep_micros(narrow_cast<uint32_t>(MonoDelta(3s).ToMicroseconds()));
+  SleepResponsePB resp;
+
+  auto status = p.Sleep(req, &resp, &controller);
+  ASSERT_TRUE(status.IsTimedOut()) << status;
+}
+
 TEST_F(RpcStubTest, StuckOutboundCallWithActiveConnection) {
   SendSimpleCall();
 

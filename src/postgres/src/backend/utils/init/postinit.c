@@ -113,6 +113,8 @@ static void process_settings(Oid databaseid, Oid roleid);
 
 /* YB functions */
 static void YbPresetDatabaseCollation(HeapTuple tuple);
+static void YbEnableStartupTimeouts(void);
+static void YbDisableStartupTimeouts(void);
 
 static long YbNumAuthorizedConnections = 0L;
 
@@ -1130,6 +1132,8 @@ InitPostgresImpl(const char *in_dbname, Oid dboid,
 	/* Connect to YugaByte cluster. */
 	YBInitPostgresBackend("postgres", yb_init_info);
 
+	YbEnableStartupTimeouts();
+
 	if (!bootstrap && MyProcPort != NULL &&
 		MyProcPort->yb_dist_traceparent != NULL &&
 		MyProcPort->yb_dist_traceparent[0] != '\0')
@@ -1341,6 +1345,9 @@ InitPostgresImpl(const char *in_dbname, Oid dboid,
 			override_allow_connections = (override_allow_connections ||
 										  MyProcPort->yb_is_tserver_auth_method);
 	}
+
+	/* YB: PerformAuthentication() consumed the STATEMENT_TIMEOUT slot; take it back. */
+	YbEnableStartupTimeouts();
 
 	/*
 	 * Binary upgrades only allowed super-user connections
@@ -1761,6 +1768,54 @@ YbEnsureSysTablePrefetchingStopped()
 		YBCStopSysTablePrefetching();
 }
 
+/*
+ * YB: Bound the catalog reads a backend performs while it is starting up.
+ *
+ * Establishing a connection in YSQL prefetches and preloads catalog data over RPCs to the local
+ * tserver, most of it before authentication runs.  None of the timers a backend normally relies on
+ * are armed during that window, so a stalled preload leaves the backend - and the client waiting
+ * on it - parked until the RPC deadline (ysql_client_read_write_timeout_ms, 10 minutes by
+ * default).
+ *
+ * Reuse the statement timeout infrastructure the way PerformAuthentication() does.  Besides
+ * cancelling an in-flight preload when it fires, arming the timer propagates the deadline to
+ * pggate, so each individual RPC is bounded as well.  authentication_timeout is the ceiling
+ * because this is connection establishment; a smaller statement_timeout, if one is configured,
+ * wins.
+ */
+static void
+YbEnableStartupTimeouts(void)
+{
+	int			timeout_ms;
+
+	if (!IsYugaByteEnabled() || IsBootstrapProcessingMode() || MyProcPort == NULL)
+		return;
+
+	timeout_ms = AuthenticationTimeout * 1000;
+	if (StatementTimeout > 0 && StatementTimeout < timeout_ms)
+		timeout_ms = StatementTimeout;
+
+	enable_timeout_after(STATEMENT_TIMEOUT, timeout_ms);
+
+	/*
+	 * A client that goes away mid-startup is otherwise only noticed once the backend gets back to
+	 * reading a command, which a stalled preload never does.
+	 */
+	if (client_connection_check_interval > 0 && IsUnderPostmaster)
+		enable_timeout_after(CLIENT_CONNECTION_CHECK_TIMEOUT,
+							 client_connection_check_interval);
+}
+
+static void
+YbDisableStartupTimeouts(void)
+{
+	if (get_timeout_active(STATEMENT_TIMEOUT))
+		disable_timeout(STATEMENT_TIMEOUT, false);
+
+	if (get_timeout_active(CLIENT_CONNECTION_CHECK_TIMEOUT))
+		disable_timeout(CLIENT_CONNECTION_CHECK_TIMEOUT, false);
+}
+
 void
 YbInitPostgres(const char *in_dbname, Oid dboid,
 			   const char *username, Oid useroid,
@@ -1778,11 +1833,13 @@ YbInitPostgres(const char *in_dbname, Oid dboid,
 	}
 	PG_CATCH();
 	{
+		YbDisableStartupTimeouts();
 		YbEnsureSysTablePrefetchingStopped();
 		YBCUpdateInitPostgresMetrics();
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	YbDisableStartupTimeouts();
 	YbEnsureSysTablePrefetchingStopped();
 	YBCUpdateInitPostgresMetrics();
 }

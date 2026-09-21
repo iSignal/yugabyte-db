@@ -64,6 +64,13 @@ DEFINE_UNKNOWN_int32(num_connections_to_server, 8,
 DEFINE_UNKNOWN_int32(proxy_resolve_cache_ms, 5000,
              "Time in milliseconds to cache resolution result in Proxy");
 
+DEFINE_RUNTIME_uint32(sync_rpc_abort_check_interval_ms, 100,
+    "How often a thread blocked in a synchronous RPC wakes up to consult the abort checker "
+    "installed for it (see ScopedSyncRequestAbortChecker). 0 disables the checks, making such "
+    "threads wait until the call completes or its deadline expires. Threads without a checker "
+    "are unaffected.");
+TAG_FLAG(sync_rpc_abort_check_interval_ms, advanced);
+
 using namespace std::literals;
 
 using std::string;
@@ -71,6 +78,22 @@ using std::shared_ptr;
 
 namespace yb {
 namespace rpc {
+
+namespace {
+
+thread_local SyncRequestAbortChecker sync_request_abort_checker;
+
+}  // namespace
+
+ScopedSyncRequestAbortChecker::ScopedSyncRequestAbortChecker(SyncRequestAbortChecker checker) {
+  LOG_IF(DFATAL, static_cast<bool>(sync_request_abort_checker))
+      << "Sync request abort checker is already installed for this thread";
+  sync_request_abort_checker = std::move(checker);
+}
+
+ScopedSyncRequestAbortChecker::~ScopedSyncRequestAbortChecker() {
+  sync_request_abort_checker = nullptr;
+}
 
 Proxy::Proxy(ProxyContext* context,
              const HostPort& remote,
@@ -357,8 +380,32 @@ Status Proxy::DoSyncRequest(const RemoteMethod* method,
   DoAsyncRequest(
       method, std::move(method_metrics), request, DCHECK_NOTNULL(resp), controller,
       latch.CountDownCallback(), true /* force_run_callback_on_reactor */, send_metadata);
-  latch.Wait();
+  WaitForSyncResponse(latch, controller);
   return controller->status();
+}
+
+void Proxy::WaitForSyncResponse(const CountDownLatch& latch, RpcController* controller) {
+  const auto check_interval = FLAGS_sync_rpc_abort_check_interval_ms * 1ms;
+  if (!sync_request_abort_checker || check_interval <= 0ms) {
+    latch.Wait();
+    return;
+  }
+
+  // The response callback holds pointers into the caller's stack (the latch, the response), so the
+  // loop below cannot be left early: aborting the call does not let us skip the wait, it only makes
+  // the reactor run the callback sooner.
+  Status abort_status;
+  while (!latch.WaitFor(check_interval)) {
+    if (abort_status.ok()) {
+      abort_status = sync_request_abort_checker();
+      if (abort_status.ok()) {
+        continue;
+      }
+    }
+    // Retried every iteration because a call that has not been handed to a connection yet - it may
+    // still be waiting on address resolution - cannot be aborted.
+    controller->QueueAbort(abort_status);
+  }
 }
 
 Status Proxy::SyncRequest(const RemoteMethod* method,

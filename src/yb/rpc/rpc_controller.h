@@ -165,6 +165,10 @@ class RpcController {
   // When call is present, marks the call as Failed by passing Forced timeout status.
   void MarkCallAsFailed();
 
+  // Asks the reactor to complete the call with `status` rather than waiting for its response.
+  // Callable while the call is in flight, from a thread other than the reactor's.
+  void QueueAbort(const Status& status);
+
   // Test only flag which is transferred to OutboundCall during its preparation time. This is used
   // to reproduce the stuck RPC scenario seen in production.
   void TEST_force_stuck_outbound_call() { TEST_disable_outbound_call_response_processing = true; }

@@ -328,6 +328,11 @@ class OutboundCall : public RpcCall {
   // the caller.
   void SetTimedOut() ON_REACTOR_THREAD EXCLUDES(mtx_);
 
+  // Asks the reactor to complete this call with `status` instead of waiting for its response.
+  // Callable from any thread. A no-op if the call has not been handed to a connection yet, in
+  // which case it will be completed by the regular deadline handling.
+  void QueueAbort(const Status& status);
+
   // Fill in the call response.
   void SetResponse(CallResponse&& resp) ON_REACTOR_THREAD;
 
