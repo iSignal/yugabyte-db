@@ -40,9 +40,12 @@ namespace {
 // How long a stalled RPC stays stalled. It only has to outlast the reaction window below, so that a
 // backend which ignores interrupts is still parked when the assertions run. The RPC deadline
 // (ysql_client_read_write_timeout_ms, 10 minutes) is what bounds such a backend today.
-constexpr auto kStall = 30s;
+constexpr auto kStall = 30s * kTimeMultiplier;
 // How long the test is willing to wait for a backend that honors interrupts.
-constexpr auto kReaction = 10s;
+constexpr auto kReaction = 10s * kTimeMultiplier;
+// authentication_timeout, and hence the bound on backend startup, for PgStartupTimeoutTest.
+constexpr auto kStartupTimeoutSec = 5;
+constexpr auto kStartupTimeout = kStartupTimeoutSec * 1s;
 
 constexpr auto kStalledQuery = "SELECT * FROM pg_locks";
 
@@ -65,7 +68,13 @@ class PgRpcInterruptTest : public PgMiniTestBase {
   // Makes the GetLockStatus RPC behind "SELECT * FROM pg_locks" hang on the tserver.
   static void StallPgLocks() {
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_delay_before_get_locks_status_ms) =
-        MonoDelta(kStall).ToMilliseconds() * kTimeMultiplier;
+        MonoDelta(kStall).ToMilliseconds();
+  }
+
+  std::string ConnStr(const std::string& options = std::string()) const {
+    return Format(
+        "host=$0 port=$1 user=$2 dbname=yugabyte $3",
+        pg_host_port().host(), pg_host_port().port(), PGConnSettings::kDefaultUser, options);
   }
 };
 
@@ -106,10 +115,7 @@ TEST_F(PgRpcInterruptTest, CancelBackendDuringStalledRpc) {
 TEST_F(PgRpcInterruptTest, ClientDisconnectDuringStalledRpc) {
   auto observer = ASSERT_RESULT(Connect());
 
-  const auto conn_str = Format(
-      "host=$0 port=$1 user=$2 dbname=yugabyte "
-      "options='-c client_connection_check_interval=1s'",
-      pg_host_port().host(), pg_host_port().port(), PGConnSettings::kDefaultUser);
+  const auto conn_str = ConnStr("options='-c client_connection_check_interval=1s'");
   PGConnPtr victim(PQconnectdb(conn_str.c_str()));
   ASSERT_EQ(PQstatus(victim.get()), CONNECTION_OK) << PQerrorMessage(victim.get());
   const auto victim_pid = PQbackendPID(victim.get());
@@ -139,19 +145,26 @@ class PgStartupTimeoutTest : public PgRpcInterruptTest {
     // Preloads must reach the master, otherwise the tserver response cache answers them and there
     // is nothing to stall.
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_enable_read_request_caching) = false;
-    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_pg_conf_csv) = "authentication_timeout=5";
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_pg_conf_csv) =
+        Format("authentication_timeout=$0", kStartupTimeoutSec);
   }
 };
 
 TEST_F(PgStartupTimeoutTest, StalledCatalogPreload) {
-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_fetch_next_delay_column) = "relname";
+  // The retrying helper would hide how long a single attempt takes, so the attempt below is raw
+  // libpq. Wait for postgres to be up first, otherwise it measures a connection refusal.
+  auto warmup = ASSERT_RESULT(Connect());
+
+  // pg_authid is prefetched before authentication, on every backend, and unlike pg_class it is not
+  // served out of the relcache init file.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_fetch_next_delay_column) = "rolcanlogin";
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_fetch_next_delay_ms) =
-      narrow_cast<int32_t>(MonoDelta(kStall).ToMilliseconds() * kTimeMultiplier);
+      narrow_cast<int32_t>(MonoDelta(kStall).ToMilliseconds());
 
-  const auto conn_str = Format(
-      "host=$0 port=$1 user=$2 dbname=yugabyte",
-      pg_host_port().host(), pg_host_port().port(), PGConnSettings::kDefaultUser);
-
+  // Without a bound on startup the attempt hangs for the RPC deadline (10 minutes); connect_timeout
+  // keeps a regression to a failed assertion rather than a hung test.
+  const auto deadline = kStartupTimeout + kReaction;
+  const auto conn_str = ConnStr(Format("connect_timeout=$0", (2 * deadline).count()));
   const auto start = MonoTime::Now();
   PGConnPtr conn(PQconnectdb(conn_str.c_str()));
   const auto elapsed = MonoTime::Now() - start;
@@ -160,7 +173,9 @@ TEST_F(PgStartupTimeoutTest, StalledCatalogPreload) {
 
   ASSERT_EQ(PQstatus(conn.get()), CONNECTION_BAD);
   LOG(INFO) << "Connection attempt failed after " << elapsed << ": " << PQerrorMessage(conn.get());
-  ASSERT_LT(elapsed, kReaction);
+  // The lower bound catches a connection that failed for some reason other than the stall.
+  ASSERT_GT(elapsed, kStartupTimeout / 2);
+  ASSERT_LT(elapsed, deadline);
 }
 
 }  // namespace yb::pgwrapper
