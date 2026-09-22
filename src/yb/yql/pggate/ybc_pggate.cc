@@ -118,13 +118,6 @@ YbcRecordTempRelationDDL_hook_type YBCRecordTempRelationDDL_hook =
 
 namespace yb::pggate {
 
-namespace {
-
-constexpr uint64_t kCatalogPrefetchRowLimit = 0;
-constexpr uint64_t kCatalogPrefetchSizeLimit = 10_MB;
-
-} // namespace
-
 //--------------------------------------------------------------------------------------------------
 // C++ Implementation.
 // All C++ objects and structures in this module are listed in the following namespace.
