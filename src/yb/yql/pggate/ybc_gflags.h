@@ -83,7 +83,6 @@ typedef struct {
   const int64_t*  TEST_delay_after_table_analyze_ms;
   const bool*     TEST_enable_obj_tuple_locks;
   const bool*     TEST_force_use_explicit_row_lock_skip_locked_read_ahead_optimization;
-  const uint64_t* TEST_ysql_catalog_read_delay_ms;
   const uint32_t* wait_for_ysql_backends_catalog_version_client_master_rpc_timeout_ms;
 } YbcPgGFlagsAccessor;
 

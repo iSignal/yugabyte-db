@@ -34,7 +34,6 @@
 #include "yb/util/flags/flag_tags.h"
 #include "yb/util/format.h"
 #include "yb/util/logging.h"
-#include "yb/util/monotime.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/status.h"
 #include "yb/util/status_fwd.h"
@@ -48,7 +47,6 @@
 #include "yb/yql/pggate/pg_tabledesc.h"
 #include "yb/yql/pggate/pg_tools.h"
 #include "yb/yql/pggate/pggate_flags.h"
-#include "yb/yql/pggate/ybc_gflags.h"
 #include "yb/yql/pggate/util/ybc_util.h"
 
 DEFINE_NON_RUNTIME_bool(ysql_enable_read_request_caching, true, "Enable read request caching");
@@ -438,10 +436,6 @@ class Loader {
       }
       LOG(INFO) << "Initiating prefetching for tables " << yb::ToString(table_names);
     }
-      const auto delay_ms = *YBCGetGFlags()->TEST_ysql_catalog_read_delay_ms;
-      if (PREDICT_FALSE(delay_ms > 0)) {
-        SleepFor(MonoDelta::FromMilliseconds(delay_ms));
-      }
       auto response = VERIFY_RESULT(Run(arena_.get(), session_, op_info_, options_));
       Status remove_predicate_status;
       ResultFunctorAdapter<bool, OperationInfo&> remove_predicate(

@@ -98,9 +98,6 @@ DEFINE_NON_RUNTIME_uint64(ysql_catalog_prefetch_row_limit, 0,
 DEFINE_NON_RUNTIME_uint64(ysql_catalog_prefetch_size_limit, 10 * 1024 * 1024,
     "Maximum response size in bytes for each catalog prefetch request. 0 means no limit.");
 
-DEFINE_test_flag(uint64, ysql_catalog_read_delay_ms, 0,
-    "Delay each catalog prefetch request.");
-
 DEFINE_RUNTIME_bool(ysql_preload_pg_authid_for_auth, true,
     "If true, YSQL preloads the pg_authid catalog caches (by-name and by-OID) "
     "before client authentication. Authentication reads pg_authid by role name "
@@ -308,7 +305,6 @@ const YbcPgGFlagsAccessor* YBCGetGFlags() {
       .TEST_enable_obj_tuple_locks = &FLAGS_TEST_enable_obj_tuple_locks,
       .TEST_force_use_explicit_row_lock_skip_locked_read_ahead_optimization =
           &FLAGS_TEST_force_use_explicit_row_lock_skip_locked_read_ahead_optimization,
-      .TEST_ysql_catalog_read_delay_ms = &FLAGS_TEST_ysql_catalog_read_delay_ms,
       .wait_for_ysql_backends_catalog_version_client_master_rpc_timeout_ms =
           &FLAGS_wait_for_ysql_backends_catalog_version_client_master_rpc_timeout_ms,
   };
