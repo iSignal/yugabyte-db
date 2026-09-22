@@ -366,15 +366,11 @@ void ApplySystemItemsFilter(LWPgsqlReadRequestPB* req, int oid_column_id) {
 class Loader {
  public:
   Loader(PgSession* session, const std::shared_ptr<ThreadSafeArena>& arena,
-         size_t table_count, const PrefetcherOptions& options)
+         size_t estimated_size, const PrefetcherOptions& options)
       : session_(session),
         arena_(arena),
-        fetch_size_limit_(
-            options.fetch_size_limit
-                ? std::max<uint64_t>(options.fetch_size_limit / table_count, 1)
-                : 0),
         options_(options) {
-    op_info_.reserve(table_count);
+    op_info_.reserve(estimated_size);
   }
 
   // Prepare operation for read from particular table
@@ -433,6 +429,16 @@ class Loader {
   Status Load(DataContainer* data_container) {
     VLOG(2) << "Loader::Load";
     while (!op_info_.empty()) {
+      const auto fetch_size_limit = options_.fetch_size_limit
+          ? std::max<uint64_t>(options_.fetch_size_limit / op_info_.size(), 1)
+          : 0;
+      for (auto& op_info : op_info_) {
+        auto& req = op_info.operation->read_request();
+        req.set_size_limit(fetch_size_limit);
+        if (req.has_index_request()) {
+          req.mutable_index_request()->set_size_limit(fetch_size_limit);
+        }
+      }
     if (yb_debug_log_catcache_events) {
       std::set<std::string> table_names;
       for (const auto& op : op_info_) {
@@ -470,13 +476,11 @@ class Loader {
     req->set_return_paging_state(true);
     req->set_is_forward_scan(true);
     req->set_limit(options_.fetch_row_limit);
-    req->set_size_limit(fetch_size_limit_);
   }
 
   PgSession* session_;
   std::vector<OperationInfo> op_info_;
   std::shared_ptr<ThreadSafeArena> arena_;
-  const uint64_t fetch_size_limit_;
   const PrefetcherOptions options_;
 };
 
@@ -550,14 +554,7 @@ class PgSysTablePrefetcher::Impl {
     std::sort(registered_for_loading_.begin(),
               registered_for_loading_.end(),
               [](const auto& lhs, const auto& rhs) { return lhs.table_id < rhs.table_id; });
-    size_t table_count = 0;
-    for (size_t i = 0; i != registered_for_loading_.size(); ++i) {
-      const auto& item = registered_for_loading_[i];
-      if (i == 0 || registered_for_loading_[i - 1].table_id != item.table_id) {
-        ++table_count;
-      }
-    }
-    Loader loader(session, arena_, table_count, options_);
+    Loader loader(session, arena_, registered_for_loading_.size(), options_);
     PgObjectId prev_table_id;
     for (const auto& item : registered_for_loading_) {
       // Load table once in spite of the fact it might be registered for preloading multiple times.
