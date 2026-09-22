@@ -1130,6 +1130,14 @@ InitPostgresImpl(const char *in_dbname, Oid dboid,
 	/* Connect to YugaByte cluster. */
 	YBInitPostgresBackend("postgres", yb_init_info);
 
+	/*
+	 * YB: Nothing checks for a departed client until startup completes, and
+	 * the catalog preload below can stall on the tserver for up to the RPC
+	 * deadline.  Stopped by YbInitPostgres.
+	 */
+	if (!bootstrap && MyProcPort != NULL)
+		YBCStartClientDisconnectWatch(MyProcPort->sock);
+
 	if (!bootstrap && MyProcPort != NULL &&
 		MyProcPort->yb_dist_traceparent != NULL &&
 		MyProcPort->yb_dist_traceparent[0] != '\0')
@@ -1778,11 +1786,13 @@ YbInitPostgres(const char *in_dbname, Oid dboid,
 	}
 	PG_CATCH();
 	{
+		YBCStopClientDisconnectWatch();
 		YbEnsureSysTablePrefetchingStopped();
 		YBCUpdateInitPostgresMetrics();
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	YBCStopClientDisconnectWatch();
 	YbEnsureSysTablePrefetchingStopped();
 	YBCUpdateInitPostgresMetrics();
 }

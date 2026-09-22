@@ -14,6 +14,9 @@
 
 #include "yb/yql/pggate/pggate.h"
 
+#include <poll.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <concepts>
@@ -57,10 +60,12 @@
 #include "yb/util/alignment.h"
 #include "yb/util/backoff_waiter.h"
 #include "yb/util/enums.h"
+#include "yb/util/errno.h"
 #include "yb/util/format.h"
 #include "yb/util/metrics.h"
 #include "yb/util/range.h"
 #include "yb/util/scope_exit.h"
+#include "yb/util/signal_util.h"
 #include "yb/util/status_format.h"
 #include "yb/util/thread.h"
 
@@ -605,6 +610,71 @@ class PgApiImpl::Interrupter {
   scoped_refptr<yb::Thread> thread_;
 };
 
+class PgApiImpl::ClientDisconnectWatch {
+ public:
+  explicit ClientDisconnectWatch(PgApiImpl& pgapi) : pgapi_(pgapi) {}
+
+  ~ClientDisconnectWatch() {
+    if (thread_) {
+      // Closing the write end is what wakes the thread up.
+      close(stop_pipe_[1]);
+      stop_pipe_[1] = -1;
+      CHECK_OK(ThreadJoiner(thread_.get()).Join());
+    }
+    for (auto fd : stop_pipe_) {
+      if (fd >= 0) {
+        close(fd);
+      }
+    }
+  }
+
+  Status Start(int client_fd) {
+    if (pipe(stop_pipe_) != 0) {
+      return STATUS_FROM_ERRNO("pipe", errno);
+    }
+    // The thread inherits the mask, which keeps postgres' signal handlers on the main thread.
+    return WithMaskedYsqlSignals([this, client_fd] {
+      return yb::Thread::Create(
+          "pgapi client disconnect watch", "pgapi client disconnect watch",
+          &ClientDisconnectWatch::Run, this, client_fd, &thread_);
+    });
+  }
+
+ private:
+  void Run(int client_fd) {
+    pollfd fds[] = {{client_fd, kClientHangupEvents, 0}, {stop_pipe_[0], POLLIN, 0}};
+    for (;;) {
+      if (poll(fds, std::size(fds), -1 /* timeout */) < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        LOG(WARNING) << "Client disconnect watch failed: " << ErrnoToString(errno);
+        return;
+      }
+      if (fds[1].revents) {
+        return;
+      }
+      if (fds[0].revents & (kClientHangupEvents | POLLHUP | POLLERR)) {
+        LOG(INFO) << "Client disconnected while the connection was being established";
+        pgapi_.Interrupt();
+        return;
+      }
+    }
+  }
+
+  // POLLRDHUP is what postgres' own client connection check (WL_SOCKET_CLOSED) relies on. Without
+  // it a client that closes its end of the socket is not reported until the backend writes to it.
+#ifdef POLLRDHUP
+  static constexpr int16_t kClientHangupEvents = POLLRDHUP;
+#else
+  static constexpr int16_t kClientHangupEvents = 0;
+#endif
+
+  PgApiImpl& pgapi_;
+  int stop_pipe_[2] = {-1, -1};
+  scoped_refptr<yb::Thread> thread_;
+};
+
 //--------------------------------------------------------------------------------------------------
 
 void PgApiImpl::TupleIdBuilder::Prepare() {
@@ -815,6 +885,21 @@ void PgApiImpl::SetupPgBackendCgroup(YbcPgOid dboid) {
 
 void PgApiImpl::Interrupt() {
   interrupter_->Interrupt();
+}
+
+void PgApiImpl::StartClientDisconnectWatch(int client_fd) {
+  DCHECK(!client_disconnect_watch_);
+  auto watch = std::make_unique<ClientDisconnectWatch>(*this);
+  auto status = watch->Start(client_fd);
+  if (!status.ok()) {
+    LOG(WARNING) << "Failed to start client disconnect watch: " << status;
+    return;
+  }
+  client_disconnect_watch_ = std::move(watch);
+}
+
+void PgApiImpl::StopClientDisconnectWatch() {
+  client_disconnect_watch_.reset();
 }
 
 //--------------------------------------------------------------------------------------------------

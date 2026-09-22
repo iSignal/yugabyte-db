@@ -59,6 +59,10 @@ void YBCSetupPgBackendCgroup(YbcPgOid dboid);
 void YBCDestroyPgGate();
 void YBCInterruptPgGate();
 
+// See PgApiImpl::StartClientDisconnectWatch.
+void YBCStartClientDisconnectWatch(int client_fd);
+void YBCStopClientDisconnectWatch();
+
 //--------------------------------------------------------------------------------------------------
 // Environment and Session.
 void YBCDumpCurrentPgSessionState(YbcPgSessionState* session_data);
