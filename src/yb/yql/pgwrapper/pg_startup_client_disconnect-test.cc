@@ -129,6 +129,15 @@ TEST_F(PgStartupClientConnectionCheckTest, ClientLeavesDuringStalledPreload) {
       [] { return CountBackendsOf(kVictimUser) == 0; }, kReaction, "orphaned backend to exit"));
 }
 
+// A connected client is neither dropped while its connection is established nor afterwards, when
+// the regular per-query check takes over the timer.
+TEST_F(PgStartupClientConnectionCheckTest, ConnectedClientUnaffected) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.FetchFormat("SELECT pg_sleep($0)", 4 * MonoDelta(kClientConnectionCheckInterval)
+      .ToSeconds()));
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int32_t>("SELECT 1")), 1);
+}
+
 // As during query execution, client_connection_check_interval = 0 (the default) means the client
 // is not checked: the backend waits out the stalled preload.
 TEST_F(PgStartupClientDisconnectTest, NoCheckWhenIntervalIsZero) {
