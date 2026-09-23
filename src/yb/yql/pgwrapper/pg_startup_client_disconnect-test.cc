@@ -31,6 +31,7 @@
 DECLARE_bool(ysql_enable_read_request_caching);
 DECLARE_int32(TEST_fetch_next_delay_ms);
 DECLARE_string(TEST_fetch_next_delay_column);
+DECLARE_string(ysql_pg_conf_csv);
 
 using namespace std::literals;
 
@@ -39,9 +40,10 @@ namespace yb::pgwrapper {
 namespace {
 
 // Long enough that a backend which ignores the departed client is still parked on the stalled read
-// when the test gives up waiting for it.
+// when the test stops watching it.
 constexpr auto kStall = 30s * kTimeMultiplier;
 constexpr auto kReaction = 10s * kTimeMultiplier;
+constexpr auto kClientConnectionCheckInterval = 500ms;
 // libpq closes its socket and returns once this elapses.
 constexpr auto kClientConnectTimeoutSec = 3;
 
@@ -73,41 +75,67 @@ class PgStartupClientDisconnectTest : public PgMiniTestBase {
     // Otherwise the tserver response cache answers the preload and there is nothing to stall.
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_enable_read_request_caching) = false;
   }
-};
 
-// A client opens a connection whose catalog preload is stuck on the tserver, then gives up and
-// closes its socket. The backend must notice and exit rather than stay parked on the preload.
-TEST_F(PgStartupClientDisconnectTest, ClientLeavesDuringStalledPreload) {
-  {
-    auto conn = ASSERT_RESULT(Connect());
-    ASSERT_OK(conn.ExecuteFormat("CREATE ROLE $0 LOGIN", kVictimUser));
+  // A client opens a connection whose catalog preload is stuck on the tserver, then gives up and
+  // closes its socket. Returns once the client is gone and its backend was seen while stalled.
+  void StartStalledConnectionAndLeave() {
+    {
+      auto conn = ASSERT_RESULT(Connect());
+      ASSERT_OK(conn.ExecuteFormat("CREATE ROLE $0 LOGIN", kVictimUser));
+    }
+
+    // pg_authid is prefetched by every backend before authentication.
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_fetch_next_delay_column) = "rolcanlogin";
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_fetch_next_delay_ms) =
+        narrow_cast<int32_t>(MonoDelta(kStall).ToMilliseconds());
+
+    const auto conn_str = Format(
+        "host=$0 port=$1 user=$2 dbname=yugabyte connect_timeout=$3",
+        pg_host_port().host(), pg_host_port().port(), kVictimUser, kClientConnectTimeoutSec);
+    TestThreadHolder threads;
+    auto client_status = CONNECTION_OK;
+    threads.AddThreadFunctor([&conn_str, &client_status] {
+      PGConnPtr client(PQconnectdb(conn_str.c_str()));
+      client_status = PQstatus(client.get());
+    });
+
+    ASSERT_OK(WaitFor(
+        [] { return CountBackendsOf(kVictimUser) > 0; }, kReaction, "victim backend to start"));
+    threads.JoinAll();
+    ASSERT_EQ(client_status, CONNECTION_BAD);
   }
 
-  // pg_authid is prefetched by every backend before authentication.
-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_fetch_next_delay_column) = "rolcanlogin";
-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_fetch_next_delay_ms) =
-      narrow_cast<int32_t>(MonoDelta(kStall).ToMilliseconds());
-  auto reset_stall = ScopeExit([] {
+  static void ResetStall() {
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_fetch_next_delay_ms) = 0;
-  });
+  }
+};
 
-  const auto conn_str = Format(
-      "host=$0 port=$1 user=$2 dbname=yugabyte connect_timeout=$3",
-      pg_host_port().host(), pg_host_port().port(), kVictimUser, kClientConnectTimeoutSec);
-  TestThreadHolder threads;
-  auto client_status = CONNECTION_OK;
-  threads.AddThreadFunctor([&conn_str, &client_status] {
-    PGConnPtr client(PQconnectdb(conn_str.c_str()));
-    client_status = PQstatus(client.get());
-  });
+class PgStartupClientConnectionCheckTest : public PgStartupClientDisconnectTest {
+ protected:
+  void SetUp() override {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_pg_conf_csv) = Format(
+        "client_connection_check_interval=$0",
+        MonoDelta(kClientConnectionCheckInterval).ToMilliseconds());
+    PgStartupClientDisconnectTest::SetUp();
+  }
+};
 
-  ASSERT_OK(WaitFor(
-      [] { return CountBackendsOf(kVictimUser) > 0; }, kReaction, "victim backend to start"));
-  threads.JoinAll();
-  ASSERT_EQ(client_status, CONNECTION_BAD);
-
+// With client_connection_check_interval set, the backend notices the departed client while its
+// preload is blocked in pggate and exits.
+TEST_F(PgStartupClientConnectionCheckTest, ClientLeavesDuringStalledPreload) {
+  auto reset_stall = ScopeExit([] { ResetStall(); });
+  ASSERT_NO_FATALS(StartStalledConnectionAndLeave());
   ASSERT_OK(WaitFor(
       [] { return CountBackendsOf(kVictimUser) == 0; }, kReaction, "orphaned backend to exit"));
+}
+
+// As during query execution, client_connection_check_interval = 0 (the default) means the client
+// is not checked: the backend waits out the stalled preload.
+TEST_F(PgStartupClientDisconnectTest, NoCheckWhenIntervalIsZero) {
+  auto reset_stall = ScopeExit([] { ResetStall(); });
+  ASSERT_NO_FATALS(StartStalledConnectionAndLeave());
+  SleepFor(kClientConnectionCheckInterval * 4);
+  ASSERT_GT(CountBackendsOf(kVictimUser), 0);
 }
 
 }  // namespace yb::pgwrapper

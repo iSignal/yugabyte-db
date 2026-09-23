@@ -131,13 +131,6 @@ class PgApiImpl {
   // Interrupt aborts all pending RPCs immediately to unblock main thread.
   void Interrupt();
 
-  // While started, Interrupt()s as soon as the peer of client_fd hangs up. Postgres runs this only
-  // while it is establishing a connection: the catalog preload it does then waits on the tserver
-  // with no timer armed, so a client that gives up would otherwise leave the backend parked until
-  // the RPC deadline.
-  void StartClientDisconnectWatch(int client_fd);
-  void StopClientDisconnectWatch();
-
   void ResetCatalogReadTime();
   [[nodiscard]] ReadHybridTime GetCatalogReadTime() const;
 
@@ -977,7 +970,6 @@ class PgApiImpl {
   Result<SetupPerformOptionsAccessorTag> FlushBufferedEntities(const PgFlushDebugContext& dbg_ctx);
 
   class Interrupter;
-  class ClientDisconnectWatch;
 
   class TupleIdBuilder {
    public:
@@ -1029,8 +1021,6 @@ class PgApiImpl {
   // TODO Rename to client_ when YBClient is removed.
   PgClient pg_client_;
   std::unique_ptr<Interrupter> interrupter_;
-  // Declared after interrupter_ so that it is destroyed, and its thread joined, first.
-  std::unique_ptr<ClientDisconnectWatch> client_disconnect_watch_;
 
   scoped_refptr<server::HybridClock> clock_;
 

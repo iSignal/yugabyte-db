@@ -546,16 +546,6 @@ void YBCInterruptPgGate() {
   pgapi->Interrupt();
 }
 
-void YBCStartClientDisconnectWatch(int client_fd) {
-  pgapi->StartClientDisconnectWatch(client_fd);
-}
-
-void YBCStopClientDisconnectWatch() {
-  if (pgapi) {
-    pgapi->StopClientDisconnectWatch();
-  }
-}
-
 const YbcPgCallbacks *YBCGetPgCallbacks() {
   return pgapi->pg_callbacks();
 }
