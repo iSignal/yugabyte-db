@@ -125,6 +125,11 @@ class ReadQuery : public std::enable_shared_from_this<ReadQuery>, public rpc::Th
         req_(req),
         resp_(resp),
         context_(std::move(context)),
+        log_ysql_catalog_read_timing_(
+            VLOG_IS_ON(1) && req->tablet_id() == master::kSysCatalogTabletId &&
+            !req->pgsql_batch().empty()),
+        start_time_(
+            log_ysql_catalog_read_timing_ ? MonoTime::Now() : MonoTime::kUninitialized),
         tablet_consensus_info_(nullptr) {}
 
   void Perform() {
@@ -229,6 +234,8 @@ class ReadQuery : public std::enable_shared_from_this<ReadQuery>, public rpc::Th
   bool reading_from_non_leader_ = false;
   RequestScope request_scope_;
   std::shared_ptr<ReadQuery> retained_self_;
+  const bool log_ysql_catalog_read_timing_;
+  const MonoTime start_time_;
   std::shared_ptr<TabletConsensusInfoPB> tablet_consensus_info_;
   // Op id of the async locking write issued by this read, applied to resp_ after the read
   // completes since Complete() clears resp_ on each attempt.
@@ -701,6 +708,11 @@ Status ReadQuery::Complete() {
     resp_->mutable_tablet_consensus_info()->CopyFrom(*tablet_consensus_info_.get());
   }
 
+  if (log_ysql_catalog_read_timing_) {
+    VLOG(1) << "YSQL catalog read batch " << req_->batch_idx() << ": total="
+            << (MonoTime::Now() - start_time_).ToMilliseconds()
+            << " ms, ops=" << req_->pgsql_batch_size();
+  }
   MakeRpcOperationCompletionCallback(std::move(context_), resp_, server_.Clock())(Status::OK());
   TRACE("Done Read");
 
@@ -851,7 +863,10 @@ Result<ReadQuery::ReadRestartInfo> ReadQuery::DoReadImpl() {
   if (!req_->pgsql_batch().empty()) {
     size_t total_num_rows_read = 0;
     auto* metadata = tablet()->metadata();
+    size_t op_idx = 0;
     for (const auto& pgsql_read_req : req_->pgsql_batch()) {
+      const auto op_start_time =
+          log_ysql_catalog_read_timing_ ? MonoTime::Now() : MonoTime::kUninitialized;
       // For colocated secondary index scans, the inner nested index_request targets the index.
       auto table_info = VERIFY_RESULT(metadata->GetTableInfo(pgsql_read_req.has_index_request()
           ? pgsql_read_req.index_request().table_id()
@@ -897,6 +912,12 @@ Result<ReadQuery::ReadRestartInfo> ReadQuery::DoReadImpl() {
       total_num_rows_read += result.num_rows_read;
 
       TRACE("Done HandlePgsqlReadRequest");
+      if (log_ysql_catalog_read_timing_) {
+        VLOG(1) << "YSQL catalog read batch " << req_->batch_idx() << " op " << ++op_idx
+                << "/" << req_->pgsql_batch_size() << ": table=" << table_info->table_name
+                << ", duration=" << (MonoTime::Now() - op_start_time).ToMilliseconds()
+                << " ms, rows=" << result.num_rows_read;
+      }
       if (result.read_restart_data.is_valid()) {
         return FormReadRestartInfo(result.read_restart_data);
       }
