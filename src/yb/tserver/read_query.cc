@@ -709,9 +709,9 @@ Status ReadQuery::Complete() {
   }
 
   if (log_ysql_catalog_read_timing_) {
-    VLOG(1) << "YSQL catalog read batch " << req_->batch_idx() << ": total="
-            << (MonoTime::Now() - start_time_).ToMilliseconds()
-            << " ms, ops=" << req_->pgsql_batch_size();
+    VLOG(1) << "YSQL catalog read batch: read_time_serial_no=" << used_read_time_.serial_no
+            << ", total_us=" << (MonoTime::Now() - start_time_).ToMicroseconds()
+            << ", ops=" << req_->pgsql_batch_size();
   }
   MakeRpcOperationCompletionCallback(std::move(context_), resp_, server_.Clock())(Status::OK());
   TRACE("Done Read");
@@ -913,10 +913,11 @@ Result<ReadQuery::ReadRestartInfo> ReadQuery::DoReadImpl() {
 
       TRACE("Done HandlePgsqlReadRequest");
       if (log_ysql_catalog_read_timing_) {
-        VLOG(1) << "YSQL catalog read batch " << req_->batch_idx() << " op " << ++op_idx
-                << "/" << req_->pgsql_batch_size() << ": table=" << table_info->table_name
-                << ", duration=" << (MonoTime::Now() - op_start_time).ToMilliseconds()
-                << " ms, rows=" << result.num_rows_read;
+        VLOG(1) << "YSQL catalog read batch: read_time_serial_no=" << read_time_.serial_no
+                << ", op=" << ++op_idx << "/" << req_->pgsql_batch_size()
+                << ", table=" << table_info->table_name
+                << ", duration_us=" << (MonoTime::Now() - op_start_time).ToMicroseconds()
+                << ", rows=" << result.num_rows_read;
       }
       if (result.read_restart_data.is_valid()) {
         return FormReadRestartInfo(result.read_restart_data);
