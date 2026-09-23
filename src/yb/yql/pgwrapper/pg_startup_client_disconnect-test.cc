@@ -130,12 +130,20 @@ class PgStartupClientConnectionCheckTest : public PgStartupClientDisconnectTest 
 };
 
 // With client_connection_check_interval set, the backend notices the departed client while its
-// preload is blocked in pggate and exits.
+// preload is blocked in pggate and exits. The interrupted backend must not leave anything behind
+// that breaks the next connection, whose preload and first query go through the same tserver.
 TEST_P(PgStartupClientConnectionCheckTest, ClientLeavesDuringStalledPreload) {
   auto reset_stall = ScopeExit([] { ResetStall(); });
   ASSERT_NO_FATALS(StartStalledConnectionAndLeave());
   ASSERT_OK(WaitFor(
       [] { return CountBackendsOf(kVictimUser) == 0; }, kReaction, "orphaned backend to exit"));
+
+  ResetStall();
+  auto settings = MakeConnSettings();
+  settings.user = kVictimUser;
+  auto conn = ASSERT_RESULT(PGConnBuilder(settings).Connect());
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<std::string>("SELECT current_user::text")), kVictimUser);
+  ASSERT_GT(ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM pg_class")), 0);
 }
 
 // A connected client is neither dropped while its connection is established nor afterwards, when
