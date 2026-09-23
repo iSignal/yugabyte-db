@@ -28,6 +28,7 @@
 #include "yb/yql/pgwrapper/libpq_utils.h"
 #include "yb/yql/pgwrapper/pg_mini_test_base.h"
 
+DECLARE_bool(pg_client_use_shared_memory);
 DECLARE_bool(ysql_enable_read_request_caching);
 DECLARE_int32(TEST_fetch_next_delay_ms);
 DECLARE_string(TEST_fetch_next_delay_column);
@@ -67,8 +68,16 @@ size_t CountBackendsOf(const std::string& user) {
 
 }  // namespace
 
-class PgStartupClientDisconnectTest : public PgMiniTestBase {
+// The parameter picks the pggate transport: the shared memory exchange (backend blocks on its
+// semaphore) or a plain RPC (backend blocks on a std::future).
+class PgStartupClientDisconnectTest : public PgMiniTestBase,
+                                      public ::testing::WithParamInterface<bool> {
  protected:
+  void SetUp() override {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_pg_client_use_shared_memory) = GetParam();
+    PgMiniTestBase::SetUp();
+  }
+
   size_t NumTabletServers() override { return 1; }
 
   void BeforePgProcessStart() override {
@@ -122,7 +131,7 @@ class PgStartupClientConnectionCheckTest : public PgStartupClientDisconnectTest 
 
 // With client_connection_check_interval set, the backend notices the departed client while its
 // preload is blocked in pggate and exits.
-TEST_F(PgStartupClientConnectionCheckTest, ClientLeavesDuringStalledPreload) {
+TEST_P(PgStartupClientConnectionCheckTest, ClientLeavesDuringStalledPreload) {
   auto reset_stall = ScopeExit([] { ResetStall(); });
   ASSERT_NO_FATALS(StartStalledConnectionAndLeave());
   ASSERT_OK(WaitFor(
@@ -131,7 +140,7 @@ TEST_F(PgStartupClientConnectionCheckTest, ClientLeavesDuringStalledPreload) {
 
 // A connected client is neither dropped while its connection is established nor afterwards, when
 // the regular per-query check takes over the timer.
-TEST_F(PgStartupClientConnectionCheckTest, ConnectedClientUnaffected) {
+TEST_P(PgStartupClientConnectionCheckTest, ConnectedClientUnaffected) {
   auto conn = ASSERT_RESULT(Connect());
   ASSERT_OK(conn.FetchFormat("SELECT pg_sleep($0)", 4 * MonoDelta(kClientConnectionCheckInterval)
       .ToSeconds()));
@@ -140,11 +149,20 @@ TEST_F(PgStartupClientConnectionCheckTest, ConnectedClientUnaffected) {
 
 // As during query execution, client_connection_check_interval = 0 (the default) means the client
 // is not checked: the backend waits out the stalled preload.
-TEST_F(PgStartupClientDisconnectTest, NoCheckWhenIntervalIsZero) {
+TEST_P(PgStartupClientDisconnectTest, NoCheckWhenIntervalIsZero) {
   auto reset_stall = ScopeExit([] { ResetStall(); });
   ASSERT_NO_FATALS(StartStalledConnectionAndLeave());
   SleepFor(kClientConnectionCheckInterval * 4);
   ASSERT_GT(CountBackendsOf(kVictimUser), 0);
 }
+
+std::string TransportName(const ::testing::TestParamInfo<bool>& info) {
+  return info.param ? "SharedMem" : "Rpc";
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    , PgStartupClientDisconnectTest, ::testing::Bool(), TransportName);
+INSTANTIATE_TEST_SUITE_P(
+    , PgStartupClientConnectionCheckTest, ::testing::Bool(), TransportName);
 
 }  // namespace yb::pgwrapper
