@@ -125,6 +125,11 @@ class ReadQuery : public std::enable_shared_from_this<ReadQuery>, public rpc::Th
         req_(req),
         resp_(resp),
         context_(std::move(context)),
+        log_ysql_catalog_read_timing_(
+            VLOG_IS_ON(1) && req->tablet_id() == master::kSysCatalogTabletId &&
+            !req->pgsql_batch().empty()),
+        start_time_(
+            log_ysql_catalog_read_timing_ ? MonoTime::Now() : MonoTime::kUninitialized),
         tablet_consensus_info_(nullptr) {}
 
   void Perform() {
@@ -229,6 +234,8 @@ class ReadQuery : public std::enable_shared_from_this<ReadQuery>, public rpc::Th
   bool reading_from_non_leader_ = false;
   RequestScope request_scope_;
   std::shared_ptr<ReadQuery> retained_self_;
+  const bool log_ysql_catalog_read_timing_;
+  const MonoTime start_time_;
   std::shared_ptr<TabletConsensusInfoPB> tablet_consensus_info_;
   // Op id of the async locking write issued by this read, applied to resp_ after the read
   // completes since Complete() clears resp_ on each attempt.
@@ -701,6 +708,16 @@ Status ReadQuery::Complete() {
     resp_->mutable_tablet_consensus_info()->CopyFrom(*tablet_consensus_info_.get());
   }
 
+  if (log_ysql_catalog_read_timing_) {
+    const auto sidecar_bytes = context_.sidecars().size();
+    const auto protobuf_bytes = resp_->SerializedSize();
+    VLOG(1) << "YSQL catalog read batch: read_time_serial_no=" << used_read_time_.serial_no
+            << ", total_us=" << (MonoTime::Now() - start_time_).ToMicroseconds()
+            << ", ops=" << req_->pgsql_batch_size()
+            << ", response_bytes=" << sidecar_bytes + protobuf_bytes
+            << ", sidecar_bytes=" << sidecar_bytes
+            << ", protobuf_bytes=" << protobuf_bytes;
+  }
   MakeRpcOperationCompletionCallback(std::move(context_), resp_, server_.Clock())(Status::OK());
   TRACE("Done Read");
 
@@ -851,7 +868,12 @@ Result<ReadQuery::ReadRestartInfo> ReadQuery::DoReadImpl() {
   if (!req_->pgsql_batch().empty()) {
     size_t total_num_rows_read = 0;
     auto* metadata = tablet()->metadata();
+    size_t op_idx = 0;
     for (const auto& pgsql_read_req : req_->pgsql_batch()) {
+      const auto op_start_time =
+          log_ysql_catalog_read_timing_ ? MonoTime::Now() : MonoTime::kUninitialized;
+      const auto op_sidecar_start_size =
+          log_ysql_catalog_read_timing_ ? context_.sidecars().size() : 0;
       // For colocated secondary index scans, the inner nested index_request targets the index.
       auto table_info = VERIFY_RESULT(metadata->GetTableInfo(pgsql_read_req.has_index_request()
           ? pgsql_read_req.index_request().table_id()
@@ -903,6 +925,16 @@ Result<ReadQuery::ReadRestartInfo> ReadQuery::DoReadImpl() {
       result.response->set_rows_data_sidecar(
           narrow_cast<int32_t>(context_.sidecars().Complete()));
       resp_->mutable_pgsql_batch()->push_back_ref(result.response);
+      if (log_ysql_catalog_read_timing_) {
+        const auto sidecar_bytes = context_.sidecars().size() - op_sidecar_start_size;
+        VLOG(1) << "YSQL catalog read batch: read_time_serial_no=" << read_time_.serial_no
+                << ", op=" << ++op_idx << "/" << req_->pgsql_batch_size()
+                << ", table=" << table_info->table_name
+                << ", duration_us=" << (MonoTime::Now() - op_start_time).ToMicroseconds()
+                << ", rows=" << result.num_rows_read
+                << ", response_bytes=" << sidecar_bytes + result.response->SerializedSize()
+                << ", sidecar_bytes=" << sidecar_bytes;
+      }
     }
 
     if (req_->consistency_level() == YBConsistencyLevel::CONSISTENT_PREFIX &&
