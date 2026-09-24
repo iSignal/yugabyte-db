@@ -63,6 +63,7 @@ DEFINE_test_flag(bool, pause_flush_aggregated_metrics, false,
 // Process/server-wide metrics should go into the 'server' entity.
 // More complex applications will define other entities.
 METRIC_DEFINE_entity(server);
+METRIC_DEFINE_entity(table);
 
 namespace yb {
 
@@ -354,6 +355,11 @@ void MetricPrototype::WriteFields(JsonWriter* writer,
 // FunctionGaugeDetacher
 //
 
+scoped_refptr<MetricEntity> MetricRegistry::FindEntity(const std::string& id) const {
+  std::lock_guard l(lock_);
+  return FindPtrOrNull(entities_, id);
+}
+
 scoped_refptr<MetricEntity> MetricRegistry::FindOrCreateEntity(
     const MetricEntityPrototype* prototype,
     const std::string& id,
@@ -509,7 +515,9 @@ Status Counter::WriteForPrometheus(
     return Status::OK();
   }
 
-  return DoWriteForPrometheus(writer, attributes, default_aggregation_levels, value());
+  return DoWriteForPrometheus(
+      writer, attributes, AggregationLevelsForExport(*prototype_, default_aggregation_levels),
+      value());
 }
 
 Status Counter::SetUpPreAggregationForPrometheus(
@@ -517,6 +525,7 @@ Status Counter::SetUpPreAggregationForPrometheus(
     const MetricEntity::AttributeMap& attributes,
     AggregationLevels default_aggregation_levels,
     const std::string& aggregation_id) {
+  default_aggregation_levels = AggregationLevelsForExport(*prototype_, default_aggregation_levels);
   if (!metrics_aggregator->IsPreAggregationSupported(prototype_, default_aggregation_levels)) {
     return Status::OK();
   }
@@ -671,6 +680,8 @@ Status BaseStats<Stats>::WriteForPrometheus(
   if (AsConstStats()->IsPreAggregated() || prototype_->level() < opts.level) {
     return Status::OK();
   }
+
+  default_aggregation_levels = AggregationLevelsForExport(*prototype_, default_aggregation_levels);
 
   // Representing the sum and count require suffixed names.
   std::string histogram_name = prototype_->name();
