@@ -2898,11 +2898,10 @@ Status CatalogManager::DoRefreshTablespaceInfo(const LeaderEpoch& epoch) {
   return Status::OK();
 }
 
-Status CatalogManager::AddIndexInfoToTable(TableInfoWithWriteLock& indexed_table,
-                                           const IndexInfoPB& index_info,
-                                           const LeaderEpoch& epoch,
-                                           CreateTableResponsePB* resp) {
-  LOG(INFO) << "AddIndexInfoToTable to " << indexed_table->ToString() << "  IndexInfo "
+Status CatalogManager::PrepareAddIndexInfoToTable(TableInfoWithWriteLock& indexed_table,
+                                                 const IndexInfoPB& index_info,
+                                                 CreateTableResponsePB* resp) {
+  LOG(INFO) << "PrepareAddIndexInfoToTable to " << indexed_table->ToString() << "  IndexInfo "
             << AsString(index_info);
   auto& l = indexed_table.lock;
   RETURN_NOT_OK(CatalogManagerUtil::CheckIfTableDeletedOrNotVisibleToClient(l, resp));
@@ -2922,16 +2921,6 @@ Status CatalogManager::AddIndexInfoToTable(TableInfoWithWriteLock& indexed_table
   l.mutable_data()->set_state(
       SysTablesEntryPB::ALTERING,
       Format("Add index info version=$0 ts=$1", pb.version(), LocalTimeAsString()));
-
-  // Update sys-catalog with the new indexed table info.
-  TRACE("Updating indexed table metadata on disk");
-  RETURN_NOT_OK(sys_catalog_->Upsert(epoch, indexed_table.info));
-
-  // Update the in-memory state.
-  TRACE("Committing in-memory state");
-  l.Commit();
-
-  RETURN_NOT_OK(SendAlterTableRequest(indexed_table.info, epoch));
 
   return Status::OK();
 }
@@ -3768,6 +3757,51 @@ std::string CatalogManager::DeletingTableData::ToString() const {
   return Format("table: $0, $1", *table_info_with_write_lock.info, delete_retainer.ToString());
 }
 
+// Collects the sys catalog changes of one delete table operation. The table being deleted, the
+// indexes deleted along with it and the indexed table an index is removed from are all written in
+// a single sys catalog operation, so that no failure can persist a subset of them.
+struct CatalogManager::DeleteTableWriteBatch {
+  std::vector<DdlLogEntry> ddl_log_entries;
+  std::vector<TableInfoPtr> tables_to_upsert;
+
+  // Write locks that no other caller commits, and the tables to send an alter table request to
+  // after the write. Both are only used for the indexed table of a dropped index.
+  std::vector<TableInfo::WriteLock*> locks_to_commit;
+  std::vector<TableInfoPtr> tables_to_alter;
+};
+
+Status CatalogManager::FlushDeleteTableWriteBatch(
+    const LeaderEpoch& epoch, DeleteTableWriteBatch* write_batch, DeleteTableResponsePB* resp) {
+  std::vector<const DdlLogEntry*> ddl_log_entries;
+  ddl_log_entries.reserve(write_batch->ddl_log_entries.size());
+  for (const auto& ddl_log_entry : write_batch->ddl_log_entries) {
+    ddl_log_entries.push_back(&ddl_log_entry);
+  }
+
+  TRACE("Updating metadata on disk");
+  auto s = sys_catalog_->Upsert(epoch, ddl_log_entries, write_batch->tables_to_upsert);
+  if (!s.ok()) {
+    // The mutations are aborted when the locks held by the caller exit their scope.
+    s = s.CloneAndPrepend("An error occurred while updating sys tables");
+    LOG(WARNING) << s;
+    return CheckIfNoLongerLeaderAndSetupError(s, resp);
+  }
+
+  if (PREDICT_FALSE(FLAGS_TEST_simulate_crash_after_table_marked_deleting)) {
+    return STATUS(InternalError, "Simulated crash after the table was marked deleting");
+  }
+
+  for (auto* lock : write_batch->locks_to_commit) {
+    lock->Commit();
+  }
+
+  for (const auto& table : write_batch->tables_to_alter) {
+    RETURN_NOT_OK(SendAlterTableRequest(table, epoch));
+  }
+
+  return Status::OK();
+}
+
 Status CatalogManager::DeleteNotServingTablet(
     const DeleteNotServingTabletRequestPB* req, DeleteNotServingTabletResponsePB* resp,
     rpc::RpcContext* rpc, const LeaderEpoch& epoch) {
@@ -4451,6 +4485,70 @@ bool EnableTableOwnedVectorReverseMapping() {
 
 } // namespace
 
+Status CatalogManager::PersistNewTable(
+    const CreateTableRequestPB& req, const TableInfoPtr& table, const TabletInfos& tablets,
+    TableInfoWithWriteLock& indexed_table, IndexInfoPB* index_info, bool index_backfill_enabled,
+    bool is_pg_table, const LeaderEpoch& epoch, CreateTableResponsePB* resp) {
+  // For an index, add the index info to the uncommitted metadata of the indexed table, so that
+  // both tables are written to the sys catalog in a single operation.
+  if (IsIndex(req)) {
+    if (index_backfill_enabled && !req.skip_index_backfill()) {
+      if (is_pg_table) {
+        // YSQL: start at some permission before backfill.  The real enforcement happens with
+        // pg_index system table's indislive and indisready columns.  Choose WRITE_AND_DELETE
+        // because it will probably be less confusing.
+        index_info->set_index_permissions(INDEX_PERM_WRITE_AND_DELETE);
+      } else {
+        // YCQL
+        index_info->set_index_permissions(INDEX_PERM_DELETE_ONLY);
+      }
+    }
+
+    // if test flag to abort create table is set and this is to create
+    // test table, fake abort the table creation.
+    // case 2: fakes the case where the index info could not be added to the indexed table, while
+    // still holding the COW lock on the indexed table and before anything was written to the sys
+    // catalog.
+    RETURN_NOT_OK(TEST_MaybeFakeAbortTableCreation(2, req.name()));
+
+    RETURN_NOT_OK_PREPEND(
+        PrepareAddIndexInfoToTable(indexed_table, *index_info, resp),
+        "An error occurred while inserting index info");
+  }
+
+  // if test flag to abort create table is set and this is to create
+  // test table, fake abort the table creation.
+  // case 1: fakes the case where the Upsert failed.
+  RETURN_NOT_OK(TEST_MaybeFakeAbortTableCreation(1, req.name()));
+
+  // An index and the indexed table that references it are written in a single operation, so that
+  // the index can never be persisted without the reference to it.
+  RETURN_NOT_OK_PREPEND(
+      IsIndex(req) ? sys_catalog_->Upsert(epoch, table, tablets, indexed_table.info)
+                   : sys_catalog_->Upsert(epoch, table, tablets),
+      "An error occurred while inserting to sys-tablets");
+  VLOG(3) << "SysTablesEntryPB after CreateTable: " << table->metadata().dirty().pb.DebugString();
+  TRACE("Wrote table and tablets to system table");
+
+  if (IsIndex(req)) {
+    // Update the in-memory state of the indexed table.
+    TRACE("Committing in-memory state of the indexed table");
+    indexed_table.lock.Commit();
+
+    // if test flag to abort create table is set and this is to create
+    // test table, fake abort the table creation.
+    // case 3: fakes the case where the creation failed after committing indexed table's in-memory
+    // state & releasing the COW lock on the indexed table.
+    RETURN_NOT_OK(TEST_MaybeFakeAbortTableCreation(3, req.name()));
+
+    RETURN_NOT_OK_PREPEND(
+        SendAlterTableRequest(indexed_table.info, epoch),
+        "An error occurred while sending alter table request");
+  }
+
+  return Status::OK();
+}
+
 // Create a new table.
 // See README file in this directory for a description of the design.
 Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
@@ -4971,63 +5069,11 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   const TabletInfos no_tablets;
   const TabletInfos& created_tablets = joining_colocation_group ? no_tablets : tablets;
 
-  // if test flag to abort create table is set and this is to create
-  // test table, fake abort the table creation.
-  // case 1: fakes the case where the Upsert failed.
-  s = TEST_MaybeFakeAbortTableCreation(1, req.name());
+  s = PersistNewTable(
+      req, table, created_tablets, indexed_table, &index_info, index_backfill_enabled, is_pg_table,
+      epoch, resp);
   if (PREDICT_FALSE(!s.ok())) {
     return AbortTableCreation(table.get(), created_tablets, s, resp, &indexed_table);
-  }
-
-  s = sys_catalog_->Upsert(epoch, table, created_tablets);
-  if (PREDICT_FALSE(!s.ok())) {
-    return AbortTableCreation(
-        table.get(), created_tablets,
-        s.CloneAndPrepend("An error occurred while inserting to sys-tablets"), resp,
-        &indexed_table);
-  }
-  VLOG(3) << "SysTablesEntryPB after CreateTable: " << table->metadata().dirty().pb.DebugString();
-  TRACE("Wrote table and tablets to system table");
-
-  // For index table, insert index info in the indexed table.
-  if (IsIndex(req)) {
-    if (index_backfill_enabled && !req.skip_index_backfill()) {
-      if (is_pg_table) {
-        // YSQL: start at some permission before backfill.  The real enforcement happens with
-        // pg_index system table's indislive and indisready columns.  Choose WRITE_AND_DELETE
-        // because it will probably be less confusing.
-        index_info.set_index_permissions(INDEX_PERM_WRITE_AND_DELETE);
-      } else {
-        // YCQL
-        index_info.set_index_permissions(INDEX_PERM_DELETE_ONLY);
-      }
-    }
-
-    // if test flag to abort create table is set and this is to create
-    // test table, fake abort the table creation.
-    // case 2: fakes the case where Upsert was successful but
-    // AddIndexInfoToTable failed while still holding the COW lock
-    // on the indexed table.
-    s = TEST_MaybeFakeAbortTableCreation(2, req.name());
-    if (PREDICT_FALSE(!s.ok())) {
-      return AbortTableCreation(table.get(), created_tablets, s, resp, &indexed_table);
-    }
-
-    s = AddIndexInfoToTable(indexed_table, index_info, epoch, resp);
-    if (PREDICT_FALSE(!s.ok())) {
-      return AbortTableCreation(
-          table.get(), created_tablets,
-          s.CloneAndPrepend("An error occurred while inserting index info"), resp, &indexed_table);
-    }
-    // if test flag to abort create table is set and this is to create
-    // test table, fake abort the table creation.
-    // case 3: fakes the case where AddIndexInfoToTable failed after
-    // committing indexed table's in-memory state & releasing
-    // the COW lock on the indexed table.
-    s = TEST_MaybeFakeAbortTableCreation(3, req.name());
-    if (PREDICT_FALSE(!s.ok())) {
-      return AbortTableCreation(table.get(), created_tablets, s, resp, &indexed_table);
-    }
   }
 
   // Commit the in-memory state.
@@ -6960,7 +7006,8 @@ Status CatalogManager::MarkIndexInfoFromTableForDeletion(
     const LeaderEpoch& epoch,
     DeleteTableResponsePB* resp,
     std::map<TableId, DeletingTableData>* data_map_ptr,
-    const NamespaceInfoPtr& ns_info) {
+    const NamespaceInfoPtr& ns_info,
+    DeleteTableWriteBatch* write_batch) {
   LOG(INFO) << "MarkIndexInfoFromTableForDeletion table " << indexed_table_id
             << " index " << index_table_id << " multi_stage=" << multi_stage;
   // Lookup the indexed table and verify if it exists.
@@ -6995,45 +7042,32 @@ Status CatalogManager::MarkIndexInfoFromTableForDeletion(
     RETURN_NOT_OK(MultiStageAlterTable::UpdateIndexPermission(
         this, indexed_table,
         {{index_table_id, IndexPermissions::INDEX_PERM_WRITE_AND_DELETE_WHILE_REMOVING}}, epoch));
-  } else {
-    RSTATUS_DCHECK(data_map_ptr, InvalidArgument, "data_map_ptr is not set");
-    RETURN_NOT_OK(DeleteIndexInfoFromTable(indexed_table_id, index_table_id, epoch, data_map_ptr));
+
+    // Actual Deletion of the index info will happen asynchronously after all the
+    // tablets move to the new IndexPermission of DELETE_ONLY_WHILE_REMOVING.
+    RETURN_NOT_OK(SendAlterTableRequest(indexed_table, epoch));
+    return Status::OK();
   }
 
-  // Actual Deletion of the index info will happen asynchronously after all the
-  // tablets move to the new IndexPermission of DELETE_ONLY_WHILE_REMOVING.
-  RETURN_NOT_OK(SendAlterTableRequest(indexed_table, epoch));
-  return Status::OK();
+  RSTATUS_DCHECK(data_map_ptr, InvalidArgument, "data_map_ptr is not set");
+  RSTATUS_DCHECK(write_batch, InvalidArgument, "write_batch is not set");
+  return DeleteIndexInfoFromTable(indexed_table_id, index_table_id, data_map_ptr, write_batch);
 }
 
 Status CatalogManager::DeleteIndexInfoFromTable(
-    const TableId& indexed_table_id, const TableId& index_table_id, const LeaderEpoch& epoch,
-    std::map<TableId, DeletingTableData>* data_map_ptr) {
+    const TableId& indexed_table_id, const TableId& index_table_id,
+    std::map<TableId, DeletingTableData>* data_map_ptr, DeleteTableWriteBatch* write_batch) {
   LOG(INFO) << "DeleteIndexInfoFromTable table " << indexed_table_id << " index " << index_table_id;
-  TableInfoPtr indexed_table;
-  TableInfo::WriteLock* l_ptr;
-  TableInfo::WriteLock indexed_table_write_lock;
-  // If data_map_ptr is not null, then this function is called as a part of manipulation over
-  // multiple tables. So all those tables should be already collected into data_map_ptr.
-  if (data_map_ptr) {
-    auto it = data_map_ptr->find(indexed_table_id);
-    if (it != data_map_ptr->end()) {
-      indexed_table = it->second.table_info_with_write_lock.info;
-      l_ptr = &it->second.table_info_with_write_lock.lock;
-    }
-  } else {
-    indexed_table = GetTableInfo(indexed_table_id);
-    l_ptr = &indexed_table_write_lock;
-
-    TRACE("Locking indexed table");
-    indexed_table_write_lock = indexed_table->LockForWrite();
-  }
-  if (indexed_table == nullptr) {
+  // This function is called as a part of manipulation over multiple tables. So all those tables
+  // should be already collected into data_map_ptr.
+  auto it = data_map_ptr->find(indexed_table_id);
+  if (it == data_map_ptr->end()) {
     LOG(WARNING) << "Indexed table " << indexed_table_id << " for index " << index_table_id
                  << " not found";
     return Status::OK();
   }
-  auto& l = *l_ptr;
+  const auto& indexed_table = it->second.table_info_with_write_lock.info;
+  auto& l = it->second.table_info_with_write_lock.lock;
   auto& indexed_table_data = *l.mutable_data();
 
   // Heed issue #6233.
@@ -7055,15 +7089,14 @@ Status CatalogManager::DeleteIndexInfoFromTable(
           Format("Delete index info version=$0 ts=$1",
                  indexed_table_data.pb.version(), LocalTimeAsString()));
 
-      // Update sys-catalog with the deleted indexed table info.
-      TRACE("Updating indexed table metadata on disk");
-      RETURN_NOT_OK(sys_catalog_->Upsert(epoch, indexed_table));
-
-      // Update the in-memory state.
-      TRACE("Committing in-memory state");
-      l.Commit();
-      VLOG(1) << "Successfully deleted index info from table " << indexed_table_id << " for index "
-              << index_table_id << " in sys-catalog";
+      // The indexed table is written to the sys catalog together with the index being deleted. Its
+      // in-memory state is committed and its tablets are told about the new schema version once
+      // that write succeeds.
+      write_batch->tables_to_upsert.push_back(indexed_table);
+      write_batch->locks_to_commit.push_back(&l);
+      write_batch->tables_to_alter.push_back(indexed_table);
+      VLOG(1) << "Deleted index info from table " << indexed_table_id << " for index "
+              << index_table_id;
       return Status::OK();
     }
   }
@@ -7244,7 +7277,8 @@ Status CatalogManager::DeleteTable(
     if (is_non_pg_table && IsIndexBackfillEnabled(index_table_type, is_transactional)) {
       return MarkIndexInfoFromTableForDeletion(
           indexed_table_id, table_id, /*multi_stage=*/true, epoch, resp, /*data_map_ptr=*/nullptr,
-          VERIFY_RESULT(FindNamespaceById(indexed_table->namespace_id())));
+          VERIFY_RESULT(FindNamespaceById(indexed_table->namespace_id())),
+          /*write_batch=*/nullptr);
     } else if (is_pg_table && req->ysql_yb_ddl_rollback_enabled()) {
       // If DDL Rollback is enabled, we will not delete the index now, but merely mark it for
       // deletion when the transaction commits. Thus set the response fields required by the client
@@ -7361,7 +7395,7 @@ Status CatalogManager::DeleteTableInternal(
   vector<DeletingTableData> tables;
   RETURN_NOT_OK(DeleteTableInMemory(req->table(), req->is_index_table(),
                                     true /* update_indexed_table */, schedules_to_tables_map, epoch,
-                                    &tables, resp, rpc, nullptr, ns_info));
+                                    &tables, resp, rpc, nullptr, ns_info, nullptr));
 
   // Update the in-memory state.
   TRACE("Committing in-memory state");
@@ -7590,7 +7624,8 @@ Status CatalogManager::DeleteTableInMemory(
     const LeaderEpoch& epoch, vector<DeletingTableData>* tables, DeleteTableResponsePB* resp,
     rpc::RpcContext* rpc,
     std::map<TableId, DeletingTableData>* data_map_ptr,
-    const NamespaceInfoPtr& ns_info) {
+    const NamespaceInfoPtr& ns_info,
+    DeleteTableWriteBatch* write_batch) {
   // TODO(NIC): How to handle a DeleteTable request when the namespace is being deleted?
   const char* const object_type = is_index_table ? "index" : "table";
   const bool cascade_delete_index = is_index_table && !update_indexed_table;
@@ -7634,12 +7669,18 @@ Status CatalogManager::DeleteTableInMemory(
     RETURN_NOT_OK(WaitForTransactionTableVersionUpdateToPropagate());
   }
 
+  // The top level call owns the write locks of all the tables involved and the batch of sys
+  // catalog changes they produce. Nested calls, which delete the indexes of the table being
+  // deleted, add to both.
   std::map<TableId, DeletingTableData> data_map;
-  if (!data_map_ptr) {
+  DeleteTableWriteBatch local_write_batch;
+  const bool is_top_level_call = data_map_ptr == nullptr;
+  if (is_top_level_call) {
     TRACE(Substitute("Locking $0", object_type));
     RETURN_NOT_OK(DeleteTableInMemoryAcquireLocks(
         table, is_index_table, update_indexed_table, schedules_to_tables_map, &data_map));
     data_map_ptr = &data_map;
+    write_batch = &local_write_batch;
   }
   auto& data = data_map_ptr->find(table->id())->second;
   auto& l = data.table_info_with_write_lock.lock;
@@ -7696,19 +7737,10 @@ Status CatalogManager::DeleteTableInMemory(
     }
   }
 
-  // Update sys-catalog with the removed table state.
-  Status s = sys_catalog_->Upsert(epoch, &ddl_log_entry, table);
-
-  if (PREDICT_FALSE(FLAGS_TEST_simulate_crash_after_table_marked_deleting)) {
-    return Status::OK();
-  }
-
-  if (!s.ok()) {
-    // The mutation will be aborted when 'l' exits the scope on early return.
-    s = s.CloneAndPrepend("An error occurred while updating sys tables");
-    LOG(WARNING) << s;
-    return CheckIfNoLongerLeaderAndSetupError(s, resp);
-  }
+  // The removed table state is written to the sys catalog by the top level call, together with the
+  // state of every other table this delete changes.
+  write_batch->ddl_log_entries.push_back(std::move(ddl_log_entry));
+  write_batch->tables_to_upsert.push_back(table);
 
   // For regular (indexed) table, delete all its index tables if any. Else for index table, delete
   // index info from the indexed table.
@@ -7718,12 +7750,13 @@ Status CatalogManager::DeleteTableInMemory(
       index_identifier.set_table_id(index.table_id());
       RETURN_NOT_OK(DeleteTableInMemory(
           index_identifier, true /* is_index_table */, false /* update_indexed_table */,
-          schedules_to_tables_map, epoch, tables, resp, rpc, data_map_ptr, ns_info));
+          schedules_to_tables_map, epoch, tables, resp, rpc, data_map_ptr, ns_info, write_batch));
     }
   } else if (update_indexed_table) {
     auto indexed_table_id = GetIndexedTableId(l->pb);
-    s = MarkIndexInfoFromTableForDeletion(
-        indexed_table_id, table->id(), /* multi_stage */ false, epoch, resp, data_map_ptr, ns_info);
+    auto s = MarkIndexInfoFromTableForDeletion(
+        indexed_table_id, table->id(), /* multi_stage */ false, epoch, resp, data_map_ptr, ns_info,
+        write_batch);
     if (!s.ok()) {
       s = s.CloneAndPrepend(Substitute("An error occurred while deleting index info: $0",
                                        s.ToString()));
@@ -7743,6 +7776,10 @@ Status CatalogManager::DeleteTableInMemory(
   // index table, append them to the end. We do so so that we will commit and delete the indexed
   // table first before its indexes.
   tables->insert(is_index_table ? tables->end() : tables->begin(), std::move(data));
+
+  if (is_top_level_call) {
+    RETURN_NOT_OK(FlushDeleteTableWriteBatch(epoch, write_batch, resp));
+  }
 
   return Status::OK();
 }

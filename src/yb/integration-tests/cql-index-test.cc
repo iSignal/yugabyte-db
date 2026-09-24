@@ -21,6 +21,10 @@
 #include "yb/integration-tests/external_mini_cluster_validator.h"
 #include "yb/integration-tests/mini_cluster_utils.h"
 
+#include "yb/master/catalog_entity_info.h"
+#include "yb/master/catalog_manager.h"
+#include "yb/master/mini_master.h"
+
 #include "yb/tablet/tablet.h"
 #include "yb/tablet/tablet_metadata.h"
 #include "yb/tablet/tablet_metrics.h"
@@ -49,8 +53,10 @@ DECLARE_int64(transaction_abort_check_interval_ms);
 DECLARE_uint64(transaction_manager_workers_limit);
 DECLARE_bool(transactions_poll_check_aborted);
 
+DECLARE_uint32(TEST_abort_create_table);
 DECLARE_bool(TEST_disable_proactive_txn_cleanup_on_abort);
 DECLARE_int32(TEST_fetch_next_delay_ms);
+DECLARE_bool(TEST_simulate_crash_after_table_marked_deleting);
 DECLARE_uint64(TEST_inject_txn_get_status_delay_ms);
 DECLARE_bool(TEST_writequery_stuck_from_callback_leak);
 DECLARE_bool(TEST_simulate_cannot_enable_compactions);
@@ -173,6 +179,82 @@ TEST_F(CqlIndexTest, MultipleIndex) {
   auto perm2 = ASSERT_RESULT(client_->WaitUntilIndexPermissionsAtLeast(
       table_name, index_table_name2, IndexPermissions::INDEX_PERM_READ_WRITE_AND_DELETE));
   CHECK_EQ(perm2, IndexPermissions::INDEX_PERM_READ_WRITE_AND_DELETE);
+}
+
+// A DROP TABLE marks the table and every one of its indexes for deletion in a single sys catalog
+// write. A master that fails right after that write must recover into a state where all of them
+// are deleted, instead of one where the table is deleted and its indexes are left behind.
+TEST_F(CqlIndexTest, DropTableWithIndexesIsAtomic) {
+  constexpr auto kNamespace = "test";
+
+  auto session = ASSERT_RESULT(EstablishSession(driver_.get()));
+  ASSERT_OK(session.ExecuteQuery(
+      "CREATE TABLE t (key INT PRIMARY KEY, v1 INT, v2 INT) WITH transactions = "
+      "{ 'enabled' : true }"));
+  ASSERT_OK(session.ExecuteQuery("CREATE INDEX idx1 ON t (v1)"));
+  ASSERT_OK(session.ExecuteQuery("CREATE INDEX idx2 ON t (v2)"));
+
+  std::vector<TableId> dropped_table_ids;
+  {
+    auto& catalog_manager = ASSERT_RESULT(cluster_->GetLeaderMiniMaster())->catalog_manager_impl();
+    for (const auto* name : {"t", "idx1", "idx2"}) {
+      auto table = catalog_manager.GetTableInfoFromNamespaceNameAndTableName(
+          YQL_DATABASE_CQL, kNamespace, name);
+      ASSERT_NE(table, nullptr) << name;
+      dropped_table_ids.push_back(table->id());
+    }
+  }
+
+  // The master persists the deletion and then fails before it applies it in memory.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_simulate_crash_after_table_marked_deleting) = true;
+  LOG(INFO) << "DROP TABLE returned: " << session.ExecuteQuery("DROP TABLE t");
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_simulate_crash_after_table_marked_deleting) = false;
+
+  ASSERT_OK(ASSERT_RESULT(cluster_->GetLeaderMiniMaster())->Restart(
+      /* wait_until_catalog_manager_is_leader = */ true));
+
+  auto& catalog_manager = ASSERT_RESULT(cluster_->GetLeaderMiniMaster())->catalog_manager_impl();
+  ASSERT_OK(WaitFor([&catalog_manager, &dropped_table_ids]() -> Result<bool> {
+    for (const auto& table_id : dropped_table_ids) {
+      auto table = catalog_manager.GetTableInfo(table_id);
+      if (table && !table->LockForRead()->started_deleting()) {
+        LOG(INFO) << "Table " << table->ToString() << " is not deleted";
+        return false;
+      }
+    }
+    return true;
+  }, 60s * kTimeMultiplier, "The dropped table and all its indexes are deleted"));
+}
+
+// An index and the reference to it in the indexed table are written to the sys catalog in a single
+// operation. A failure during the creation therefore cannot leave behind an index that no table
+// refers to.
+TEST_F(CqlIndexTest, CreateIndexIsAtomicWithIndexedTable) {
+  constexpr auto kNamespace = "test";
+  // The create table abort flag only applies to tables with this name prefix.
+  constexpr auto kIndexName = "test_create_abort_idx";
+
+  auto session = ASSERT_RESULT(EstablishSession(driver_.get()));
+  ASSERT_OK(session.ExecuteQuery(
+      "CREATE TABLE t (key INT PRIMARY KEY, value INT) WITH transactions = { 'enabled' : true }"));
+
+  // Fail the creation while holding the lock on the indexed table, after the index table and its
+  // tablets have been prepared.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_abort_create_table) = 2;
+  ASSERT_NOK(session.ExecuteQuery(Format("CREATE INDEX $0 ON t (value)", kIndexName)));
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_abort_create_table) = 0;
+
+  ASSERT_OK(ASSERT_RESULT(cluster_->GetLeaderMiniMaster())->Restart(
+      /* wait_until_catalog_manager_is_leader = */ true));
+
+  auto& catalog_manager = ASSERT_RESULT(cluster_->GetLeaderMiniMaster())->catalog_manager_impl();
+  ASSERT_EQ(catalog_manager.GetTableInfoFromNamespaceNameAndTableName(
+      YQL_DATABASE_CQL, kNamespace, kIndexName), nullptr);
+
+  auto indexed_table = catalog_manager.GetTableInfoFromNamespaceNameAndTableName(
+      YQL_DATABASE_CQL, kNamespace, "t");
+  ASSERT_NE(indexed_table, nullptr);
+  ASSERT_EQ(indexed_table->LockForRead()->pb.indexes_size(), 0);
 }
 
 TEST_F(CqlIndexTest, RecreateIndex) {

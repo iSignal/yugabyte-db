@@ -2107,13 +2107,24 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
       TabletInfoPtr tablet_info, const std::unordered_set<TableId>& tables_to_remove,
       const LeaderEpoch& epoch);
 
-  // Add index info to the indexed table.
-  Status AddIndexInfoToTable(TableInfoWithWriteLock& indexed_table,
-                             const IndexInfoPB& index_info,
-                             const LeaderEpoch& epoch,
-                             CreateTableResponsePB* resp);
+  // Add index info to the uncommitted metadata of the indexed table. The caller must hold the
+  // write lock on the indexed table, persist it in the same sys catalog write as the index table,
+  // and afterwards commit the lock and send the alter table request.
+  Status PrepareAddIndexInfoToTable(TableInfoWithWriteLock& indexed_table,
+                                    const IndexInfoPB& index_info,
+                                    CreateTableResponsePB* resp);
+
+  // Write a new table, its tablets and, for an index, the indexed table that references it to the
+  // sys catalog in a single operation. Commits the indexed table's in-memory state and sends its
+  // alter table request once that write succeeded. The caller aborts the creation of the table if
+  // this returns an error.
+  Status PersistNewTable(
+      const CreateTableRequestPB& req, const TableInfoPtr& table, const TabletInfos& tablets,
+      TableInfoWithWriteLock& indexed_table, IndexInfoPB* index_info, bool index_backfill_enabled,
+      bool is_pg_table, const LeaderEpoch& epoch, CreateTableResponsePB* resp);
 
   struct DeletingTableData;
+  struct DeleteTableWriteBatch;
 
   // Delete index info from the indexed table.
   Status MarkIndexInfoFromTableForDeletion(
@@ -2121,12 +2132,19 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
       const LeaderEpoch& epoch,
       DeleteTableResponsePB* resp,
       std::map<TableId, DeletingTableData>* data_map_ptr,
-      const NamespaceInfoPtr& ns_info);
+      const NamespaceInfoPtr& ns_info,
+      DeleteTableWriteBatch* write_batch);
 
   // Delete index info from the indexed table.
   Status DeleteIndexInfoFromTable(
-      const TableId& indexed_table_id, const TableId& index_table_id, const LeaderEpoch& epoch,
-      std::map<TableId, DeletingTableData>* data_map_ptr);
+      const TableId& indexed_table_id, const TableId& index_table_id,
+      std::map<TableId, DeletingTableData>* data_map_ptr,
+      DeleteTableWriteBatch* write_batch);
+
+  // Write everything collected in write_batch to the sys catalog in a single operation, then
+  // commit the locks the batch owns and send the alter table requests it collected.
+  Status FlushDeleteTableWriteBatch(
+      const LeaderEpoch& epoch, DeleteTableWriteBatch* write_batch, DeleteTableResponsePB* resp);
 
   // Builds the TabletLocationsPB for a tablet based on the provided TabletInfo.
   // Populates locs_pb and returns true on success.
@@ -2272,7 +2290,8 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
       DeleteTableResponsePB* resp,
       rpc::RpcContext* rpc,
       std::map<TableId, DeletingTableData>* data_map_ptr,
-      const NamespaceInfoPtr& ns_info);
+      const NamespaceInfoPtr& ns_info,
+      DeleteTableWriteBatch* write_batch);
 
   // Request tablet servers to delete all replicas of the tablet.
   void DeleteTabletReplicas(
