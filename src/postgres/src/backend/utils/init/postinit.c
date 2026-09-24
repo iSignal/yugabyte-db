@@ -95,6 +95,7 @@
 #include "utils/catcache.h"
 #include "utils/yb_inheritscache.h"
 #include "yb/yql/pggate/ybc_gflags.h"
+#include <poll.h>
 
 static HeapTuple GetDatabaseTuple(const char *dbname);
 static HeapTuple GetDatabaseTupleByOid(Oid dboid);
@@ -113,8 +114,17 @@ static void process_settings(Oid databaseid, Oid roleid);
 
 /* YB functions */
 static void YbPresetDatabaseCollation(HeapTuple tuple);
+static void YbEnableStartupClientConnectionCheck(void);
+static void YbDisableStartupClientConnectionCheck(void);
+static void YbCheckClientConnectionFromSignalHandler(void);
 
 static long YbNumAuthorizedConnections = 0L;
+
+/*
+ * Set while InitPostgres runs with the client connection check armed; see
+ * YbEnableStartupClientConnectionCheck.
+ */
+static volatile sig_atomic_t yb_startup_client_connection_check = false;
 
 /*** InitPostgres support ***/
 
@@ -1130,6 +1140,10 @@ InitPostgresImpl(const char *in_dbname, Oid dboid,
 	/* Connect to YugaByte cluster. */
 	YBInitPostgresBackend("postgres", yb_init_info);
 
+	/* YB: Disabled by YbInitPostgres. */
+	if (!bootstrap)
+		YbEnableStartupClientConnectionCheck();
+
 	if (!bootstrap && MyProcPort != NULL &&
 		MyProcPort->yb_dist_traceparent != NULL &&
 		MyProcPort->yb_dist_traceparent[0] != '\0')
@@ -1778,13 +1792,80 @@ YbInitPostgres(const char *in_dbname, Oid dboid,
 	}
 	PG_CATCH();
 	{
+		YbDisableStartupClientConnectionCheck();
 		YbEnsureSysTablePrefetchingStopped();
 		YBCUpdateInitPostgresMetrics();
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	YbDisableStartupClientConnectionCheck();
 	YbEnsureSysTablePrefetchingStopped();
 	YBCUpdateInitPostgresMetrics();
+}
+
+/*
+ * The catalog preload done by InitPostgres waits on the tserver inside
+ * pggate, where no CHECK_FOR_INTERRUPTS() runs, so the regular client
+ * connection check would never get to look at the socket.  Instead, for as
+ * long as InitPostgres runs, the check timer repeats and its handler probes
+ * the socket itself.  As during queries, client_connection_check_interval = 0
+ * means the client is not checked.
+ *
+ * Only the server-wide value of the GUC is seen here: the pre-authentication
+ * preload runs before startup options and per-role/database settings are
+ * applied.
+ */
+static void
+YbEnableStartupClientConnectionCheck(void)
+{
+	if (client_connection_check_interval <= 0 || !IsUnderPostmaster ||
+		MyProcPort == NULL)
+		return;
+
+	yb_startup_client_connection_check = true;
+	enable_timeout_every(CLIENT_CONNECTION_CHECK_TIMEOUT,
+						 TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+													 client_connection_check_interval),
+						 client_connection_check_interval);
+}
+
+static void
+YbDisableStartupClientConnectionCheck(void)
+{
+	if (!yb_startup_client_connection_check)
+		return;
+
+	disable_timeout(CLIENT_CONNECTION_CHECK_TIMEOUT, false);
+	yb_startup_client_connection_check = false;
+}
+
+/*
+ * Runs in signal context, so it cannot use pq_check_connection(): that
+ * modifies FeBeWaitSet, which the interrupted code may be using, and can
+ * ereport.  poll() is async-signal-safe and asks the kernel the same question.
+ * On a lost client this does what die() does: pggate is interrupted, which
+ * fails the pending request and makes the backend exit with FATAL.
+ */
+static void
+YbCheckClientConnectionFromSignalHandler(void)
+{
+#ifdef POLLRDHUP
+	struct pollfd pfd;
+
+	if (ClientConnectionLost)
+		return;
+
+	pfd.fd = MyProcPort->sock;
+	pfd.events = POLLRDHUP;
+	pfd.revents = 0;
+	if (poll(&pfd, 1, 0) > 0 &&
+		(pfd.revents & (POLLRDHUP | POLLHUP | POLLERR)) != 0)
+	{
+		ClientConnectionLost = true;
+		InterruptPending = true;
+		YBCInterruptPgGate();
+	}
+#endif
 }
 
 /*
@@ -2073,6 +2154,17 @@ IdleStatsUpdateTimeoutHandler(void)
 static void
 ClientCheckTimeoutHandler(void)
 {
+	/*
+	 * YB: Not setting CheckClientConnectionPending here is deliberate: its
+	 * processing re-arms this timer as a one-shot, which would stop the checks
+	 * while a later preload request is blocked.
+	 */
+	if (yb_startup_client_connection_check)
+	{
+		YbCheckClientConnectionFromSignalHandler();
+		return;
+	}
+
 	CheckClientConnectionPending = true;
 	InterruptPending = true;
 	SetLatch(MyLatch);
