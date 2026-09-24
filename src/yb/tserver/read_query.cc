@@ -710,7 +710,7 @@ Status ReadQuery::Complete() {
 
   if (log_ysql_catalog_read_timing_) {
     const auto sidecar_bytes = context_.sidecars().size();
-    const auto protobuf_bytes = resp_->ByteSizeLong();
+    const auto protobuf_bytes = resp_->SerializedSize();
     VLOG(1) << "YSQL catalog read batch: read_time_serial_no=" << used_read_time_.serial_no
             << ", total_us=" << (MonoTime::Now() - start_time_).ToMicroseconds()
             << ", ops=" << req_->pgsql_batch_size()
@@ -932,7 +932,7 @@ Result<ReadQuery::ReadRestartInfo> ReadQuery::DoReadImpl() {
                 << ", table=" << table_info->table_name
                 << ", duration_us=" << (MonoTime::Now() - op_start_time).ToMicroseconds()
                 << ", rows=" << result.num_rows_read
-                << ", response_bytes=" << sidecar_bytes + result.response->ByteSizeLong()
+                << ", response_bytes=" << sidecar_bytes + result.response->SerializedSize()
                 << ", sidecar_bytes=" << sidecar_bytes;
       }
     }
