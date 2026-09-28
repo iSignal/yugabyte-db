@@ -1309,6 +1309,57 @@ YbShouldPreloadCatcacheLists(void)
 }
 
 /*
+ * Whether a tuple of a relation-scoped catalog belongs to a relation that the
+ * relcache preload in progress excludes (ysql_catalog_preload_exclude_schemas).
+ * All tuples of an excluded relation are skipped together, which keeps the
+ * per-relation catcache lists built below complete for the relations kept.
+ */
+static bool
+YbIsPreloadExcludedTuple(Oid catalog_relid, HeapTuple tuple)
+{
+	Oid			relid;
+
+	switch (catalog_relid)
+	{
+		case RelationRelationId:
+			relid = ((Form_pg_class) GETSTRUCT(tuple))->oid;
+			break;
+		case AttributeRelationId:
+			relid = ((Form_pg_attribute) GETSTRUCT(tuple))->attrelid;
+			break;
+		case StatisticRelationId:
+			relid = ((Form_pg_statistic) GETSTRUCT(tuple))->starelid;
+			break;
+		case IndexRelationId:
+			relid = ((Form_pg_index) GETSTRUCT(tuple))->indexrelid;
+			break;
+		case ConstraintRelationId:
+			relid = ((Form_pg_constraint) GETSTRUCT(tuple))->conrelid;
+			break;
+		case RewriteRelationId:
+			relid = ((Form_pg_rewrite) GETSTRUCT(tuple))->ev_class;
+			break;
+		case PartitionedRelationId:
+			relid = ((Form_pg_partitioned_table) GETSTRUCT(tuple))->partrelid;
+			break;
+		case TypeRelationId:
+			{
+				Form_pg_type typ = (Form_pg_type) GETSTRUCT(tuple);
+
+				/* Array types of excluded row types go with them. */
+				if (OidIsValid(typ->typelem) &&
+					YbIsPreloadExcludedRowType(typ->typelem))
+					return true;
+				relid = typ->typrelid;
+				break;
+			}
+		default:
+			return false;
+	}
+	return OidIsValid(relid) && YbIsPreloadExcludedRelation(relid);
+}
+
+/*
  * In YugaByte mode preload the given cache with data from master.
  * If no index cache is associated with the given cache (most of the time), its id should be -1.
  */
@@ -1344,6 +1395,7 @@ YbPreloadCatalogCache(int cache_id, int idx_cache_id)
 											  NULL /* key */ );
 
 	size_t		scanned = 0;
+	size_t		excluded = 0;
 	instr_time	start;
 
 	if (yb_debug_log_catcache_events)
@@ -1358,6 +1410,11 @@ YbPreloadCatalogCache(int cache_id, int idx_cache_id)
 			break;
 
 		scanned++;
+		if (YbIsPreloadExcludedTuple(cache->cc_reloid, ntp))
+		{
+			excluded++;
+			continue;
+		}
 		SetCatCacheTuple(cache, ntp, RelationGetDescr(relation));
 
 		if (idx_cache)
@@ -1539,19 +1596,22 @@ YbPreloadCatalogCache(int cache_id, int idx_cache_id)
 
 		INSTR_TIME_SET_CURRENT(duration);
 		INSTR_TIME_SUBTRACT(duration, start);
-		elog(LOG, "YbPreloadCatalogCache: %ld entries added for "
+		elog(LOG, "YbPreloadCatalogCache: %ld entries added (%ld excluded) for "
 			 "cache id %d, index oid %d (relation %s), took %ld us",
-			 scanned, cache->id, cache->cc_indexoid, cache->cc_relname,
-			 INSTR_TIME_GET_MICROSEC(duration));
+			 scanned - excluded, excluded, cache->id, cache->cc_indexoid,
+			 cache->cc_relname, INSTR_TIME_GET_MICROSEC(duration));
 	}
 
 	/*
 	 * Done: mark cache(s) as loaded. We can only safely set yb_cc_is_fully_loaded
-	 * if we did full preloading; minimal preloading doesn't load user objects.
+	 * if we did full preloading; minimal preloading doesn't load user objects,
+	 * and a cache missing excluded relations' tuples must keep going to the
+	 * catalog on a miss.
 	 */
 	if (!YBCIsInitDbModeEnvVarSet() &&
 		YbNeedAdditionalCatalogTables() &&
-		!YbUseMinimalCatalogCachesPreload())
+		!YbUseMinimalCatalogCachesPreload() &&
+		excluded == 0)
 	{
 		cache->yb_cc_is_fully_loaded = true;
 		if (idx_cache)

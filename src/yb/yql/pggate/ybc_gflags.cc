@@ -100,6 +100,15 @@ DEFINE_NON_RUNTIME_uint64(ysql_catalog_prefetch_size_limit, 10 * 1024 * 1024,
     "evenly among the catalog tables active in each prefetch round and capped at the safe maximum "
     "RPC response size. 0 uses that safe maximum.");
 
+DEFINE_NON_RUNTIME_string(ysql_catalog_preload_exclude_schemas, "",
+    "Schemas whose relations are left out of the catalog caches and relcache built by "
+    "catalog preloading, per (login role, database). The preloaded catalog data is still "
+    "fetched in full; relations in excluded schemas are loaded on demand when used. "
+    "Temporary relations of other sessions are also excluded when an entry applies. "
+    "Format: semicolon-separated entries "
+    "<role_name>@<database_oid>:<schema_oid>[,<schema_oid>...]. "
+    "Example: role1@16384:16500,16501;role2@16384:16502");
+
 DEFINE_RUNTIME_bool(ysql_preload_pg_authid_for_auth, true,
     "If true, YSQL preloads the pg_authid catalog caches (by-name and by-OID) "
     "before client authentication. Authentication reads pg_authid by role name "
@@ -259,6 +268,8 @@ const YbcPgGFlagsAccessor* YBCGetGFlags() {
           &FLAGS_ysql_enable_create_database_oid_collision_retry,
       .ysql_catalog_preload_additional_table_list =
           FLAGS_ysql_catalog_preload_additional_table_list.c_str(),
+      .ysql_catalog_preload_exclude_schemas =
+          FLAGS_ysql_catalog_preload_exclude_schemas.c_str(),
       .ysql_use_relcache_file                   = &FLAGS_ysql_use_relcache_file,
       .ysql_use_optimized_relcache_update       = &FLAGS_ysql_use_optimized_relcache_update,
       .ysql_cdcsdk_enable_old_namespace_streams  = &FLAGS_ysql_cdcsdk_enable_old_namespace_streams,

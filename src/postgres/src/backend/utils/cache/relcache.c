@@ -110,6 +110,7 @@
 #include "catalog/yb_catalog_version.h"
 #include "commands/dbcommands.h"
 #include "commands/yb_cmds.h"
+#include "libpq/libpq-be.h"
 #include "partitioning/partdesc.h"
 #include "postmaster/postmaster.h"
 #include "utils/catcache.h"
@@ -1447,6 +1448,9 @@ YBLoadRelations(YbUpdateRelationCacheState *state)
 		Oid			relid = relp->oid;
 
 		if (state->sys_relations_only && !IsSystemClass(relid, relp))
+			continue;
+
+		if (YbIsPreloadExcludedRelation(relid))
 			continue;
 
 		++num_tuples;
@@ -3147,8 +3151,236 @@ YbGetRelCacheInitFileRevalidationFailed()
 	return YbNumRelCacheInitFileRevalidationFailed;
 }
 
+/*
+ * Namespaces excluded by ysql_catalog_preload_exclude_schemas for this
+ * backend's (login role, database), parsed once per backend.
+ */
+static List *yb_preload_excluded_nsps = NIL;
+static bool yb_preload_excluded_nsps_initialized = false;
+
+/*
+ * Relations (and their row types) left out of the catalog caches and relcache
+ * by the relcache preload in progress, or NULL outside of such a preload.
+ *
+ * The prefetched catalog data stays complete, so any lookup of an excluded
+ * relation made while the prefetcher is active is still answered correctly;
+ * after that, excluded relations are loaded on demand.
+ */
+typedef struct YbPreloadExclusion
+{
+	MemoryContext context;
+	HTAB	   *relids;
+	HTAB	   *reltypes;
+} YbPreloadExclusion;
+
+static YbPreloadExclusion *yb_preload_exclusion = NULL;
+
+static bool
+YbParsePreloadExclusionOid(const char *str, Oid *result)
+{
+	char	   *end;
+	unsigned long value;
+
+	if (*str < '0' || *str > '9')
+		return false;
+	errno = 0;
+	value = strtoul(str, &end, 10);
+	if (errno != 0 || *end != '\0' || value > PG_UINT32_MAX)
+		return false;
+	*result = (Oid) value;
+	return true;
+}
+
+/*
+ * Parse one "<role_name>@<database_oid>:<schema_oid>[,<schema_oid>...]" entry
+ * and, if it applies to this backend, append its schema OIDs to
+ * yb_preload_excluded_nsps. The role name is split off at the last '@' before
+ * the last ':' since only the OID parts have a restricted alphabet. A
+ * malformed entry is ignored as a whole.
+ */
+static void
+YbParsePreloadExclusionEntry(const char *entry)
+{
+	char	   *role = pstrdup(entry);
+	char	   *colon = strrchr(role, ':');
+	char	   *at;
+	Oid			db_oid;
+	char	   *saveptr;
+	List	   *nsps = NIL;
+	ListCell   *lc;
+	MemoryContext oldcxt;
+
+	if (colon == NULL)
+		goto malformed;
+	*colon = '\0';
+	at = strrchr(role, '@');
+	if (at == NULL || at == role)
+		goto malformed;
+	*at = '\0';
+	if (!YbParsePreloadExclusionOid(at + 1, &db_oid))
+		goto malformed;
+
+	for (char *token = strtok_r(colon + 1, ",", &saveptr); token != NULL;
+		 token = strtok_r(NULL, ",", &saveptr))
+	{
+		Oid			nsp_oid;
+
+		if (!YbParsePreloadExclusionOid(token, &nsp_oid))
+			goto malformed;
+		nsps = lappend_oid(nsps, nsp_oid);
+	}
+
+	if (db_oid != MyDatabaseId || strcmp(role, MyProcPort->user_name) != 0)
+	{
+		list_free(nsps);
+		pfree(role);
+		return;
+	}
+
+	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+	foreach(lc, nsps)
+	{
+		Oid			nsp_oid = lfirst_oid(lc);
+
+		if (nsp_oid < FirstNormalObjectId)
+			ereport(LOG,
+					(errmsg("ysql_catalog_preload_exclude_schemas: ignoring "
+							"system schema OID %u", nsp_oid)));
+		else
+			yb_preload_excluded_nsps =
+				list_append_unique_oid(yb_preload_excluded_nsps, nsp_oid);
+	}
+	MemoryContextSwitchTo(oldcxt);
+	list_free(nsps);
+	pfree(role);
+	return;
+
+malformed:
+	list_free(nsps);
+	pfree(role);
+	ereport(LOG,
+			(errmsg("ysql_catalog_preload_exclude_schemas: ignoring "
+					"malformed entry \"%s\"", entry)));
+}
+
+static void
+YbInitPreloadExcludedNamespaces(void)
+{
+	const char *flag = YBCGetGFlags()->ysql_catalog_preload_exclude_schemas;
+	char	   *flag_copy;
+	char	   *saveptr;
+
+	if (yb_preload_excluded_nsps_initialized)
+		return;
+	yb_preload_excluded_nsps_initialized = true;
+
+	/*
+	 * Only client backends are matched, by their login role: the filter must
+	 * not change if the session user changes later.
+	 */
+	if (!IS_NON_EMPTY_STR_FLAG(flag) || MyProcPort == NULL ||
+		MyProcPort->user_name == NULL || YBCIsInitDbModeEnvVarSet() ||
+		IsBinaryUpgrade || YbUseMinimalCatalogCachesPreload())
+		return;
+
+	flag_copy = pstrdup(flag);
+	for (char *entry = strtok_r(flag_copy, ";", &saveptr); entry != NULL;
+		 entry = strtok_r(NULL, ";", &saveptr))
+		YbParsePreloadExclusionEntry(entry);
+	pfree(flag_copy);
+}
+
+/*
+ * Collect the relations to leave out of this preload. Must run after the
+ * catalogs are prefetched and before any catalog cache is filled.
+ */
+static void
+YbBeginPreloadExclusion(int log_level)
+{
+	MemoryContext context;
+	MemoryContext oldcxt;
+	YbPreloadExclusion *exclusion;
+	HASHCTL		ctl;
+	Relation	pg_class_desc;
+	SysScanDesc scandesc;
+	HeapTuple	tuple;
+
+	Assert(yb_preload_exclusion == NULL);
+	YbInitPreloadExcludedNamespaces();
+	if (yb_preload_excluded_nsps == NIL)
+		return;
+
+	context = AllocSetContextCreate(CurrentMemoryContext,
+									"YbPreloadExclusion",
+									ALLOCSET_DEFAULT_SIZES);
+	oldcxt = MemoryContextSwitchTo(context);
+	exclusion = palloc0(sizeof(YbPreloadExclusion));
+	exclusion->context = context;
+	MemSet(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(Oid);
+	ctl.entrysize = sizeof(Oid);
+	ctl.hcxt = context;
+	exclusion->relids = hash_create("YbPreloadExcludedRelids", 1024, &ctl,
+									HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	exclusion->reltypes = hash_create("YbPreloadExcludedRelTypes", 1024, &ctl,
+									  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	MemoryContextSwitchTo(oldcxt);
+
+	pg_class_desc = table_open(RelationRelationId, AccessShareLock);
+	scandesc = systable_beginscan(pg_class_desc, InvalidOid,
+								  false /* indexOk */ , NULL, 0, NULL);
+	while (HeapTupleIsValid(tuple = systable_getnext(scandesc)))
+	{
+		Form_pg_class relp = (Form_pg_class) GETSTRUCT(tuple);
+
+		if (IsSystemClass(relp->oid, relp))
+			continue;
+		if (!list_member_oid(yb_preload_excluded_nsps, relp->relnamespace) &&
+			!(relp->relpersistence == RELPERSISTENCE_TEMP &&
+			  !isTempOrTempToastNamespace(relp->relnamespace)))
+			continue;
+
+		hash_search(exclusion->relids, &relp->oid, HASH_ENTER, NULL);
+		if (OidIsValid(relp->reltype))
+			hash_search(exclusion->reltypes, &relp->reltype, HASH_ENTER, NULL);
+	}
+	systable_endscan(scandesc);
+	table_close(pg_class_desc, AccessShareLock);
+
+	yb_preload_exclusion = exclusion;
+	elog(log_level,
+		 "Preloading relcache excludes %ld relation(s) in %d schema(s)",
+		 hash_get_num_entries(exclusion->relids),
+		 list_length(yb_preload_excluded_nsps));
+}
+
+static void
+YbEndPreloadExclusion(void)
+{
+	if (yb_preload_exclusion == NULL)
+		return;
+	MemoryContextDelete(yb_preload_exclusion->context);
+	yb_preload_exclusion = NULL;
+}
+
+bool
+YbIsPreloadExcludedRelation(Oid relid)
+{
+	return yb_preload_exclusion != NULL &&
+		hash_search(yb_preload_exclusion->relids, &relid, HASH_FIND,
+					NULL) != NULL;
+}
+
+bool
+YbIsPreloadExcludedRowType(Oid typid)
+{
+	return yb_preload_exclusion != NULL &&
+		hash_search(yb_preload_exclusion->reltypes, &typid, HASH_FIND,
+					NULL) != NULL;
+}
+
 static YbcStatus
-YbPreloadRelCacheImpl(YbRunWithPrefetcherContext *ctx)
+YbDoPreloadRelCache(YbRunWithPrefetcherContext *ctx)
 {
 	YbNumRelCachePreloads++;
 	int log_level =
@@ -3204,6 +3436,8 @@ YbPreloadRelCacheImpl(YbRunWithPrefetcherContext *ctx)
 
 	if (status)
 		return status;
+
+	YbBeginPreloadExclusion(log_level);
 
 	/*
 	 * The preloading catalog cache before processing relations will help to
@@ -3311,6 +3545,23 @@ YbPreloadRelCacheImpl(YbRunWithPrefetcherContext *ctx)
 	YbUpdateCatalogCacheVersion(YbGetMasterCatalogVersion());
 	elog(log_level, "Preloading relcache complete");
 	return NULL;
+}
+
+static YbcStatus
+YbPreloadRelCacheImpl(YbRunWithPrefetcherContext *ctx)
+{
+	YbcStatus	status;
+
+	PG_TRY();
+	{
+		status = YbDoPreloadRelCache(ctx);
+	}
+	PG_FINALLY();
+	{
+		YbEndPreloadExclusion();
+	}
+	PG_END_TRY();
+	return status;
 }
 
 void
@@ -9617,8 +9868,11 @@ write_relcache_init_file(bool shared)
 
 	/*
 	 * YB mode uses local-tserver prefetching instead of relcache file.
+	 * A backend with ysql_catalog_preload_exclude_schemas applied never
+	 * writes the file, which is shared with backends of other roles.
 	 */
-	if (IsYugaByteEnabled() && YbCatalogPreloadRequired())
+	if (IsYugaByteEnabled() &&
+		(YbCatalogPreloadRequired() || yb_preload_excluded_nsps != NIL))
 		return;
 
 	/*
