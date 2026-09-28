@@ -51,6 +51,7 @@
 
 /* YB includes */
 #include "common/pg_yb_common.h"
+#include "utils/relcache.h"
 #include "yb_ash.h"
 #include "yb_qpm.h"
 #include "yb_query_diagnostics.h"
@@ -157,6 +158,9 @@ CalculateShmemSize(int *num_semaphores)
 
 	if (YBIsEnabledInPostgresEnvVar())
 		size = add_size(size, YbQpmShmemSize());
+
+	if (YBIsEnabledInPostgresEnvVar())
+		size = add_size(size, YbCatalogPreloadBaseShmemSize());
 
 	if (YBIsEnabledInPostgresEnvVar() && yb_enable_query_diagnostics)
 		size = add_size(size, YbQueryDiagnosticsShmemSize());
@@ -321,6 +325,9 @@ CreateSharedMemoryAndSemaphores(void)
 
 	if (YBIsEnabledInPostgresEnvVar())
 		YbQpmShmemInit();
+
+	if (YBIsEnabledInPostgresEnvVar())
+		YbCatalogPreloadBaseShmemInit();
 
 	/* Setting up yb_terminated_queries shared memory space. */
 	YbTerminatedQueriesShmemInit();

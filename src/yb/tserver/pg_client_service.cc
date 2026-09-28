@@ -2498,6 +2498,7 @@ class PgClientServiceImpl::Impl : public SessionProvider, public SessionRegistry
       rpc::RpcContext context) {
     TriggerRelcacheInitConnectionRequestPB request;
     request.set_database_name(req.database_name());
+    request.set_schedule_catalog_preload_refresh(req.schedule_catalog_preload_refresh());
     auto shared_context = std::make_shared<rpc::RpcContext>(std::move(context));
     const_cast<TabletServerIf&>(tablet_server_).TriggerRelcacheInitConnection(
         request,

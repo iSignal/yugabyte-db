@@ -179,6 +179,18 @@ DEFINE_NON_RUNTIME_bool(ysql_enable_relcache_init_optimization, true,
     "disconnected. Instead an internal super user connection is made to perform the "
     "relcache init file rebuild.");
 
+DEFINE_NON_RUNTIME_bool(ysql_enable_catalog_preload_from_cached_base, false,
+    "Applies when new connections fully preload the catalog caches (e.g. with "
+    "ysql_catalog_preload_additional_tables or ysql_catalog_preload_additional_table_list) and "
+    "ysql_enable_read_request_cache_for_connection_auth is true. A new connection preloads its "
+    "catalog caches from the tserver response cache at the newest catalog version known to be "
+    "cached on this tserver, then applies invalidation messages to catch up to the tserver's "
+    "catalog version, instead of missing the cache after every DDL. A background internal "
+    "connection later refills the cache at the latest catalog version. As with "
+    "ysql_enable_read_request_cache_for_connection_auth, new connections observe DDLs "
+    "(including security DDLs) only once the new catalog version reaches this tserver via "
+    "heartbeat.");
+
 DEFINE_test_flag(int64, delay_after_table_analyze_ms, 0,
     "Add this delay after each table is analyzed.");
 
@@ -303,6 +315,8 @@ const YbcPgGFlagsAccessor* YBCGetGFlags() {
       .ysql_enable_scram_channel_binding = &FLAGS_ysql_enable_scram_channel_binding,
       .TEST_ysql_conn_mgr_auth_delay_ms = &FLAGS_TEST_ysql_conn_mgr_auth_delay_ms,
       .ysql_enable_relcache_init_optimization = &FLAGS_ysql_enable_relcache_init_optimization,
+      .ysql_enable_catalog_preload_from_cached_base =
+          &FLAGS_ysql_enable_catalog_preload_from_cached_base,
       .placement_cloud = FLAGS_placement_cloud.c_str(),
       .placement_region = FLAGS_placement_region.c_str(),
       .placement_zone = FLAGS_placement_zone.c_str(),

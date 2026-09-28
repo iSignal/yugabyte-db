@@ -282,6 +282,30 @@ DEFINE_RUNTIME_int32(min_invalidation_message_retention_time_secs, 60,
     "Minimal time at which a catalog version with invalidation message is retained.");
 TAG_FLAG(min_invalidation_message_retention_time_secs, advanced);
 
+DEFINE_RUNTIME_uint32(ysql_catalog_preload_refresh_min_delay_ms, 60 * 1000,
+    "Used with ysql_enable_catalog_preload_from_cached_base. When a new connection preloads its "
+    "catalog caches from an older cached catalog version, the tserver opens an internal "
+    "connection to refill the response cache at the latest catalog version after a random delay "
+    "picked from [ysql_catalog_preload_refresh_min_delay_ms, "
+    "ysql_catalog_preload_refresh_max_delay_ms]. The delay batches bursts of DDLs into one "
+    "refresh and spreads the refreshes of different tservers over time to limit master load.");
+TAG_FLAG(ysql_catalog_preload_refresh_min_delay_ms, advanced);
+
+DEFINE_RUNTIME_uint32(ysql_catalog_preload_refresh_max_delay_ms, 5 * 60 * 1000,
+    "See ysql_catalog_preload_refresh_min_delay_ms.");
+TAG_FLAG(ysql_catalog_preload_refresh_max_delay_ms, advanced);
+
+DEFINE_test_flag(bool, skip_catalog_preload_refresh, false,
+    "Drop scheduled catalog preload refresh connections instead of opening them.");
+
+METRIC_DEFINE_counter(server, ysql_catalog_preload_refresh_requests,
+    "YSQL Catalog Preload Refresh Requests", yb::MetricUnit::kRequests,
+    "Number of requests from new connections to refill the response cache at the latest catalog "
+    "version");
+METRIC_DEFINE_counter(server, ysql_catalog_preload_refresh_connections,
+    "YSQL Catalog Preload Refresh Connections", yb::MetricUnit::kRequests,
+    "Number of catalog preload refresh internal connections that completed successfully");
+
 DEFINE_RUNTIME_int32(history_retention_pins_persist_interval_sec, 60,
     "Interval at which the cluster-wide per-database history retention pins received in the "
     "heartbeat response are persisted to local disk, so that they can be applied on startup "
@@ -434,7 +458,11 @@ TabletServer::TabletServer(const TabletServerOptions& opts)
       xcluster_context_(new TserverXClusterContext()),
       object_lock_tracker_(std::make_shared<ObjectLockTracker>()),
       object_lock_shared_state_manager_(
-          new docdb::ObjectLockSharedStateManager(object_lock_tracker_, metric_entity()))
+          new docdb::ObjectLockSharedStateManager(object_lock_tracker_, metric_entity())),
+      catalog_preload_refresh_requests_(
+          METRIC_ysql_catalog_preload_refresh_requests.Instantiate(metric_entity())),
+      catalog_preload_refresh_connections_(
+          METRIC_ysql_catalog_preload_refresh_connections.Instantiate(metric_entity()))
 #ifdef __linux__
       ,
       cgroup_manager_(FLAGS_enable_qos ? new TServerCgroupManager() : nullptr)
@@ -1475,6 +1503,12 @@ void TabletServer::TriggerRelcacheInitConnection(
     StdStatusCallback callback) {
   const std::string dbname = req.database_name();
 
+  if (req.schedule_catalog_preload_refresh()) {
+    ScheduleCatalogPreloadRefresh(dbname);
+    callback(Status::OK());
+    return;
+  }
+
   bool started_superuser_connection = false;
   bool aborted_due_to_shutdown = false;
   {
@@ -1584,6 +1618,49 @@ void TabletServer::MakeRelcacheInitConnection(const std::string& dbname) {
     LOG(INFO) << "Relcache init connection to database " << dbname << " failed: " << status;
   }
   RelcacheInitConnectionDone(dbname, status);
+}
+
+void TabletServer::ScheduleCatalogPreloadRefresh(const std::string& dbname) {
+  catalog_preload_refresh_requests_->Increment();
+  {
+    std::lock_guard l(lock_);
+    if (shutting_down_ || !pending_catalog_preload_refreshes_.insert(dbname).second) {
+      return;
+    }
+  }
+  const auto min_delay_ms = FLAGS_ysql_catalog_preload_refresh_min_delay_ms;
+  const auto delay_ms = RandomUniformInt(
+      min_delay_ms, std::max(min_delay_ms, FLAGS_ysql_catalog_preload_refresh_max_delay_ms));
+  LOG(INFO) << "Catalog preload refresh connection to database " << dbname << " scheduled in "
+            << delay_ms << "ms";
+  messenger()->scheduler().Schedule(
+      [this, dbname](const Status& status) {
+        if (!status.ok() || shutting_down_ || FLAGS_TEST_skip_catalog_preload_refresh) {
+          LOG(INFO) << "Catalog preload refresh connection to database " << dbname
+                    << " skipped: " << status;
+          std::lock_guard l(lock_);
+          pending_catalog_preload_refreshes_.erase(dbname);
+          return;
+        }
+        MakeCatalogPreloadRefreshConnection(dbname);
+      },
+      std::chrono::milliseconds(delay_ms));
+}
+
+void TabletServer::MakeCatalogPreloadRefreshConnection(const std::string& dbname) {
+  auto deadline = CoarseMonoClock::Now() + default_client_timeout();
+  auto status = ResultToStatus(CreateInternalPGConn(
+      dbname, kDefaultInternalPgUser, /*simple_query_protocol=*/false, deadline,
+      pgwrapper::YbInternalConnKindWireName::kCatalogPreloadRefresh));
+  if (status.ok()) {
+    catalog_preload_refresh_connections_->Increment();
+    LOG(INFO) << "Catalog preload refresh connection to database " << dbname << " succeeded";
+  } else {
+    LOG(WARNING) << "Catalog preload refresh connection to database " << dbname << " failed: "
+                 << status;
+  }
+  std::lock_guard l(lock_);
+  pending_catalog_preload_refreshes_.erase(dbname);
 }
 
 void TabletServer::SetYsqlCatalogVersion(uint64_t new_version, uint64_t new_breaking_version) {

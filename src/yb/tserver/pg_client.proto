@@ -1535,6 +1535,9 @@ message PgClearExportedTxnSnapshotsResponsePB { AppStatusPB status = 1; }
 
 message PgTriggerRelcacheInitConnectionRequestPB {
   string database_name = 1;
+  // Instead of rebuilding the relcache init file, schedule a delayed catalog preload refresh
+  // connection to refill the response cache at the latest catalog version. Responds immediately.
+  bool schedule_catalog_preload_refresh = 2;
 }
 
 message PgTriggerRelcacheInitConnectionResponsePB { AppStatusPB status = 1; }

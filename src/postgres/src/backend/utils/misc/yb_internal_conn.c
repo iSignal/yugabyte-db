@@ -87,6 +87,18 @@ const YbInternalConnKindDescriptor
 		.use_minimal_preload = false,
 		.preload_lists_in_minimal_mode = false,
 	},
+	[YB_INTERNAL_CONN_KIND_CATALOG_PRELOAD_REFRESH] = {
+		.wire_name = "catalog_preload_refresh",
+		.backend_type = YB_CATALOG_PRELOAD_REFRESH_BACKEND,
+		.backend_desc = "yb catalog preload refresh backend",
+		/*
+		 * Exists only to fill the tserver response cache at the latest
+		 * catalog version, so it must issue the same full-preload requests as
+		 * a regular backend for the cache keys to match.
+		 */
+		.use_minimal_preload = false,
+		.preload_lists_in_minimal_mode = false,
+	},
 };
 
 YbInternalConnKind

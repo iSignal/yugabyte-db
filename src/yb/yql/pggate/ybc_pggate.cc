@@ -3448,6 +3448,10 @@ YbcStatus YBCTriggerRelcacheInitConnection(const char* dbname) {
   return ToYBCStatus(pgapi->TriggerRelcacheInitConnection(dbname));
 }
 
+YbcStatus YBCScheduleCatalogPreloadRefresh(const char* dbname) {
+  return ToYBCStatus(pgapi->ScheduleCatalogPreloadRefresh(dbname));
+}
+
 YbcFlushDebugContext YBCMakeFlushDebugContextBeginSubTxn(uint32_t id, const char *name) {
   return PgFlushDebugContext::YbcBeginSubTxn(id, name);
 }
