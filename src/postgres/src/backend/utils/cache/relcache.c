@@ -3335,9 +3335,7 @@ YbBeginPreloadExclusion(int log_level)
 
 		if (IsSystemClass(relp->oid, relp))
 			continue;
-		if (!list_member_oid(yb_preload_excluded_nsps, relp->relnamespace) &&
-			!(relp->relpersistence == RELPERSISTENCE_TEMP &&
-			  !isTempOrTempToastNamespace(relp->relnamespace)))
+		if (!list_member_oid(yb_preload_excluded_nsps, relp->relnamespace))
 			continue;
 
 		hash_search(exclusion->relids, &relp->oid, HASH_ENTER, NULL);

@@ -104,7 +104,6 @@ DEFINE_NON_RUNTIME_string(ysql_catalog_preload_exclude_schemas, "",
     "Schemas whose relations are left out of the catalog caches and relcache built by "
     "catalog preloading, per (login role, database). The preloaded catalog data is still "
     "fetched in full; relations in excluded schemas are loaded on demand when used. "
-    "Temporary relations of other sessions are also excluded when an entry applies. "
     "Format: semicolon-separated entries "
     "<role_name>@<database_oid>:<schema_oid>[,<schema_oid>...]. "
     "Example: role1@16384:16500,16501;role2@16384:16502");
