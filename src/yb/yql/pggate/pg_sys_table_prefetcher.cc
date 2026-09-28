@@ -540,9 +540,12 @@ class PgSysTablePrefetcher::Impl {
     //   catalog version N.
     // - Reading missed data at same read time when catalog version N has been read guaranties that
     //   data will be consistent to catalog version N
+    // When the version was not read from the master (no version read time), the missed data is
+    // read at the session's catalog read time, which the cached response set to its own read time.
     return options_.caching_info &&
            (options_.caching_info->mode == PrefetchingCacheMode::TRUST_CACHE ||
-            options_.caching_info->mode == PrefetchingCacheMode::TRUST_CACHE_AUTH)
+            options_.caching_info->mode == PrefetchingCacheMode::TRUST_CACHE_AUTH) &&
+           options_.caching_info->version_info.version_read_time
         ?  std::optional(options_.caching_info->version_info.version_read_time) : std::nullopt;
   }
 
