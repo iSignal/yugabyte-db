@@ -35,8 +35,6 @@
 #include <optional>
 #include <string>
 
-#include <optional>
-
 #include "yb/consensus/metadata.pb.h"
 
 #include "yb/tserver/remote_client_base.h"

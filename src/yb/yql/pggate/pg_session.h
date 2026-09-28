@@ -150,6 +150,8 @@ class PgSession final : public std::enable_shared_from_this<PgSession> {
     std::optional<uint32_t> lifetime_threshold_ms;
   };
 
+  void SetBackendCatalogVersion(tserver::PgPerformOptionsPB* options);
+
   Result<PerformFuture> RunAsync(
       std::span<const PgsqlOpPtr> ops, const PgTableDesc& table, const RunOptions& options = {});
 

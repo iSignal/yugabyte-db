@@ -921,6 +921,21 @@ Status PgSession::SetReadTimeIfPresent(
   return Status::OK();
 }
 
+// A tserver that answers a catalog read from a local copy of the master system catalog tablet must
+// first have applied every catalog change up to the version this backend is at. The per-operation
+// ysql_db_catalog_version cannot say what that version is, because PG leaves it unset on internal
+// scans of system relations, which is what a catalog cache miss and a relcache build are. This
+// value is used only to make the tserver wait; it is never validated.
+void PgSession::SetBackendCatalogVersion(tserver::PgPerformOptionsPB* options) {
+  const auto local_version = pg_callbacks_.GetLocalCatalogVersion();
+  if (local_version.db_oid == kPgInvalidOid) {
+    return;
+  }
+  auto& read_time_options = *options->mutable_read_time_options();
+  read_time_options.set_backend_catalog_version(local_version.version);
+  read_time_options.set_backend_catalog_version_db_oid(local_version.db_oid);
+}
+
 Result<PerformFuture> PgSession::Perform(BufferableOperations&& ops, PerformOptions&& ops_options) {
   DCHECK(!ops.Empty());
   tserver::PgPerformOptionsPB options;
@@ -945,6 +960,13 @@ Result<PerformFuture> PgSession::Perform(BufferableOperations&& ops, PerformOpti
       }
     }
     options.set_use_legacy_catalog_session(true);
+    // The tserver may answer this from the local copy of the master system catalog tablet, so it
+    // needs the same version to wait for that a catalog snapshot sends. A backend that has not
+    // attached to a database yet reports an invalid db oid and the tserver then has no
+    // per-database version to wait for, which is correct: the shared catalogs this preload reads
+    // are covered by the exposure gate instead, which does not publish a version until every
+    // tserver's copy holds the rows master read it at.
+    SetBackendCatalogVersion(&options);
   } else {
     const auto is_catalog_snapshot =
         IsCatalogSnapshot(!YBCIsLegacyModeForCatalogOps() && ops_options.has_catalog_ops);
@@ -952,18 +974,7 @@ Result<PerformFuture> PgSession::Perform(BufferableOperations&& ops, PerformOpti
         {}, options, OpsHaveNonTransactionalWrites(ops.operations()),
         ops_options.read_time_action, SkipReadTimeOptions::kFalse, is_catalog_snapshot));
     if (is_catalog_snapshot) {
-      // A tserver that answers this read from a local copy of the master system catalog tablet
-      // must first have applied every catalog change up to the version this backend is at. The
-      // per-operation ysql_db_catalog_version cannot say what that version is, because PG leaves
-      // it unset on internal scans of system relations, which is what a catalog cache miss and a
-      // relcache build are. This value is used only to make the tserver wait; it is never
-      // validated.
-      const auto local_version = pg_callbacks_.GetLocalCatalogVersion();
-      if (local_version.db_oid != kPgInvalidOid) {
-        auto& read_time_options = *options.mutable_read_time_options();
-        read_time_options.set_backend_catalog_version(local_version.version);
-        read_time_options.set_backend_catalog_version_db_oid(local_version.db_oid);
-      }
+      SetBackendCatalogVersion(&options);
     }
     if (pg_txn_manager_->IsTxnInProgress()) {
       options.mutable_in_txn_limit_ht()->set_value(ops_options.in_txn_limit.ToUint64());

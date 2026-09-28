@@ -293,6 +293,60 @@ TEST_F(PgLocalCatalogTest, MasterCatalogReadsDropWhenServing) {
       << "Serving from the copy did not reduce master catalog reads. " << RoutingCounters(0);
 }
 
+// The core requirement, measured the way a remote region feels it: a fresh backend must not pay
+// the master round trip for its catalog reads. TEST_local_catalog_master_read_delay_ms stands in
+// for that round trip by sleeping before every catalog request this tserver sends to master, on
+// both catalog paths, and not at all on a request the copy answered. With the copy serving, the
+// time a fresh connection plus one query costs must therefore barely move when the delay is
+// turned on.
+TEST_F(PgLocalCatalogTest, FreshBackendDoesNotPayMasterCatalogLatency) {
+  constexpr auto kDelayMs = 100;
+  ASSERT_OK(WaitForAllServing());
+  {
+    auto conn = ASSERT_RESULT(ConnectTo(0));
+    ASSERT_OK(conn.Execute("CREATE TABLE t (k INT PRIMARY KEY, v TEXT)"));
+    ASSERT_OK(conn.Execute("INSERT INTO t VALUES (1, 'one')"));
+  }
+  ASSERT_OK(WaitForAllServing());
+
+  // A fresh connection and one query on it, which is the whole of what a remote client waits for.
+  const auto measure = [this]() -> Result<MonoDelta> {
+    const auto start = MonoTime::Now();
+    auto conn = VERIFY_RESULT(ConnectTo(0));
+    auto value = VERIFY_RESULT(conn.FetchRow<std::string>("SELECT v FROM t WHERE k = 1"));
+    SCHECK_EQ(value, "one", IllegalState, "Wrong row read");
+    return MonoTime::Now() - start;
+  };
+
+  // Warm the cluster so that the first measurement is not paying one-time work.
+  ASSERT_RESULT(measure());
+  const auto without_delay = ASSERT_RESULT(measure());
+
+  ASSERT_OK(cluster_->SetFlag(
+      &TServer(0), "TEST_local_catalog_master_read_delay_ms", std::to_string(kDelayMs)));
+  const auto served_before = ASSERT_RESULT(Counter(0, METRIC_local_catalog_reads_served));
+  const auto with_delay = ASSERT_RESULT(measure());
+  const auto served = ASSERT_RESULT(Counter(0, METRIC_local_catalog_reads_served)) - served_before;
+  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_master_read_delay_ms", "0"));
+
+  const auto added = with_delay - without_delay;
+  const auto added_ms = added.ToMilliseconds();
+  LOG(INFO) << "Fresh connection and one query: " << without_delay.ToMilliseconds()
+            << " ms with no injected delay, " << with_delay.ToMilliseconds() << " ms with "
+            << kDelayMs << " ms per master catalog request; added " << added_ms << " ms, which is "
+            << (static_cast<double>(added_ms) / kDelayMs) << " master catalog requests. The copy "
+            << "answered " << served << " requests in the same window. " << RoutingCounters(0);
+
+  ASSERT_GT(served, 0) << "The copy answered nothing, so this measures the wrong thing. "
+                       << RoutingCounters(0);
+  // Not one whole round trip: with the copy serving, a fresh backend's catalog work must not
+  // reach master at all. Half the injected delay is the allowance for measurement noise.
+  ASSERT_LT(added_ms, kDelayMs / 2)
+      << "A fresh backend paid " << (static_cast<double>(added_ms) / kDelayMs) << " master catalog "
+      << "round trips while the copy was serving; the copy answered " << served << ". "
+      << RoutingCounters(0);
+}
+
 // Phase 7 test 2: a DDL on one tserver is visible to a backend on another as soon as the DDL
 // returns, and that backend's catalog misses are answered from its own copy. This is the exposure
 // gate: the DDL's client is not told success until every tserver has acknowledged the lock

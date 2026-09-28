@@ -161,6 +161,18 @@ DEFINE_test_flag(bool, pause_session_lock_after_release, false,
 DEFINE_test_flag(uint64, shared_exchange_big_response_delay_ms, 0,
     "Delay before sending response that does not fit into the shared exchange buffer.");
 
+DEFINE_RUNTIME_bool(log_local_catalog_read_routing, false,
+    "Log one line per catalog request saying whether the tserver-local copy of the master system "
+    "catalog tablet answered it and, when it did not, which rule sent it to master. Runtime, so it "
+    "can be turned on for a slow query and off again. The same lines are emitted at "
+    "--vmodule=pg_client_session=1 without the flag.");
+
+DEFINE_test_flag(uint64, local_catalog_master_read_delay_ms, 0,
+    "Sleep this long before every catalog request this session sends to master, to stand in for "
+    "the round trip a tserver in a remote region pays. Applies to both catalog paths -- a PG "
+    "catalog snapshot and the legacy catalog session -- and not to a request the local copy "
+    "answered.");
+
 DEFINE_RUNTIME_uint32(local_catalog_serve_wait_timeout_ms, 5000,
     "How long a catalog read waits for the local system catalog copy to hold what the backend "
     "was told before the read goes to master instead. The copy polls every "
@@ -3457,6 +3469,12 @@ class PgClientSession::Impl {
       return Status::OK();
     }
 
+    if (PREDICT_FALSE(FLAGS_TEST_local_catalog_master_read_delay_ms > 0) &&
+        (options.use_legacy_catalog_session() ||
+         options.read_time_options().is_catalog_snapshot())) {
+      SleepFor(MonoDelta::FromMilliseconds(FLAGS_TEST_local_catalog_master_read_delay_ms));
+    }
+
     data->used_read_time_applier = MakeUsedReadTimeApplier(setup_session_result, data->req);
     // MakeUsedReadTimeApplier has set plain_session_used_read_time_.pending_update, so the next
     // request expects a used read time stored by the applier, which
@@ -3623,6 +3641,27 @@ class PgClientSession::Impl {
     return safe_time;
   }
 
+  // The two request shapes whose reads the copy can answer, both of which read the catalog at one
+  // hybrid time of their own.
+  //
+  //  - A PG catalog snapshot on the plain session. This is a catalog cache miss or a relcache
+  //    build in a backend that is already attached to its database.
+  //  - The legacy catalog session. PG puts a backend's catalog reads on it while sys table
+  //    prefetching is running, which is the preload a backend does at start, before it has a
+  //    database. Those reads are of shared catalogs -- pg_authid and pg_database among them --
+  //    which the copy holds like any other, and they carry no transaction.
+  template <class OptionsPB>
+  static bool IsCopyServableCatalogRequest(const OptionsPB& options, PgClientSessionKind kind) {
+    if (options.ddl_mode() || options.ddl_use_regular_transaction_block() ||
+        options.yb_non_ddl_txn_for_sys_tables_allowed()) {
+      return false;
+    }
+    if (kind == PgClientSessionKind::kPlain) {
+      return options.read_time_options().is_catalog_snapshot();
+    }
+    return kind == PgClientSessionKind::kLegacyCatalog && options.use_legacy_catalog_session();
+  }
+
   // Chooses the read time of a catalog snapshot that has none yet. The local copy's complete time
   // C is used when the copy may answer this backend's catalog reads, so that every read under the
   // snapshot runs at a time the copy holds in full; otherwise the caller's clamped clock reading
@@ -3631,10 +3670,7 @@ class PgClientSession::Impl {
   HybridTime LocalCatalogReadTimeForFreshSnapshot(
       const OptionsPB& options, PgClientSessionKind kind, CoarseTimePoint deadline) {
     auto* replica = local_catalog_replica();
-    if (!replica || kind != PgClientSessionKind::kPlain ||
-        !options.read_time_options().is_catalog_snapshot() ||
-        options.ddl_mode() || options.ddl_use_regular_transaction_block() ||
-        options.yb_non_ddl_txn_for_sys_tables_allowed()) {
+    if (!replica || !IsCopyServableCatalogRequest(options, kind)) {
       return HybridTime::kInvalid;
     }
     return LocalCatalogCompleteTime(replica, options.read_time_options(), deadline);
@@ -3692,34 +3728,80 @@ class PgClientSession::Impl {
   Result<bool> TryServeCatalogReadsLocally(
       const PerformQueryDataPtr& data, const SetupSessionResult& setup_session_result,
       CoarseTimePoint deadline) {
+    // Says where this catalog request went and, when it did not go to the copy, which rule sent it
+    // to master. Written once per request under --log_local_catalog_read_routing or
+    // --vmodule=pg_client_session=1, so that a slow query on a live cluster can be explained
+    // without a rebuild.
+    std::string routing_reason;
+    auto report = ScopeExit(
+        [this, data, &routing_reason] {
+          if (routing_reason.empty() ||
+              !(FLAGS_log_local_catalog_read_routing || VLOG_IS_ON(1))) {
+            return;
+          }
+          std::string ops;
+          for (const auto& op : data->req.ops()) {
+            if (op.has_read()) {
+              ops += Format("$0 ", op.read().table_id().ToBuffer());
+            } else {
+              ops += Format("w:$0 ", op.write().table_id().ToBuffer());
+            }
+          }
+          LOG_WITH_PREFIX(INFO) << "Local catalog read routing: " << routing_reason
+                                << "; ops=[" << ops << "]";
+        });
+
     auto* replica = local_catalog_replica();
     if (!replica) {
+      routing_reason = "to master: the feature is off on this tserver, there is no copy";
       return false;
     }
     const auto& options = data->req.options();
-    if (!options.read_time_options().is_catalog_snapshot() ||
-        setup_session_result.kind != PgClientSessionKind::kPlain) {
-      return false;
-    }
     if (options.ddl_mode() || options.ddl_use_regular_transaction_block() ||
         options.yb_non_ddl_txn_for_sys_tables_allowed()) {
       // A YSQL upgrade's migration session writes catalog rows outside a DDL, with
       // yb_non_ddl_txn_for_sys_tables_allowed set, so like a DDL backend it can hold uncommitted
       // catalog rows that exist only on master.
+      routing_reason = Format(
+          "to master: the backend holds catalog rows only master has (ddl_mode=$0 "
+          "ddl_in_transaction_block=$1 yb_non_ddl_txn_for_sys_tables_allowed=$2)",
+          options.ddl_mode(), options.ddl_use_regular_transaction_block(),
+          options.yb_non_ddl_txn_for_sys_tables_allowed());
       replica->IncReadsToMasterInDdl();
+      return false;
+    }
+    if (!IsCopyServableCatalogRequest(options, setup_session_result.kind)) {
+      routing_reason = Format(
+          "to master: not a catalog request the copy can answer (session kind=$0 "
+          "is_catalog_snapshot=$1 use_legacy_catalog_session=$2)",
+          setup_session_result.kind, options.read_time_options().is_catalog_snapshot(),
+          options.use_legacy_catalog_session());
       return false;
     }
     const auto& transaction = setup_session_result.session_data.transaction;
     if (transaction && transaction->isolation() == IsolationLevel::SERIALIZABLE_ISOLATION) {
+      routing_reason =
+          "to master: a SERIALIZABLE transaction is attached, whose catalog reads take the master "
+          "tablet's own safe time and so have no single time the copy could reproduce";
       replica->IncReadsToMasterSerializable();
       return false;
     }
     if (!replica->IsServing()) {
+      routing_reason = Format(
+          "to master: the copy is not serving (state=$0)", replica->state());
       replica->IncReadsToMasterNotServing();
       return false;
     }
     auto tablet_peer = replica->tablet_peer();
-    if (!tablet_peer || !AllOpsAreReadsOfLocalCatalogTables(tablet_peer, data->req)) {
+    if (!tablet_peer) {
+      routing_reason = "to master: the copy has no tablet peer";
+      replica->IncReadsToMasterNotServing();
+      return false;
+    }
+    if (!AllOpsAreReadsOfLocalCatalogTables(tablet_peer, data->req)) {
+      routing_reason =
+          "to master: not every operation is a read of a table the copy holds, so the request "
+          "cannot be split between the copy and master";
       replica->IncReadsToMasterNotServing();
       return false;
     }
@@ -3727,12 +3809,20 @@ class PgClientSession::Impl {
     const auto& read_time_options = options.read_time_options();
     const auto safe_time = LocalCatalogCompleteTime(replica, read_time_options, deadline);
     if (!safe_time.is_valid()) {
+      routing_reason = Format(
+          "to master: the copy could not reach the state this backend was told about "
+          "(backend_catalog_version=$0 db_oid=$1 applied_version=$2); see the wait lines above",
+          read_time_options.backend_catalog_version(),
+          read_time_options.backend_catalog_version_db_oid(),
+          read_time_options.backend_catalog_version_db_oid() == kInvalidOid
+              ? 0 : replica->applied_version(read_time_options.backend_catalog_version_db_oid()));
       return false;
     }
 
     auto& session = *setup_session_result.session_data.session;
     const auto snapshot_read_time = session.read_point()->GetReadTime();
     if (!snapshot_read_time) {
+      routing_reason = "to master: this request's session has no read time to read the copy at";
       replica->IncReadsToMasterNotServing();
       return false;
     }
@@ -3741,10 +3831,11 @@ class PgClientSession::Impl {
       // first read, or the caller asked for an explicit time above what the copy holds
       // (yb_read_time, ysql_dump --read-time). Reading the copy at C instead would move the
       // snapshot backwards in the first case and answer a different question in the second.
-      VLOG_WITH_PREFIX(1) << "Routing a catalog read at "
-                          << LocalCatalogHybridTimeForLog(snapshot_read_time.read)
-                          << " to master: the copy holds only "
-                          << LocalCatalogHybridTimeForLog(safe_time);
+      routing_reason = Format(
+          "to master: the request's read time $0 is above the copy's complete time $1, by $2 us",
+          LocalCatalogHybridTimeForLog(snapshot_read_time.read),
+          LocalCatalogHybridTimeForLog(safe_time),
+          snapshot_read_time.read.PhysicalDiff(safe_time).ToMicroseconds());
       replica->IncReadsToMasterNotServing();
       return false;
     }
@@ -3757,6 +3848,9 @@ class PgClientSession::Impl {
     // read time far in the past -- must go to master rather than fail.
     auto read_op = PrepareLocalCatalogRead(tablet_peer, read_time, deadline);
     if (!read_op.ok()) {
+      routing_reason = Format(
+          "to master: the copy no longer keeps history back to $0 ($1)", read_time,
+          read_op.status().message().ToBuffer());
       VLOG_WITH_PREFIX(2) << "Routing a catalog read at " << read_time
                           << " to master: " << read_op.status();
       replica->IncReadsToMasterNotServing();
@@ -3769,6 +3863,9 @@ class PgClientSession::Impl {
       StatusToPB(status, data->resp.mutable_status());
       data->sidecars.Reset();
     } else {
+      routing_reason = Format(
+          "served by the copy at $0, which holds up to $1",
+          LocalCatalogHybridTimeForLog(read_time.read), LocalCatalogHybridTimeForLog(safe_time));
       replica->IncReadsServed();
     }
     // The response cache holds a pending entry for this key when caching was requested; it must be
