@@ -29,6 +29,7 @@
 METRIC_DECLARE_histogram(handler_latency_yb_tserver_TabletServerService_Read);
 
 DECLARE_bool(ysql_catalog_preload_additional_tables);
+DECLARE_string(ysql_catalog_preload_additional_table_list);
 DECLARE_string(ysql_catalog_preload_exclude_schemas);
 DECLARE_bool(ysql_enable_auto_analyze);
 DECLARE_bool(ysql_enable_relcache_init_optimization);
@@ -45,12 +46,13 @@ struct CacheMemoryUsage {
   int64_t backend_pss_kb;
 };
 
-// Sums CacheMemoryContext and all of its descendants. pg_get_backend_memory_contexts() emits
+// Sums used bytes of CacheMemoryContext and all of its descendants. total_bytes is not used
+// because CacheMemoryContext grows in blocks of up to 8MB. pg_get_backend_memory_contexts() emits
 // contexts in depth-first pre-order, so the subtree is the run of rows after CacheMemoryContext
 // with a deeper level.
 Result<int64_t> CacheMemoryContextBytes(PGConn& conn) {
   const auto rows = VERIFY_RESULT((conn.FetchRows<std::string, int32_t, int64_t>(
-      "SELECT name, level, total_bytes FROM pg_get_backend_memory_contexts()")));
+      "SELECT name, level, used_bytes FROM pg_get_backend_memory_contexts()")));
   std::optional<int32_t> cache_level;
   int64_t total = 0;
   for (const auto& [name, level, bytes] : rows) {
@@ -70,12 +72,15 @@ Result<int64_t> CacheMemoryContextBytes(PGConn& conn) {
 
 } // namespace
 
-// Uses ysql_catalog_preload_additional_tables so that, without exclusion, the relation-scoped
-// catalog caches are marked fully loaded and their misses never reach master.
+// Preloads enough catalogs that, without exclusion, planning a simple query on a relation misses
+// no catalog cache. pg_operator and pg_amop are not in the ysql_catalog_preload_additional_tables
+// default list, and they are not relation-scoped, so they must stay fully loaded under exclusion.
 class PgCatalogPreloadExclusionTest : public PgMiniTestBase {
  protected:
   void SetUp() override {
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_catalog_preload_additional_tables) = true;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_catalog_preload_additional_table_list) =
+        "pg_operator,pg_amop";
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_enable_auto_analyze) = false;
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_enable_relcache_init_optimization) = false;
     PgMiniTestBase::SetUp();
@@ -128,7 +133,7 @@ class PgCatalogPreloadExclusionMissTest : public PgCatalogPreloadExclusionTest {
     auto conn = ASSERT_RESULT(ConnectToDB(kDbName));
     ASSERT_OK(conn.Execute("CREATE SCHEMA incl"));
     ASSERT_OK(conn.Execute("CREATE SCHEMA excl"));
-    for (const auto* table : {"incl.warmup", "incl.t", "excl.t"}) {
+    for (const auto* table : {"incl.t", "excl.t"}) {
       ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0 (k INT PRIMARY KEY, v INT)", table));
       ASSERT_OK(conn.ExecuteFormat("CREATE INDEX ON $0 (v)", table));
       ASSERT_OK(conn.ExecuteFormat(
@@ -145,14 +150,6 @@ class PgCatalogPreloadExclusionMissTest : public PgCatalogPreloadExclusionTest {
     excl_oid_ = ASSERT_RESULT(SchemaOid(conn, "excl"));
   }
 
-  // Some catalogs (e.g. pg_operator, pg_amop) are not fully preloaded even without exclusion, so
-  // the first query of a session misses on them. Absorb those misses on a table of the same shape.
-  Result<PGConn> ConnectAndWarmUp(const std::string& user = PGConnSettings::kDefaultUser) {
-    auto conn = VERIFY_RESULT(ConnectAs(user));
-    RETURN_NOT_OK(MasterReads(conn, "SELECT v FROM incl.warmup WHERE k = 3"));
-    return conn;
-  }
-
   Oid excl_oid_ = kInvalidOid;
 };
 
@@ -164,14 +161,14 @@ TEST_F(PgCatalogPreloadExclusionMissTest, ExcludedSchemaMissesGoToMaster) {
   // relation's first-use reads are compared with the same query without exclusion.
   size_t incl_base, excl_base;
   {
-    auto conn = ASSERT_RESULT(ConnectAndWarmUp());
+    auto conn = ASSERT_RESULT(ConnectToDB(kDbName));
     incl_base = ASSERT_RESULT(MasterReads(conn, kInclQuery));
     excl_base = ASSERT_RESULT(MasterReads(conn, kExclQuery));
   }
 
   ASSERT_OK(SetExcludeSchemasFlag(Format("postgres@$0:$1", db_oid_, excl_oid_)));
 
-  auto conn = ASSERT_RESULT(ConnectAndWarmUp());
+  auto conn = ASSERT_RESULT(ConnectToDB(kDbName));
   const auto incl_reads = ASSERT_RESULT(MasterReads(conn, kInclQuery));
   const auto excl_reads = ASSERT_RESULT(MasterReads(conn, kExclQuery));
   LOG(INFO) << "First-use master reads without exclusion: incl.t=" << incl_base
@@ -216,10 +213,10 @@ TEST_F(PgCatalogPreloadExclusionMissTest, ExclusionMatchesRoleAndDatabase) {
       "other_role@$0:$1;postgres@$2:$1;postgres@$0:11;garbage;postgres@x:$1;postgres@$0:1x",
       db_oid_, excl_oid_, db_oid_ + 1)));
 
-  auto conn = ASSERT_RESULT(ConnectAndWarmUp());
+  auto conn = ASSERT_RESULT(ConnectToDB(kDbName));
   const auto postgres_reads = ASSERT_RESULT(MasterReads(conn, kExclQuery));
 
-  auto other_conn = ASSERT_RESULT(ConnectAndWarmUp("other_role"));
+  auto other_conn = ASSERT_RESULT(ConnectAs("other_role"));
   const auto other_reads = ASSERT_RESULT(MasterReads(other_conn, kExclQuery));
   LOG(INFO) << "First-use master reads of excl.t: postgres=" << postgres_reads
             << " other_role=" << other_reads;
@@ -265,7 +262,7 @@ TEST_F(PgCatalogPreloadExclusionTest, CacheMemoryShrinksWithExclusion) {
       .backend_pss_kb = VERIFY_RESULT(
           ProcFileValue(Format("/proc/$0/smaps_rollup", pid), "Pss:")),
     };
-    LOG(INFO) << "exclude_schemas='" << flag << "': CacheMemoryContext subtree = "
+    LOG(INFO) << "exclude_schemas='" << flag << "': CacheMemoryContext subtree used = "
               << usage.cache_context_bytes << " bytes, backend PSS = "
               << usage.backend_pss_kb << " kB";
     return usage;
@@ -279,7 +276,7 @@ TEST_F(PgCatalogPreloadExclusionTest, CacheMemoryShrinksWithExclusion) {
 
   const auto one_saved = none.cache_context_bytes - one.cache_context_bytes;
   const auto both_saved = none.cache_context_bytes - both.cache_context_bytes;
-  LOG(INFO) << "CacheMemoryContext saved: one schema = " << one_saved
+  LOG(INFO) << "CacheMemoryContext used bytes saved: one schema = " << one_saved
             << " bytes, both schemas = " << both_saved << " bytes; "
             << "backend PSS saved: one schema = " << none.backend_pss_kb - one.backend_pss_kb
             << " kB, both schemas = " << none.backend_pss_kb - both.backend_pss_kb << " kB";
