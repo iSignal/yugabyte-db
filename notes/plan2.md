@@ -356,6 +356,109 @@ Counters and histograms on the tserver, all per tserver:
   master, to measure change-stream and status-resolution load.
 - Sharing master's status resolution across streams on the same source tablet
   if the study shows it dominates.
+- Send a DDL's changed DocDB table list in the lock release, so a tserver can
+  evict those table cache entries instead of emptying the whole database's.
+
+  **The problem.** On a tserver a region away from master, the first query on a
+  new connection after any DDL takes about 9 s where it otherwise takes 0.5 s.
+  Measured on the three-region cluster with 100 ms one way to node 3: `ALTER
+  TABLE t ADD COLUMN` on node 1, then `SELECT * FROM t01_r1` on a fresh backend
+  on node 3, 8.9 s against 0.46 s in steady state. `t01_r1` is not the table that
+  was altered.
+
+  **What it is not.** It is not the local catalog copy, and it is not catalog
+  reads. The per-request routing log (`--log_local_catalog_read_routing`)
+  shows every catalog request in that window answered by the copy and none sent
+  to master; master's catalog read count moves by 2; ASH records one
+  `CatalogRead` sample out of about a hundred. Turning the copy off makes the
+  same query 20.1 s instead of 10.1 s, so the copy is already removing half of
+  this.
+
+  **The root cause.** Master's RPC counters across one slow query show
+  `MasterDdl::GetTableSchema` 52 times, about 200 ms each, which is the whole of
+  the 9 s. Those are misses in the tserver's `PgTableCache`, which holds the
+  DocDB schema of each table. A DDL empties it: master's new catalog version for
+  the database reaches the tserver, `SetYsqlDBCatalogVersionsUnlocked` puts the
+  database in `db_oids_updated` (`src/yb/tserver/tablet_server.cc:1696`), that
+  calls `InvalidatePgTableCache` (`:1884`), and
+  `PgTableCache::Impl::InvalidateDbTables` clears the whole per-database map
+  (`src/yb/tserver/pg_table_cache.cc:243-266`, whose own log line reads
+  "Invalidating entire table cache of database"). The only thing the
+  invalidation is keyed on is the database's catalog version, which says that
+  something in the database changed and nothing about what, so every table's
+  entry is dropped and every table the next backend touches is re-fetched from
+  master one round trip at a time. An existing connection does not feel this
+  because commit `ad458d744db` made the PG-side cache evict selectively; a new
+  connection starts with an empty PG cache and falls through to the tserver's.
+  That commit says so itself: it "only optimizes PG table cache, not tserver
+  table cache ... at tserver side, it does not understand the invalidation
+  messages yet so the entire cache is still cleared", and new connections
+  "continue to behave as currently".
+
+  **The proposed fix.** Master already knows which tables a DDL transaction
+  changed, because that set is what its own DDL verification runs on. Put that
+  set in the lock release and have each tserver evict exactly those entries
+  instead of the database's whole map.
+
+  1. The set is `CatalogManager::YsqlDdlTransactionState`, held per transaction
+     in `ysql_ddl_txn_verfication_state_map_`
+     (`src/yb/master/catalog_manager.h:3417-3436`, `:3456`). It carries `tables`,
+     "the table info objects of the tables affected by this transaction", and
+     `nochange_tables`, "set of tables whose DocDB schema do not change".
+     `tables` minus `nochange_tables` is precisely the set whose DocDB schema
+     moved, which is precisely what a tserver's table cache has to drop.
+  2. The set is authoritative rather than advisory. It is the same state the
+     verifier acts on, built on master as it processes the DDL's own
+     `CreateTable`, `AlterTableWithBatchTracker` and `DeleteTable` requests
+     (`src/yb/master/catalog_manager.cc:4925`, `:8449`, `:7301`). If it were
+     incomplete, DDL verification itself would be wrong, so completeness is
+     already a requirement the system enforces elsewhere and this change does
+     not add a new one.
+  3. The release is issued after verification has finished and is synchronous,
+     so at that moment the set is final and every tserver is reached:
+     `DdlAtomicityFinishTransaction` calls `WaitForDdlVerificationToFinish` and
+     only then `ReleaseObjectLocksIfNecessary(..., kSync)`
+     (`src/yb/tserver/pg_client_session.cc:3271-3296`).
+  4. Master already fills cache-update fields into this very request, in
+     `ObjectLockInfoManager::Impl::PopulateDbCatalogVersionCache`
+     (`src/yb/master/object_lock_info_manager.cc:1178-1210`), which is where the
+     new list goes. `ReleaseObjectLockRequestPB` already carries
+     `db_catalog_version_data` for the same purpose; field 7's comment says it is
+     there "to optimize the case where a DDL release causes the catalog-version
+     to increase -- where the release request can update the TServers instead of
+     waiting for the next heartbeat" (`src/yb/tserver/tserver.proto:539-551`).
+     The tserver consumes it in `ts_local_lock_manager.cc:538-606`, which calls
+     `SetYsqlDBCatalogVersions`, which is the call that empties the cache. The
+     new list lands in the same message and is applied at the same point.
+
+  Not PG's `ddl_transaction_state.altered_table_ids`
+  (`src/postgres/src/backend/utils/misc/pg_yb_utils.c:2714-2728`), which was the
+  first idea and is the wrong source. It is per backend and never sent to master,
+  it is populated at only two call sites, both on the ALTER path
+  (`src/postgres/src/backend/commands/yb_cmds.c:1778`, `:1919`), and master builds
+  its verification state independently of it, so a gap in that list would not be
+  caught by verification. It exists to evict the backend's own cache entries in
+  `YbInvalidateTableCacheForAlteredTables`
+  (`src/postgres/src/backend/utils/misc/pg_yb_utils.c:4700-4730`), which is the
+  local counterpart of what this item does for every other tserver.
+
+  Things to settle before writing it:
+  - Keep the present whole-database clear as the fallback for any release that
+    does not carry the list, including retries, since field 7's comment already
+    warns that a retried release may carry stale information, and for a DDL that
+    master did not track verification state for.
+  - A global impact DDL already skips per-database granularity and clears
+    everything (`src/yb/tserver/tablet_server.cc:1881`); that stays as it is.
+  - `PopulateDbCatalogVersionCache` carries its own TODO that it sends every
+    database's catalog version "because the cache invalidation logic on the
+    tserver side expects a full report"; the two coarsenesses are in the same
+    function and could be narrowed together.
+  - `db_catalog_inval_messages_data` is already field 10 of the same request, so
+    a tserver that learned to read invalidation messages could reach a similar
+    result without a new field. Master's verification set is preferable: it is
+    exact rather than inferred, and it is the set the system already has to get
+    right.
+
 - Master-driven fan-out on the DDL path, slow poll otherwise. Plan:
   1. Tservers report the applied op id of their copy in heartbeats.
   2. The lock-release message for a DDL carries the change records from that

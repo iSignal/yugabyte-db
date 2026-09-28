@@ -1470,6 +1470,11 @@ isolation", and the process aborted. A snapshot isolation transaction would inst
 point replaced by a `ReadHybridTime::SingleTime`, which drops the local, global and in-transaction
 limits that bound its uncertainty window.
 
+(Superseded. The side map described in this paragraph was the first version and was later deleted.
+The shipped mechanism chooses the time once and excludes serializable entirely; it is documented in
+the section "The catalog snapshot's read time lives on the plain session's read point" and lands in
+commit 146f355944c. The paragraph below is kept as the chronological record of the first attempt.)
+
 The fix holds the pinned time in the session against the catalog snapshot's own read time serial
 number, in `local_catalog_read_time_serial_no_` and `local_catalog_read_time_`. With a transaction
 attached that record is the only source consulted and the session's read point is not touched.
@@ -1877,3 +1882,926 @@ with the copy serving, the RPC these tests count does not exist.
 **What is left.** Of the 39 `yb-admin-snapshot-schedule-test` failures, the mechanism is fixed and
 two of the binary's tests were run locally and pass; the other 37 have not been run with the fix.
 That binary is the one place where the next default-on run can still produce failures in numbers.
+
+## Second default-on CI run: what was published and what it is expected to show
+
+**Commits.** The working tree became four commits on top of `94a777b21fb`, and the throwaway
+default-flip commit was moved back to the tip:
+
+```
+8d9f6ff55bf  DO NOT LAND: CI run of D57801 with the local catalog copy on by default
+189fb79232e  Notes: the read time choice, the PITR re-seed and the CI test fixes
+01317fa1d69  Keep the copy out of three tests that count reads reaching master
+146f355944c  Choose a catalog snapshot's read time where the snapshot gets one
+5ba31e6ed00  Re-seed the local catalog copy when master restores its system catalog
+94a777b21fb  (previous tip of the stack)
+```
+
+`local_catalog_replica.{h,cc}` carries changes that belong to two different commits: the new
+`local_catalog_reads_to_master_serializable` counter belongs with the read time choice, and the
+move of `kLocalCatalogTabletId` out to `yb/common/constants.h` belongs with the test fixes. The
+split was done by reverting only the constant move in the working tree, committing the counter,
+then re-applying the move and committing it with the rest of the test fixes. No `git stash` was
+used, because the stash stack is shared with the other worktrees on this host.
+
+**Published.**
+
+- `./build-support/lint.sh --rev 94a777b21fb`: 0 errors, 0 warnings.
+- `origin/master` is 3 commits ahead of the stack's merge base `53aae8dc4ef`, and none of the three
+  touches any file this stack touches, so the CI job's forced rebase has nothing to conflict on.
+  This is what failed the 2026-09-06 run, when the stack still carried `common_flags.cc` edits.
+- D57801 updated from `189fb79232e` (the stack without the flip), D58090 from `8d9f6ff55bf` (the
+  stack with it), both against base `53aae8dc4ef`.
+- D58090's Test Plan set to the single line `Jenkins: release`, and `trigger jenkins` posted on
+  D58090. The flip is conditional on `NDEBUG`, so only the release lane runs with the copy serving
+  catalog reads; a run on D57801 would exercise nothing but `pg_local_catalog-test`.
+
+**Expected failures.** Every group the first run produced is accounted for:
+
+| Group                                          | Failures | Status for this run                                     |
+|------------------------------------------------|---------:|---------------------------------------------------------|
+| Object locking off, copy served anyway         |      ~80 | Fixed: the copy refuses to serve without object locking. |
+| `conflict_resolve_keys_verification-itest`     |       17 | Fixed: the DocDB write dump skips the copy's tablet.     |
+| `yb-admin-snapshot-schedule-test` PITR         |       39 | Mechanism fixed; 2 of the 39 verified locally, 37 not.   |
+| Catalog snapshot read time, incl. SERIALIZABLE |   varied | Fixed: one time per snapshot, chosen at one site.        |
+| RPC-count and follower-read assertions         |        2 | Fixed: both fixtures pin the flag off.                   |
+
+No temporary debugging code had to be removed. A scan of the whole stack found no added
+`LOG(ERROR)`, `LOG(FATAL)`, `#if 0`, `DISABLED_` or `FIXME`; every flag the stack adds is either a
+permanent feature flag or a `TEST_`-prefixed hook a test sets, and every `SleepFor` it adds is
+inside a test.
+
+The residual risk is the 37 unrun PITR tests. If the re-seed path is wrong for a case those tests
+cover, that one binary can still fail in numbers; nothing else in the first run's failure set is
+unexplained.
+
+## Third default-on CI run (D58090 launch 169341): triaging the published failures
+
+The run under triage is D58090's release lane, ReportPortal launch **169341**
+("D58090-alma8-clang21-release", base commit 748104ff, diff 315855). Baseline for
+"did the diff introduce this" is the master-release series "master-alma8-clang21-release":
+build 851 = launch 169542 (commit 53aae8dc, the stack's merge base) and build 852 = launch
+169599. A failure that appears in 169341 but not in 851/852 is diff-introduced at the launch
+level; a failure present in both is pre-existing and out of scope.
+
+### The largest cluster, `pg_vector_index-test` (73 failed items), is a CI-experiment artifact, not a feature defect
+
+The 73 failures split into 71 colocated variants and 2 distributed variants (both the `Backup`
+method). They are diff-introduced at the launch level and yet the feature does nothing in any of
+them. Both statements are true at once, and the resolution is that the load which makes them flake
+comes from the feature running in *other* test binaries on the same CI worker, not from the feature
+running in this one.
+
+**The feature is provably inert in every `pg_vector_index-test`.** The copy is constructed only
+when both object locking and concurrent DDL are on (tablet_server.cc:934-940 gates construction on
+`FLAGS_enable_local_tserver_catalog && LocalCatalogPrerequisitesMet()`, and
+LocalCatalogPrerequisitesMet is `FLAGS_enable_object_locking_for_table_locks &&
+FLAGS_ysql_enable_concurrent_ddl`, local_catalog_replica.cc:162-163). The base fixture
+`PgVectorIndexTestBase` forces both off — pg_vector_index-test.cc:229
+`ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_object_locking_for_table_locks) = false` and line 232
+`FLAGS_ysql_enable_concurrent_ddl = false` — every fixture in the file inherits from it and none
+turns them back on, and the branch never modified this file (empty `git diff --stat` against the
+merge base). With the prerequisites unmet the replica pointer stays NULL, so there is no poller, no
+CDC subscription, and no serving path; master likewise registers no sys-catalog change service
+(master.cc:339 gates it on the same prerequisites). The logs confirm the runtime state:
+`using_table_locks:0` in the sampled colocated failures.
+
+**All of the branch's always-run code is additive or inert when object locking is off.** master
+catalog read adds an out-parameter that copies out a cached read time and changes neither the read
+time chosen nor the rows read (catalog_manager.cc). master heartbeat populate is unchanged in its
+per-database loop (master_heartbeat_service.cc). The tserver heartbeat exposure gate
+(heartbeater.cc) returns "the copy holds these versions" as TRUE whenever the replica is null, which
+selects the APPLY branch, so catalog versions propagate to shared memory exactly as on master. The
+tserver session serve path and the PG callback registration are both gated on a non-null serving
+replica (pg_client_session.cc, pg_yb_utils.c). None of this can alter pg_vector behavior.
+
+**The failures are timing-dependent, not a deterministic code bug.** In launch 169341 the vector
+binary is 1209 passed vs 73 failed (94% pass). The same test method passes on some parameters and
+fails on others in the same run (e.g. `SnapshotReadWithConcurrentDelete` failed on three colocated
+parameters and passed on `ColocatedHnswlibPackingV2`). A deterministic defect would fail every
+parameter of a method identically. Failed items show `executions.total:1` — no retry masked
+anything.
+
+**The failing mechanism is the 30-second shared-memory catalog-version wait on a freshly created
+database.** A colocated variant creates a new database (`colocated_db`, oid 16384) and then runs
+`CREATE EXTENSION vector` on it. The first backend to connect to a database whose catalog version is
+not yet in tserver shared memory waits up to 30 seconds for the heartbeat to publish it
+(PgApiImpl::GetSharedCatalogVersion, pggate.cc:2052; the wait is WaitFor(30s) at pggate.cc:2077,
+whose timeout message is "Database $0 is not ready in Yugabyte shared memory"). When the version
+does not arrive inside the window, the CREATE fails. This matches the observed wall-clock: the
+sampled colocated failures end at ~34.8-35.7s, i.e. the ~5s of setup plus the 30s wait. The
+non-colocated variants reuse the pre-existing "yugabyte" database, whose version is already in shared
+memory, so they do not hit this wait — consistent with only 2 of the 73 being distributed (the
+`Backup` method, a distinct ~115s signature).
+
+**Why the wait misses its window only on D58090, and only as flakiness.** In the release lane object
+locking and concurrent DDL both default ON (common_flags.cc:170 `kEnableDdlTransactionBlocks` is
+true under NDEBUG; line 224 `kEnableObjectLockingForTableLocks = kEnableDdlTransactionBlocks`; line
+244 the concurrent-DDL DEFINE takes the same default). D58090's one-line flip sets
+`enable_local_tserver_catalog` on by default under NDEBUG as well. So every release test binary
+*except* the ones that force object locking off runs the copy serving catalog reads — each such
+process runs an extra poller, a CDC subscription, and WAL apply. The CI packs several test processes
+onto each worker. The pg_vector process itself runs copy-off, but it competes for CPU and memory with
+copy-on neighbors, and under that transient contention the heartbeat that must publish db-16384's
+catalog version can slip past the fixed 30s window.
+
+- PROVEN: feature inert in the test; failures timing-dependent; 30s shm wait is the failing site;
+  release defaults put the copy serving in neighbor binaries.
+- LEADING HYPOTHESIS, not proven to cause->effect: that cross-process CPU/memory contention from
+  copy-serving neighbors is what pushes db-16384's version publication past 30s. Proving it needs
+  CI-worker scheduling/CPU data or a controlled whole-suite A/B (copy on vs off, measuring the new
+  database's version-publication latency), neither runnable under the one-test-at-a-time VM
+  constraint. A single local `pg_vector_index-test` cannot reproduce it: fastdebug defaults the copy
+  OFF (kLocalTserverCatalogDefault=false when not NDEBUG), and one local binary has no copy-on
+  neighbors to contend with.
+
+**Categorization against the two user categories.** Neither. Category 1 (test expects unnecessary
+behavior) does not apply: the expectation, that `CREATE EXTENSION` on a new colocated database
+succeeds within 30s, is legitimate and matches standard behavior. Category 2 (feature violates a
+standard-Postgres expectation the test encodes) cannot apply: the feature is inert here, so it
+violates nothing. This is a property of the D58090 "DO NOT LAND" whole-suite-copy-on experiment, not
+of the feature as it will ship (D57801 defaults the copy off). No feature code change is implicated.
+If a green D58090 run is required, the correction is at the CI level (lower per-worker test
+concurrency for this experimental lane, or raise the shared-memory readiness wait), not in the
+branch.
+
+
+### `pg_read_after_commit_visibility-test` `DeferredModeAddCheckConstraint/TransactionalDdlInSerializableTxn`: fixed by 146f355944c, which postdates this launch's base
+
+Launch 169341 aborted this parameterisation with "Read time should NOT be specified for serializable
+isolation level". Two checks emit that text; the launch's is the tablet-side one:
+
+| Site | Exact message | Layer |
+|---|---|---|
+| `src/yb/tablet/write_query.cc:1077` | "...serializable isolation **level**: $0" | tablet, returns a status |
+| `src/yb/client/async_rpc.cc:497` | "...serializable isolation:" | client batcher, `LOG_IF(DFATAL,...)` |
+
+The launch's message carries the word "level", so the abort came from `write_query.cc:1077`. Both
+fire when a serializable operation carries a read time.
+
+Category 2: the test encodes a standard-Postgres-consistent expectation, and the branch state under
+test violated it.
+
+**What the test expects.** A transactional DDL in a serializable transaction
+(`ALTER TABLE kv ADD CONSTRAINT kv_v_positive CHECK (v > 0)`) picks no read time. A serializable
+transaction carries none, and the exclusive object lock the DDL takes on `kv` orders the DDL after
+every committed writer, so the constraint validation sees the committed row without a read time and
+without a read restart (`pg_read_after_commit_visibility-test.cc:667-672`).
+
+**Why the branch violated it at this launch's base.** Launch 169341 built base commit 748104ff
+(2026-09-11), which carried the first version of the read-time choice. That version let the ordinary
+clamp put this server's clock reading on the plain session's single `ConsistentReadPoint`, then
+`TryServeCatalogReadsLocally` wrote the copy's time C over it. The catalog snapshot and the
+serializable transaction multiplex that one read point by serial number in
+`SetupPlainSessionReadTime`, so the concrete time planted for the catalog snapshot was still on the
+register when the serializable transaction's next non-catalog write ran; that write therefore
+carried a read time and the tablet rejected it. The section "The catalog snapshot's read time lives
+on the plain session's read point" documents the mechanism in full.
+
+**The fix and where it lives.** Commit 146f355944c "Choose a catalog snapshot's read time where the
+snapshot gets one" (2026-09-12) deletes the side map and excludes serializable at two points, so no
+time is ever planted on a serializable transaction's read point:
+
+- `TryServeCatalogReadsLocally` returns false for `SERIALIZABLE_ISOLATION` and counts the routing in
+  `local_catalog_reads_to_master_serializable` (`pg_client_session.cc:3713-3714`).
+- `PgTxnManager::SetupReadTimeOptions` returns before the catalog clamp for a serializable
+  transaction, so the request carries neither a read time nor `clamp_uncertainty_window`, and the
+  tserver register stays empty for that serial number.
+
+**Timeline: the launch predates the fix.**
+
+```
+2026-09-11  748104ff    launch 169341 base            first-version code, aborts the test
+2026-09-12  146f355944c the fix                        deletes side map, excludes serializable
+2026-09-12  8d9f6ff55bf HEAD (DO NOT LAND tip)          sits on top of the fix
+```
+
+`git merge-base --is-ancestor 146f355944c 748104ff` is false: the fix is not in the launch's base.
+It is in HEAD (position 19 of the 22 commits in `748104ff..HEAD`).
+
+**Verification at HEAD, release build, the faithful CI configuration.** Command:
+`./yb_build.sh release --clang21 --cxx-test pg_read_after_commit_visibility-test`, one binary, whole
+suite, no extra flags. A release build defaults `enable_local_tserver_catalog` on under `NDEBUG` and
+the DDL-transaction-block prerequisites on, so the copy serves exactly as it did in the launch. All
+four `DeferredModeAddCheckConstraint` parameterisations pass:
+
+| Parameter | Result |
+|---|---|
+| SnapshotDdlTxn | OK (12698 ms) |
+| SerializableDdlTxn | OK (9586 ms) |
+| TransactionalDdlInSnapshotTxn | OK (8688 ms) |
+| TransactionalDdlInSerializableTxn | OK (8587 ms) |
+
+`grep -c "Read time should NOT be specified"` over the whole run is 0. The whole binary is green:
+42 of 42 test-runs OK, 0 failed, ctest "100% tests passed", 412.66 s. The release build reproduces
+the launch's configuration and every test passes, which confirms the fix is in HEAD and the launch
+169341 failure predates it. No further code change is needed for this failure.
+
+### Launch 169341 broad triage: the feature-adjacent failures reduce to three DocDB code sites and one fixture lever
+
+The failures that involve the local catalog copy fall into three error signatures, and every one
+of them is decided by a single question: does the failing test's fixture leave the copy active at
+HEAD, or does it disable the copy?
+
+**The lever.** The copy serves only when both `enable_object_locking_for_table_locks` and
+`ysql_enable_concurrent_ddl` are on. `LocalCatalogPrerequisitesMet()` (local_catalog_replica.cc:162)
+returns true only when both flags are on, and tablet_server.cc:934-935 refuses to start the copy
+when the prerequisite is not met even though `enable_local_tserver_catalog` is on. A release build
+defaults all three flags on. Therefore:
+
+- A fixture that pushes neither flag to `false` runs the copy on at HEAD. The test exercises the
+  feature; a launch-169341 failure of that test is a real signal.
+- A fixture that pushes either flag to `false` runs the copy off at HEAD. The test executes zero
+  feature code; a launch-169341 failure of that test was produced by the diff the launch built, in
+  which the copy started on `enable_local_tserver_catalog` alone, before commit 9735b896ed9 added
+  the both-flags prerequisite.
+
+The launch necessarily built a diff older than 9735b896ed9. Proof by the copy-off fixtures: a test
+whose fixture pushes `enable_object_locking_for_table_locks=false` cannot reach any copy code once
+9735b896ed9 is in the tree, yet several such tests failed in the launch with a copy-sourced error
+(signature 2 below). The only code that produces that error while object locking is off is the
+pre-9735b896ed9 activation path, so the launch built a diff before that commit.
+
+#### Copy state at HEAD of every triaged fixture
+
+| test (fixture) | flags the fixture pushes | copy at HEAD |
+|---|---|---|
+| pg_read_after_commit_visibility DeferredMode* (PgReadAfterCommitVisibilityDdlTest) | none disabling | on |
+| pg_skip_intents_metrics CTAS/CreateLike/MatView (SkipIntentsMetricTest) | objlock=true, ddl_block=true | on |
+| TestPgAlterTable OnDelete/OnUpdate (Java, BasePgSQLTest) | none disabling | on |
+| pg_backends CachedVersion/WaitOnlySameDatabase (PgBackendsTest) | none disabling | on |
+| pg_catalog_version IncrementAllDBCatalogVersions (PgCatalogVersionTest + RestartClusterWithDBCatalogVersionMode) | none disabling | on |
+| pg_catalog_version NewConnectionRelCachePreloadTest (PgCatalogVersionTest + RestartClusterWithInvalMessageEnabled) | none disabling | on |
+| pg_catalog_perf ResponseCacheInvalidation* (PgCatalogWithUnlimitedCachePerfTest) | invalidation=false -> objlock=false, concurrent_ddl=false | off |
+| pg_ddl_transaction DDLStaleSafeTimeReadRestart | invalidation/objlock off | off |
+| pg_catalog_version ConnMgr RPC-count x3 (PgCatalogVersionConnManagerTest) | enable_local_tserver_catalog=false (added by 01317fa1d69) | off |
+
+#### Signature (2) and signature (3) are the same heartbeat check, called the exposure gate
+
+The tserver publishes master's per-database catalog versions to PG shared memory only after the copy
+holds the catalog rows those versions describe. heartbeater.cc:560-573:
+
+```
+if (last_hb_response_.has_db_catalog_version_data() &&
+    !LocalCatalogCopyHoldsHeartbeatVersions()) {
+  // skip publishing this heartbeat's versions
+} else if (last_hb_response_.has_db_catalog_version_data()) {
+  // publish
+}
+```
+
+`LocalCatalogCopyHoldsHeartbeatVersions()` (heartbeater.cc:137-145) returns true when the feature is
+off, the copy is not serving, or the heartbeat carries no read time; otherwise it returns
+`HoldsCatalogStateAt(db_catalog_versions_read_time)`. `HoldsCatalogStateAt(target)`
+(local_catalog_replica.cc:358-364) returns true when the copy's `safe_time() >= target`; otherwise
+it requests an immediate poll and returns false.
+
+Cause and effect. Master reads the catalog versions at `db_catalog_versions_read_time`. If the
+tserver published version N now while the copy's safe_time is still below that read time, a backend
+told version N would then read its catalog from a copy that does not yet hold version N's rows. The
+gate withholds the versions until the copy's poller advances safe_time to the read time.
+
+```
+master heartbeat: {db catalog versions @ read_time T}
+        |
+        v
+  copy.safe_time >= T ?
+        |                         \
+       yes                         no
+        |                          |
+  publish versions            skip publishing, request immediate poll
+  to PG shared memory              |
+        |                    next heartbeat retries after poller advances safe_time
+        v
+  backend sees new version
+```
+
+- Signature (2) "Database is not ready in Yugabyte shared memory" (pggate.cc:2051-2095): a new
+  database's first catalog version never reaches shared memory because the gate keeps withholding it,
+  so `GetSharedCatalogVersion` times out after 30 s.
+- Signature (3) "wait for catalog version N to propagate didn't complete": a bumped version never
+  reaches shared memory for the same reason, so the propagate wait times out after ~10 s.
+
+Both are the gate withholding versions while the copy is behind the read time.
+
+#### The gate clears in ~1 s at HEAD; the launch built a diff where it did not
+
+Measured at HEAD, release build, copy on, whole `PgBackendsTest` suite (run bszllkk90):
+
+- `wait for catalog version 2 to propagate` started 00:02:21.368, completed 00:02:22.465 (~1.1 s).
+- `wait for catalog version 3 to propagate` ~1.0 s.
+- PgBackendsTest AlreadySatisfiedVersion, CachedVersion, FutureVersion, CachedJob all OK.
+
+The poller advances the copy's safe_time to the heartbeat read time within ~1 s, well under the
+10 s and 30 s deadlines, because `HoldsCatalogStateAt` requests an immediate poll on every miss
+(local_catalog_replica.cc:362) and the poll seeds the copy to the current safe time. Signatures (2)
+and (3) do not reproduce at HEAD. The launch built an earlier diff whose poller left the gate shut
+past the deadline; the current poller code is not that diff.
+
+#### Category assignments (user's scheme: 1 = test expects unnecessary behavior; 2 = behavior also in standard PG, a design miss; neither = CI-experiment artifact / infra)
+
+| cluster | signature | copy at HEAD | category | disposition |
+|---|---|---|---|---|
+| pg_read_after_commit DeferredMode* ; pg_skip_intents CTAS/CreateLike/MatView ; TestPgAlterTable OnDelete/OnUpdate | (1) read time on serializable | on | 2 | fixed by 146f355944c; pg_read_after_commit verified 42/42 at HEAD (prior run bnbn32rrp / build_release_repro.log). Confirm one non-pg_read_after_commit representative (pg_skip_intents TestCTASMetricsWithIsolation). |
+| pg_backends CachedVersion/WaitOnlySameDatabase ; pg_catalog_version NewConnectionRelCachePreloadTest, IncrementAllDBCatalogVersions | (3) propagate timeout / version-value mismatch | on | neither | exposure gate clears ~1 s at HEAD; pg_backends verified OK (run bszllkk90). Launch built a pre-current-poller diff. |
+| pg_catalog_perf ResponseCacheInvalidation* ; pg_ddl_transaction DDLStaleSafeTimeReadRestart | (2) db not ready in shared memory | off | neither | feature inactive at HEAD (fixture disables objlock); launch failure is the pre-9735b896ed9 activation-on-enable_local_tserver_catalog-alone artifact. Expected pass at HEAD. |
+| pg_catalog_version ConnMgr RPC-count x3 | RPC-count mismatch | off | neither | 01317fa1d69 pins `enable_local_tserver_catalog=false` fixture-wide; the copy legitimately changes master RPC traffic these tests count, so it is kept out. Resolved. |
+| TestPgCacheConsistency x3 (Java) | version-mismatch count skew (1 vs 0; 4 vs 1; 10 vs 9) | off | neither | fixture overrides `getTServerFlags()` (TestPgCacheConsistency.java:54,56) to push `enable_object_locking_for_table_locks=false` and `ysql_enable_concurrent_ddl=false`, added on master by 97155bba829 (#28529, the object-locking feature). Copy off at HEAD. Launch failure is the pre-9735b896ed9 activation artifact: the launch diff started the copy on `enable_local_tserver_catalog` alone despite `objlock=false`, so a DML after a DDL read from a lagging copy and the catalog-version-mismatch counts shifted. 9735b896ed9 restores copy off, so the test runs its master path. Expected pass at HEAD. |
+| Group B: upgrade tests, pg_regress diffs, OOM, 601 s hangs, cost-model drift, SIGKILL/SIGSEGV timeouts, cdcsdk, pg_hint_table InvalidHint | mixed | n/a | neither | pre-existing or infra; not feature defects. |
+
+No category-1 failure found so far: no test asserts a behavior the feature makes unnecessary. Every
+copy-on failure is either a real correctness bug already fixed (category 2, signature 1) or a
+propagation latency that does not reproduce at HEAD (signature 3). Every copy-off failure is a CI
+artifact of the pre-prerequisite activation path.
+
+Open verification (sequential, no parallel test runs):
+1. pg_skip_intents_metrics SkipIntentsBasicTest.TestCTASMetricsWithIsolation at HEAD — confirm the
+   146f355944c fix on a non-pg_read_after_commit serializable case.
+2. TestPgCacheConsistency (3 Java) at HEAD — optional confirmation only; copy is off at HEAD so a pass is expected, same as the other copy-off fixtures.
+
+### Launch 169341 full enumeration: all 201 unique to_investigate items bucketed and counted
+
+Source: ReportPortal launch 169341 (D58090, diff 315855 on base 748104ff13, release/clang21/alma8),
+all 3 pages of get_test_items_by_filter (status=FAILED, ti001). Totals from get_launch_by_id:
+398 failed executions, 201 unique items, 10713 passed, 362 skipped.
+Reconcile 398 vs 201: 398 counts every execution including CI retries; 201 counts distinct test
+items; 398 - 201 = 197 retry re-runs of the same failing items.
+
+Label definitions (verbatim CI error strings; not invented terms):
+- Error-1 = "Read time should NOT be specified for serializable isolation level" (write_query.cc:1077).
+- Error-2 = "Database is not ready in Yugabyte shared memory: Timed out 30000ms" (pggate.cc:2051-2095).
+- Error-3 = "wait for catalog version N to propagate didn't complete within ~10000ms".
+
+ACCOUNTING (201 total):
+  Understood, feature-adjacent .............................. 21
+    Fixed (feature bug; test assumption category 1) ........  9   Error-1 / 146f355944c
+    Understood, not a bug at HEAD (CI artifact) ............ 12
+      Error-3 non-reproducing at HEAD .....................  4
+      Error-2 copy-off at HEAD (9735b896ed9) ..............  2
+      ConnMgr RPC-count copy-off (01317fa1d69) ............  3
+      TestPgCacheConsistency copy-off (97155bba829) .......  3
+  Not individually root-caused (prior: pre-existing/infra) . 180
+
+Verified pass at HEAD (release) so far: 5 items
+  - DdlMode/PgReadAfterCommitVisibilityDdlTest x3 (Error-1) : 4 AddCheckConstraint params OK, 0 Error-1.
+  - PgBackendsTest CachedVersion + WaitOnlySameDatabase (Error-3): 27 OK / 0 FAILED, 0 Error-3, 0 Error-1.
+
+GROUP A - feature-adjacent, understood (21):
+  A1 Error-1, fixed by 146f355944c (copy ON), 9:
+     DdlMode/PgReadAfterCommitVisibilityDdlTest.DeferredMode{AddCheckConstraint,AddForeignKey,Ctas}/TransactionalDdlInSerializableTxn  [VERIFIED]
+     org.yb.pgsql.TestPgAlterTable.testAddColumnWithForeignKeyConstraintOn{Delete,Update}  [pending re-run]
+     SkipIntentsBasicTest.{TestCreateLikeInsertMetrics/2,TestCTASMetricsWithIsolation/2}  [pending re-run]
+     SkipIntentsMatViewTest.TestRefreshMetrics/{4,5}  [pending re-run]
+  A2 Error-3, non-reproducing at HEAD (copy ON), 4:
+     PgBackendsTest.{CachedVersion,WaitOnlySameDatabase}  [VERIFIED]
+     PgCatalogVersionTest.{IncrementAllDBCatalogVersions,NewConnectionRelCachePreloadTest}  [pending re-run]
+  A3 Error-2, copy OFF at HEAD via 9735b896ed9, 2:
+     PgCatalogPerfTest.ResponseCacheInvalidationOnConnectionWithTempTableClosure
+     PgMasterDDLReadRestartProbeTest.DDLStaleSafeTimeReadRestart
+  A4 ConnMgr RPC-count, copy OFF at HEAD via 01317fa1d69, 3:
+     PgCatalogVersionConnManagerTest.{TestConnectionManagerRelCacheInitRpcCount/0,/1,TestConnectionManagerRpcCount/0}
+  A5 TestPgCacheConsistency, copy OFF at HEAD via 97155bba829, 3:
+     org.yb.pgsql.TestPgCacheConsistency.{testConsistentPreparedStatements,testInheritance,testPgInheritsCacheConsistency}
+
+GROUP B - not individually root-caused, 180 (prior only; NOT verified):
+  Vector index (HNSW) family ............................... 73  PgVectorIndexSingleServerTest 50, PgVectorIndexTest 20, ReverseMappingCompactionGc(Colocated)Test 3
+  Snapshot / PITR restore family .......................... 42  YbAdminSnapshotScheduleTestWithYsqlColocationRestoreParam 30, Colocation/...Param 6, YbAdminSnapshotScheduleTest 3, ...WithYsql 2, SkipIntentsPITRTest 1
+  Conflict-resolution family .............................. 17  ConflictResolveKeysVerificationITest (whole family down = fixture-level crash)
+  Upgrade / rollback family ............................... 14  TestYsqlUpgrade 5, YsqlMajorUpgrade* 4, Backup/Cdc/PgLocksV76/UpgradeFrom_2_25 4, PgLibPqTest.ReplayDeletedTableInColocatedDBPostUpgrade 1
+  Index backfill family ...................................  7  PgIndexBackfill* 6, PgSerializeBackfillTest 1
+  Sequence cache family ...................................  7  TestPgSequencesWith(Server)CacheFlag
+  pg_regress suites .......................................  7  Parallel, Planner, ResetAnalyze, DDLIsolationNoTxnDDLNoObjectLocking, ThirdPartyExtensions(PgCron, Anonymizer x2)
+  Role profile ............................................  3  TestYbRoleProfile
+  Cost-model estimation ...................................  2  TestPgCostModelSeekNextEstimation (integer-overflow tests)
+  Clone ...................................................  2  Colocation/PgCloneTestWithColocatedDBParam, PgCloneTest
+  Catalog-related singles (candidate feature-adjacent) ....  6  PgLibPqTest.{CatalogCacheMemoryLeak,ConcurrentIndexInsert}, TestPgUpdatePrimaryKey.basicSystemTables, TestPgFollowerReads.testPgSysCatalogNoFollowerReads, PgHintTableTest.InvalidHint, CDCSDKConsistentStreamTest.CDCSDKMultipleAlterImplicit
+
+Group B disambiguation not yet done. Next step to move B items from "not understood" to "understood":
+pull one CI log per family; the 6 catalog-related singles are the only B items with a plausible
+path through the local catalog copy and should be logged first.
+
+## Fourth default-on CI run (D58090 launch 169670): 23 failures, triaged
+
+**The launch.** D58090 diff 315957, base commit `34f97f9f63f6be719e8cbfa81168c0c758834d8e`,
+alma8/clang21/release, started 2026-09-12T18:45:59Z. Statistics: 13299 executions, 38 failed, 12843
+passed, 418 skipped, 23 unique `to_investigate` (ti001) items, `reran_passed=11`. The two other
+lanes on the same diff each have one unique failure: alma9-clang21-asan launch 169672
+(`TestPgRegressYbExtensionsYbXclusterDdlReplication - schedule`, SIGTERM) and alma8-gcc15-fastdebug
+launch 169671.
+
+**Against the previous run.** Launch 169341 (diff 315855, base `748104ff13`) had 201 unique failed
+items; 183 of those 201 are gone and 5 are new. The two launches do not share a base commit, so the
+183 is not attributable to the three fix commits alone; the part of it that is base drift has not
+been separated.
+
+### The single mechanism behind 13 of the 23: a catalog write that is neither a DDL commit nor a version bump is invisible to the next catalog read
+
+**What the read path does.** `PgClientSessionImpl::SetFreshCatalogSnapshotReadTime`
+(`src/yb/tserver/pg_client_session.cc:3644-3658`) gives a PG catalog snapshot that has no read time
+yet the local copy's complete time C, and `TryServeCatalogReadsLocally`
+(`src/yb/tserver/pg_client_session.cc:3692`) then answers the snapshot's reads from the copy at
+exactly that time. C is master's state as of the copy's last applied poll batch, so C trails
+master's present by the poll interval (`local_catalog_poll_interval_ms`, default 100 ms) plus the
+apply time.
+
+**Which reads this covers.** `PgSession` marks a request `has_catalog_ops` whenever any operation in
+it touches a relation whose schema says `is_ysql_catalog_table()`
+(`src/yb/yql/pggate/pg_session.cc:1273-1276`), and that flag becomes
+`read_time_options.is_catalog_snapshot` (`src/yb/yql/pggate/pg_session.cc:950`,
+`src/yb/yql/pggate/pg_txn_manager.cc:822`). So it is not only PG's internal `CatalogSnapshot` scans
+that the copy may answer: a plain SQL `SELECT ... FROM pg_catalog.pg_proc` typed by a user is
+routed the same way.
+
+**The two things that pull C forward, and what each misses.**
+
+1. The backend's catalog version. `LocalCatalogCompleteTime`
+   (`src/yb/tserver/pg_client_session.cc:3563-3587`) waits until the copy has applied the version
+   the backend carries in `backend_catalog_version`. A write that increments no catalog version
+   leaves that number unchanged, so the wait is satisfied immediately and covers nothing.
+
+2. The session's own write floor. `HandleCommit`
+   (`src/yb/tserver/pg_client_session.cc:4594-4604`) records a clock reading into
+   `own_catalog_write_floor_`, and `LocalCatalogCompleteTime`
+   (`src/yb/tserver/pg_client_session.cc:3598-3617`) makes the next catalog read wait for the copy
+   to reach it. That store sits inside `if (commit_status.ok() && is_ddl_mode)`, so it is recorded
+   only for a DDL commit. A catalog write made outside DDL mode records no floor at all.
+
+**The writes that fall through both.** There are two ways a committed catalog write ends up absent
+from the only token the guards read, which is the version number the backend puts in
+`backend_catalog_version`.
+
+*Form one: no version is incremented at all.*
+
+- Any DML run with `yb_non_ddl_txn_for_sys_tables_allowed` set. The java suites reach this through
+  `BasePgSQLTest.executeSystemTableDml`
+  (`java/yb-pgsql/src/test/java/org/yb/pgsql/BasePgSQLTest.java:1524`), which sets the GUC, runs the
+  statement and clears the GUC again.
+- The failed-login counter. `YbMaybeIncFailedAttemptsAndDisableProfile`
+  (`src/postgres/src/backend/commands/yb_profile.c:726-772`) reads the current count through
+  `yb_get_role_profile_tuple_by_role_oid`, which is a `table_beginscan_catalog`
+  (`src/postgres/src/backend/commands/yb_profile.c:432`) and therefore a catalog-snapshot read, adds
+  one, and writes the result back with `YBCExecuteUpdateLoginAttempts`
+  (`src/postgres/src/backend/executor/ybModifyTable.c:1298-1310`), which issues a
+  `YB_SINGLE_SHARD_TRANSACTION` update. No DDL, no version bump.
+- `yb_reset_analyze_statistics`, a SQL-language function declared
+  `SET yb_non_ddl_txn_for_sys_tables_allowed = ON`
+  (`src/postgres/src/backend/catalog/yb_system_functions.sql:20-92`) that writes `pg_class` and
+  `pg_statistic_ext_data` and then raises the version row by hand with
+  `UPDATE pg_yb_catalog_version SET current_version = current_version + 1` (`:84`). That last
+  statement writes the row but advances no backend's reported version; see the second form below.
+
+CORRECTION (2026-09-14, raised by the user): `ANALYZE` is **not** in this list. It is classified as
+a DDL and it does increment the catalog version -- `is_ddl = is_analyze` and
+`is_version_increment = true` in `src/postgres/src/backend/utils/misc/pg_yb_utils.c:4231-4278`. The
+earlier claim here came from grepping only `analyze.c`, where the classification does not live. Both
+guards therefore do apply to `ANALYZE`, and any `ANALYZE`-driven failure needs a different
+explanation.
+
+*Form two: the version row is raised by hand, and no backend's reported version moves.* A backend's
+`yb_catalog_cache_version` is advanced in exactly two places -- a DDL commit
+(`src/postgres/src/backend/utils/misc/pg_yb_utils.c:3044` and `:3443`) and a read of the tserver's
+shared memory. A raw `UPDATE pg_yb_catalog_version` writes the row and does neither, so the writing
+session's next statement still reports the old number, guard 1 is satisfied at once, and a backend
+that connects afterwards starts from shared memory, which the exposure gate has not published yet.
+The sites are `yb_reset_analyze_statistics`
+(`src/postgres/src/backend/catalog/yb_system_functions.sql:84`),
+`src/postgres/src/test/regress/sql/yb.orig.planner_base_scans_cost_model.sql:26` and both
+`TestPgCostModelSeekNextEstimation` cases.
+
+**Damage, form one: a session does not see its own catalog write.**
+
+```
+one connection, one session, no DDL
+
+  SET yb_non_ddl_txn_for_sys_tables_allowed = 1
+  UPDATE pg_catalog.pg_proc SET proargdefaults = '(... :location -1 ...)'   commits at H
+  SET yb_non_ddl_txn_for_sys_tables_allowed = 0
+  SELECT proargdefaults FROM pg_catalog.pg_proc                 read served at C, C < H
+                                                                returns ':location 83',
+                                                                the value initdb wrote
+```
+
+This is `TestYsqlUpgrade.updatePgNodeTreeType`
+(`java/yb-pgsql/src/test/java/org/yb/pgsql/TestYsqlUpgrade.java:2359-2372`) verbatim, and its CI
+failure message is the `:location -1` versus `:location 83` mismatch.
+
+**Damage, form two: a session does not see another session's catalog write.** The counter is
+`pg_yb_role_profile.rolprffailedloginattempts`, an `int16` column with one row per role, which
+records how many consecutive failed logins a role has had. Every failed login is a separate client
+connection and therefore a separate backend and a separate `PgClientSession`
+(`java/yb-pgsql/src/test/java/org/yb/pgsql/TestYbRoleProfile.java:114-130`), so nothing about the
+writing session's state is available to the reading session.
+
+Measured on `testLogin[0]`, release build, with
+`--vmodule=pg_client_session=1,local_catalog_replica=1,local_catalog_poller=1`
+(`scratchpad/rp_vlog.log`, and the tserver log under
+`java/yb-pgsql/target/surefire-reports_org.yb.pgsql.TestYbRoleProfile__testLogin_0_/`):
+
+```
+ts1 wall clock      what happened                                      copy's C on ts1
+------------------  -------------------------------------------------  ---------------
+01:52:27.296608                                                         C := 27.296608
+01:52:27.345        backend 3311969 starts (the successful login)
+01:52:27.380        its catalog snapshot pinned to C = 27.296608        (83 ms behind)
+01:52:27.393        backend 3311980 starts (the failed login)
+01:52:27.398020     poller applies 1 record, lag 0.001s                 C := 27.398020
+01:52:27.425        "password authentication failed for user
+                     profile_user"; the counter write commits here
+01:52:27.430        the test's own connection (session 5) pins its
+                    catalog snapshot to C = 27.398020                   <-- BEFORE the write
+01:52:27.433        AssertionError: expected:<1> but was:<0>
+01:52:27.458859     poller applies the counter write                    C := 27.458859
+```
+
+The write was made and was not lost. The reader's snapshot was pinned 28 ms before it and could not
+see it. `expected:<1> but was:<0>` is a stale read.
+
+CORRECTION (2026-09-14): an earlier version of this section called form two a lost update, on the
+theory that the incrementing backend read a stale counter and wrote back stale+1. The trace above
+does not show that, and no lost increment has been observed. The read-modify-write hazard is
+structurally present -- `YbMaybeIncFailedAttemptsAndDisableProfile` does read through a catalog
+snapshot the copy may answer -- but it is unproven, and the observed failures are explained by the
+reader alone.
+
+**Why the staleness exists even though the copy is healthy.** Every `Safe time advanced` line in the
+run reports `lag 0.001s`, so the records the copy applies are 1 ms old; the copy is not behind in
+the sense of replication lag. C is a step function that moves only when a poll lands, and the step
+measured here is 27.296608 -> 27.398020, that is 101 ms, which is
+`local_catalog_poll_interval_ms = 100`. A catalog snapshot pinned between two polls is frozen at the
+earlier step, so any catalog row that another session wrote inside that window reads as its
+pre-write value.
+
+`TestYbRoleProfile.assertProfileStateForUser`
+(`java/yb-pgsql/src/test/java/org/yb/pgsql/TestYbRoleProfile.java:142-162`) is the assertion, and
+the CI messages `expected:<2> but was:<1>`, `expected:<3> but was:<2>`, `expected:<3> but was:<1>`
+and `expected:<1> but was:<0>` are one, one, two and one lost increments respectively.
+
+**The 13 items.**
+
+| Item | Form |
+|---|---|
+| `TestYbRoleProfile#testLogin[0]`, `[1]`, `#testAdminCanUnlockAfterLockout[0]`, `#testAdminCanChangeUserProfile[0]` | two |
+| `YsqlRoleProfileDuringMajorUpgradeTest.RoleProfileWritesDisabled` | two |
+| `TestYsqlUpgrade#updatePgNodeTreeType`, `#insertOnConflictWithOidsWorks`, `#creatingSystemRelsAfterFailure`, `#sharedRelsIndexesWork`, `#creatingSharedRelsCreatesThemEverywhere` | one |
+| `TestPgUpdatePrimaryKey#basicSystemTables` | one |
+| `TestPgCostModelSeekNextEstimation#test26463IntegerOverflowInSeekEstimationforBNL`, `#testSeekNextEstimation25862IntegerOverflow` | one |
+
+The two cost-model items set `reltuples` by hand
+(`java/yb-pgsql/src/test/java/org/yb/pgsql/TestPgCostModelSeekNextEstimation.java:1286-1295`) and
+then read the planner's estimate back; the estimates they observe, 999 nexts and 1 seek, are what
+the planner produces from the default `reltuples`, so the planner read `pg_class` from the copy
+before the write landed.
+
+`TestPgRegressPlanner` belongs to the same mechanism and is the clearest cross-session case.
+`src/postgres/src/test/regress/sql/yb.orig.planner_base_scans_cost_model.sql:24-30` writes
+`pg_class.reltuples` under the GUC, bumps `pg_yb_catalog_version` by hand, then reconnects with
+`\c yugabyte` and reads `reltuples` back. The hand-written version bump never advances any
+backend's `yb_catalog_cache_version` -- only a DDL commit or a shared-memory read does that -- so
+the new backend reports the old version, the version wait is satisfied at once, and the read is
+served at a C below the write.
+
+`TestPgRegressResetAnalyze` belongs here too, and it is the cleanest discriminator in the whole
+set because one statement's catalog write is visible and the next one's is not, in the same session.
+`ANALYZE` is a DDL, so its commit advances the backend's own reported version and guard 1 then waits
+for the copy. `yb_reset_analyze_statistics` raises the version row by hand, so nothing the guards
+read changes. The failing block
+(`src/postgres/src/test/regress/sql/yb.orig.reset_analyze.sql`, expected output lines 199-208) is:
+
+```
+\c - yb_user2                                reconnect
+CALL record_stats();                         snapshot the current stats into x_stats
+ANALYZE;                                     a DDL: increments the catalog version
+SELECT yb_reset_analyze_statistics(null);    a SQL function running a plain UPDATE pg_class:
+                                             increments nothing
+SELECT * FROM diff_stats;                    expects (0 rows)
+```
+
+`diff_stats` full-joins the recorded snapshot `x_stats` (alias `t0`, printed with `d = '-'`) against
+the live `all_stats` (alias `t`, printed with `d = '+'`) on `(id, reltuples, ncolstats)` and keeps
+the rows that fail to match. The actual output has 18 rows in 9 pairs, of which the first is:
+
+```
+ d |  owner   | schemaname | relname | k | s | reltuples | ncolstats
+ - | yb_user2 | public     | mv_u2   | m | f |        -1 |         0     recorded before ANALYZE
+ + | yb_user2 | public     | mv_u2   | m | f |         8 |         2     live read now
+```
+
+The recorded side is right. The live side shows the post-`ANALYZE` values, so `ANALYZE`'s write was
+visible to that read and `yb_reset_analyze_statistics`'s reset of the same rows, committed one
+statement later, was not.
+
+### Local reproduction
+
+`./yb_build.sh release --clang21 --java-test org.yb.pgsql.TestYbRoleProfile` on the branch tip
+(`8d9f6ff55bf`, the flag defaulted on) gives 20 tests run, 5 failures, 445.8 s:
+
+```
+testAdminCanChangeUserProfile[0]    expected:<3> but was:<2>
+testAdminCanLockAndUnlock[0]        expected:<1> but was:<0>
+testLogin[0]                        expected:<2> but was:<1>
+testAdminCanUnlockAfterLockout[0]   expected:<3> but was:<2>
+testLogin[1]                        expected:<1> but was:<0>
+```
+
+`testAdminCanLockAndUnlock[0]` is a fifth member of the family that the launch did not list.
+The same command with `YB_EXTRA_DAEMON_FLAGS=--enable_local_tserver_catalog=false` gives 20 tests
+run, 0 failures, 440.8 s. Same binary, same tests, the copy is the only difference, so the copy is
+the cause.
+
+### Three independent confirmations of the same mechanism, from three different suites
+
+**`TestYsqlUpgrade#updatePgNodeTreeType`** -- a write and a read of `pg_proc` one statement apart in
+one session. The CI message is the written value against the value read back:
+
+```
+expected  :location -1      (what the UPDATE wrote)
+actual    :location 83      (what initdb had written)
+```
+
+**`TestPgRegressPlanner`, suite `yb.orig.planner_base_scans_cost_model`** -- an `ANALYZE` and then a
+plain SQL read of `pg_class`. This one matters most, because the read is an ordinary user statement,
+not an internal catalog scan:
+
+```
+SELECT reltuples FROM pg_class where relname LIKE 't1%';
+   expected      actual
+    100000          -1        the value before ANALYZE ran
+    100000           0
+    100000           0
+```
+
+**`TestPgRegressResetAnalyze`, suite `yb.orig.reset_analyze`** -- the same in the other direction.
+`record_stats()` captured `reltuples = -1, ncolstats = 0` for eight relations of `yb_user2`, and a
+later read of those same rows returned `reltuples = 8/9/10, ncolstats = 2/3`, which is the state
+before `yb_reset_analyze_statistics` ran.
+
+### Why the exposure gate does not cover any of this
+
+The gate (`src/yb/tserver/heartbeater.cc:560-573`, predicate at
+`src/yb/tserver/heartbeater.cc:137-145`) withholds a heartbeat's catalog versions until the copy
+holds master's state as of `db_catalog_versions_read_time`. It is keyed entirely on catalog
+versions. A write that increments no version produces no new version for the gate to withhold, so
+the gate never learns the write happened. The gate is sound for what it covers and irrelevant here.
+
+The gate's own skip path is not a stall: `SetYsqlDBCatalogVersions` is what recomputes
+`catalog_versions_fingerprint_` (`src/yb/tserver/tablet_server.cc:1870`), and the gate skips that
+call, so the tserver keeps reporting the previous fingerprint and master resends the versions on
+the next heartbeat.
+
+### `PgLibPqTest.ReplayDeletedTableInColocatedDBPostUpgrade`: a test flag meant for user tablets crashes the copy's tablet
+
+Reproduced locally and deterministically with
+`./yb_build.sh release --clang21 --cxx-test 'TEST_F(PgLibPqTest, ReplayDeletedTableInColocatedDBPostUpgrade)'`
+(`scratchpad/replay_release.log`). The FATAL, which the CI log had truncated, is:
+
+```
+F0914 02:23:05.088521 operation_driver.cc:425]
+  T 00000000000000000000000000000001 P ... kChangeMetadata:
+  Apply failed: Illegal state (yb/tablet/tablet_metadata.cc:1359):
+  Superblock flush marker 1.581 ahead of apply marker -1.-1
+```
+
+`00000000000000000000000000000001` is `kLocalCatalogTabletId`
+(`src/yb/common/constants.h:48`), so the tablet that dies is the copy's, and the operation's payload
+is the list of master system catalog tables it is adding.
+
+The sequence:
+
+```
+  test sets TEST_invalidate_last_change_metadata_op on every tserver
+              (src/yb/yql/pgwrapper/pg_libpq-test.cc:1840)
+                      │
+                      ▼
+  RaftGroupMetadata construction takes the flag branch and sets
+      last_applied_change_metadata_op_id_ = OpId::Invalid()   (-1.-1)
+              (src/yb/tablet/tablet_metadata.cc:1187-1191)
+                      │
+                      ▼
+  the copy's tablet applies a kChangeMetadata that adds the system catalog
+  tables, advancing last_flushed_change_metadata_op_id_ to 1.581
+                      │
+                      ▼
+  RaftGroupMetadata::Flush checks
+      last_flushed_change_metadata_op_id_ <= last_applied_change_metadata_op_id_
+              (src/yb/tablet/tablet_metadata.cc:1355-1359)
+      1.581 <= -1.-1 is false -> Illegal state
+                      │
+                      ▼
+  OperationDriver::ReplicationFinished turns that status into a glog FATAL
+              (src/yb/tablet/operations/operation_driver.cc:425)
+      the tserver dies; the in-flight CREATE DATABASE reports
+      "server closed the connection unexpectedly"
+```
+
+The flag exists to simulate an upgrade from a release that never recorded the last change metadata
+op id, and it was written for user tablets. It now also reaches the copy's tablet, which is created
+on every tserver. Either the copy's metadata must be built without the invalidated marker, or the
+flag must not apply to it.
+
+### Two failures are not ours: they reproduce with the copy turned off
+
+Each was run twice locally on the branch tip, once as the launch ran it and once with
+`YB_EXTRA_DAEMON_FLAGS=--enable_local_tserver_catalog=false`. Both fail the same way either way, so
+the copy is not involved in either.
+
+| Test | copy on | copy off |
+|---|---|---|
+| `YbAdminSnapshotScheduleTestWithYsqlColocationParam.PgsqlCreateTable/0` | FAILED, 17.0 s, `relation "not_colocated_table" already exists` | FAILED, 15.5 s, same message |
+| `CDCSDKConsistentStreamTest.TestGetChangesDuringLoadTxn` | FAILED, 5.9 s, `cdc_sdk_proto_records_size()` is 0, expected 5 | FAILED, 6.9 s, same |
+
+Note that the launch listed `PgsqlCreateTable/2` and the local repro is `/0`
+(`(kNotColocated, kPITR)`); both parameters produce the same message, and the local one reproduces
+on the first attempt.
+
+#### The copy behaves correctly through the restore
+
+
+The test restores to a point before the table existed and then re-creates it, and the re-create
+fails with `relation "not_colocated_table" already exists`. Run locally it reproduces on the first
+attempt with the copy on (parameter `/0`, `(kNotColocated, kPITR)`, 17.0 s,
+`scratchpad/pitr_release.log`). Run again with
+`YB_EXTRA_DAEMON_FLAGS=--enable_local_tserver_catalog=false` it fails identically, same parameter,
+same message, 15.5 s (`scratchpad/pitr_copyoff.log`), so the copy is not involved.
+
+The copy's own behaviour during the window is also correct and visible in the log: master sends
+"this batch crossed a restore" to all three tservers at 02:25:38.690
+(`src/yb/master/sys_catalog_change_service.cc:166`), each poller re-seeds
+(`src/yb/tserver/local_catalog_poller.cc:373`), all three move `kServing -> kReseeding` by
+02:25:38.804, and the `CREATE TABLE` fails at 02:25:39.303 while they are all still `kReseeding`
+and therefore not answering any read.
+
+### The second family: the gate lengthens catalog version propagation, and two tests time out on it
+
+With the copy serving, a new catalog version reaches PG shared memory only after the copy has
+applied master's writes up to the heartbeat's read time. The added delay is one poll interval
+(`local_catalog_poll_interval_ms`, default 100 ms) plus one heartbeat interval
+(`heartbeat_interval_ms`, default 1000 ms), so about 1.1 s in the steady state.
+
+- `PgCatalogVersionTest.IncrementAllDBCatalogVersions` fails with `current_version doesn't match:
+  3 vs 2`, master at 3 and shared memory at 2. Its wait is `WaitForCatalogVersionToPropagate`
+  (`src/yb/yql/pgwrapper/libpq_test_base.cc:417-424`), a flat 2 s sleep whose own comment already
+  says it "may return before the catalog version is actually propagated".
+- `PgBackendsTest.MultipleWaiters` fails with `Operation 'wait for catalog version 2 to propagate'
+  didn't complete within 10016ms`. It passes locally in one run at 18.5 s
+  (`scratchpad/multiwaiters_release.log`), and the launch needed 8 attempts, so it is a timing
+  failure under CI load rather than a deterministic one.
+
+Both are test timing assumptions, not correctness violations, and the fix belongs in the tests:
+replace the flat sleep with a wait on the condition.
+
+### What is not yet explained
+
+- `TestPgSequencesWithServerCacheFlag#testCacheFlagValueHigherThanCacheOption` and
+  `#testLowerThanDefaultCacheFlagValue`. Both spawn a new tserver, connect to it, run `CREATE
+  SEQUENCE s1`, and the next statement `SELECT nextval('s1')` fails with `relation "s1" does not
+  exist` at position 16. `CREATE SEQUENCE` is a DDL, so both guards should apply. The whole class
+  runs clean locally with the copy on -- 53 tests, 0 failures, 657.4 s
+  (`scratchpad/seqcache_release.log`) -- and the launch needed 5 and 6 attempts, so these are
+  timing failures under CI load. The window they lose to is not established.
+- `BackupUpgradeTest.TestRestoreBackupAfterRollback`. A 631 s harness timeout inside
+  `yb::ExternalYbController::RunBackupCommand()`. The SIGSEGV in the log is `run-with-timeout`
+  killing the child, not a crash of ours.
+
+## A fresh backend paid a master round trip before its first query, and now does not
+
+**How it showed up.** On the three-region simulated cluster (R1 `127.0.0.4`, R2 `127.0.0.5` at 3 ms
+one way, R3 `127.0.0.6` at 100 ms one way) a `\dt` on a new backend against R3 took about 310 ms
+against about 115 ms on R1. Decomposing it showed the cost is not in `\dt`:
+
+| measurement | R1 | R3 |
+|---|---:|---:|
+| new backend, `select 1` | 32 ms | 295 ms |
+| new backend, `\dt` | 114 ms | 320 ms |
+| the `\dt` itself | 82 ms | 25 ms |
+
+The `\dt` is cheaper on R3 than on R1, which is the copy working. The 263 ms is paid before the
+first query runs. R3's counters confirm the copy was healthy and in the read path:
+`local_catalog_reads_served` 4687 and every `local_catalog_reads_to_master_*` counter zero, so
+nothing that reached the read redirect went to master.
+
+**What the round trip was.** `TEST_local_catalog_master_read_delay_ms`
+(`src/yb/tserver/pg_client_session.cc`) sleeps before every catalog request a session sends to
+master, on both catalog paths, and not at all on a request the copy answered; it stands in for the
+wide area round trip. With it set to 100 ms, a fresh connection plus one query cost 118 ms more than
+without it, which is 1.18 master catalog requests, and a temporary log line on the delayed
+request (removed before upload) named its operations:
+
+```
+legacy=1 snapshot=0 ddl=0 non_ddl_sys=0
+ops=[ r:...000004ec  r:...000004ee  r:...00001f4a  r:...00001f89 ]
+        pg_authid     pg_database    pg_yb_catalog  pg_yb_logical
+        (1260)        (1262)         _version(8010) _client_version(8073)
+```
+
+That is the shared catalog preload a backend does in `InitPostgres` before it has a database, to
+authenticate the role and resolve the database. All four are `BKI_SHARED_RELATION` and the copy
+holds every one of them.
+
+**Why the copy declined it.** `YBCIsLegacyModeForCatalogOps`
+(`src/yb/yql/pggate/ybc_pggate.cc:2084-2086`) returns true while sys table prefetching is running,
+so `GetRequiredSessionType` (`src/yb/yql/pggate/pg_session.cc:225-239`) puts those reads on the
+legacy catalog session. `PgSession::Perform` then takes its legacy branch, which never sets
+`is_catalog_snapshot`, and both the read time chooser and `TryServeCatalogReadsLocally` required
+`is_catalog_snapshot` together with the plain session kind. The request therefore never reached the
+copy, no matter that the copy held every row it asked for.
+
+**The fix.** A new predicate `IsCopyServableCatalogRequest`
+(`src/yb/tserver/pg_client_session.cc`) accepts either shape: a PG catalog snapshot on the plain
+session, or the legacy catalog session. Both the read time chooser
+(`LocalCatalogReadTimeForFreshSnapshot`) and `TryServeCatalogReadsLocally` now use it. Nothing else
+in the read rule changed: the DDL, transactional DDL block and
+`yb_non_ddl_txn_for_sys_tables_allowed` exclusions are checked first and are unchanged, the read
+still runs at exactly the read point's time, and a request carrying an explicit read time above C
+still goes to master.
+
+The legacy path already asked for the clamped clock reading when it had no read time of its own
+(`src/yb/yql/pggate/pg_session.cc`), which is the same door a catalog snapshot comes through, so the
+chooser now hands it C instead. `DoPerform` already echoes that time back as `catalog_read_time`, so
+the rest of the preload runs at the same C and sees one state.
+
+`PgSession::SetBackendCatalogVersion` was factored out and is now called on the legacy path as well,
+so the version wait in `LocalCatalogCompleteTime` applies to these reads too. A backend that has not
+attached to a database reports an invalid db oid and there is then no per-database version to wait
+for, which is correct for this phase: the shared catalogs it reads are covered by the exposure gate
+instead, which does not publish a version until every tserver's copy holds the rows master read it
+at, and a `CREATE ROLE` or `CREATE DATABASE` is not acknowledged to its client until that has
+happened.
+
+**Measured.** `PgLocalCatalogTest.FreshBackendDoesNotPayMasterCatalogLatency`, release:
+
+| | delayed master requests | added time at 100 ms per request |
+|---|---:|---:|
+| before | 1 | 118 ms |
+| after | 0 | 11 ms |
+
+The copy answered 40 requests in the measured window, up from 39. The whole
+`pgwrapper_pg_local_catalog-test` binary is 48 of 48 with the change.
+
+**Not a regression.** The exclusion is as old as the feature and was written down three times: the
+D57801 summary says "The same predicate excludes sys-table prefetching and parallel workers";
+`notes/implementation2.md` records it under the 2026-09-03 gaps as "Catalog preload (backend start,
+full cache refresh) and parallel workers read master ... accounts for the residual master reads per
+fresh connection"; and `MasterCatalogReadsDropWhenServing`
+(`src/yb/yql/pgwrapper/pg_local_catalog-test.cc`) says in its comment that an exact zero is not
+assertable because of it. What was missing was a measurement with a round trip long enough to
+matter: on a single host the extra trip is about a millisecond and invisible, and every existing
+test asserted on counters rather than on time.
+
+## Per-request routing log, and the 9 s after a DDL that is not the copy's
+
+**The log.** `--log_local_catalog_read_routing` (runtime tserver flag,
+`src/yb/tserver/pg_client_session.cc`) writes one INFO line per catalog request from
+`TryServeCatalogReadsLocally`: either `served by the copy at <time>, which holds up to <C>` or
+`to master: <rule>` with the values that decided it, followed by the operations' table ids. Every
+decline path now sets a reason; before, several returned without a trace. The same lines appear at
+`--vmodule=pg_client_session=1` without the flag. It is turned on with
+`yb-ts-cli --server_address=<ts> set_flag log_local_catalog_read_routing true`.
+
+**The symptom.** On the three-region cluster (tc delays from
+`~/ysql/notes/local-catalog-cache-perf/scripts/tc_asymmetric.sh`: node 1 to node 2 3 ms one way,
+node 3 to either 100 ms), `ALTER TABLE t ADD COLUMN` on node 1 followed by
+`SELECT * FROM t01_r1` on a fresh connection to node 3 takes 8.9 s; the same query in steady state
+takes 0.46 s. `t01_r1` is not the table that was altered.
+
+**It is not the copy.** With the routing log on, all 66 catalog requests of the slow query were
+answered by the copy and none went to master. The time sits in gaps between them of about 402 ms
+and 805 ms, which are two and four round trips at 200 ms. Master's catalog read count moved by 2,
+ASH on node 3 showed one `CatalogRead` sample in about 106, and forcing
+`TEST_local_catalog_disable_serving` on made the same query 20.1 s instead of 10.1 s.
+
+**What it is.** Master's RPC counters across one slow query: `MasterDdl::GetTableSchema` +52,
+`AcquireObjectLocksGlobal` +2. The 52 schema fetches at about 200 ms each are the 9 s. They are
+misses in the tserver's `PgTableCache`, which a DDL empties for the whole database: the new version
+reaches the tserver, `SetYsqlDBCatalogVersionsUnlocked` adds the database to `db_oids_updated`
+(`src/yb/tserver/tablet_server.cc:1696`), `InvalidatePgTableCache` follows (`:1884`), and
+`PgTableCache::Impl::InvalidateDbTables` calls `clear()` on that database's map
+(`src/yb/tserver/pg_table_cache.cc:243-266`). The invalidation is keyed only on the database's
+version, so it cannot tell which table changed.
+
+Commit `ad458d744db` (D45266, #28049) made the PG-side table cache evict selectively from
+invalidation messages and says in its message that the tserver cache was left out: new connections
+"continue to behave as currently". A new backend starts with an empty PG cache and falls through to
+the emptied tserver cache.
+
+**Proposed fix, recorded in `notes/plan2.md` section 11.** Master already holds the set of tables
+each DDL transaction changed, because DDL verification runs on it:
+`CatalogManager::YsqlDdlTransactionState::tables` minus `nochange_tables`
+(`src/yb/master/catalog_manager.h:3417-3436`). The lock release is sent after
+`WaitForDdlVerificationToFinish` and is synchronous to every tserver
+(`src/yb/tserver/pg_client_session.cc:3271-3296`), and master already fills cache-update fields into
+that request in `PopulateDbCatalogVersionCache` (`src/yb/master/object_lock_info_manager.cc:1178`).
+Carrying the set there lets each tserver evict just those entries. PG's
+`ddl_transaction_state.altered_table_ids` was considered first and rejected: it is per backend,
+never sent to master, covers only the ALTER path, and is not what verification uses.
+
+## Upload to D57801 with the feature on by default (2026-09-28)
+
+Before the upload the working tree was reviewed for leftover investigation code. Removed: the INFO
+line that listed each request `TEST_local_catalog_master_read_delay_ms` delayed; the flag's sleep
+stays, since `FreshBackendDoesNotPayMasterCatalogLatency` needs it. Fixed: the routing flag's name in
+a comment and in `notes/plan2.md` (it has no `ysql_` prefix). Replaced: the
+`CI EXPERIMENT, NOT FOR LANDING` comment on `enable_local_tserver_catalog`, carried from the D58090
+commit. The default is unchanged: `true` under `NDEBUG`, `false` otherwise, the same condition as
+`enable_object_locking_for_table_locks` and `ysql_enable_concurrent_ddl`, which the copy requires.
+D57801's test plan now carries `Jenkins: release`, so CI runs only the lane where object locking and
+the copy are both on.

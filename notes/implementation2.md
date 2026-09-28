@@ -557,6 +557,13 @@ on.
   read master: both run on the legacy catalog-ops path. Not in the original
   plan's read-kind table; recorded as a limitation, accounts for the residual
   master reads per fresh connection.
+  FIXED 2026-09-16: the copy now serves the legacy catalog session too, via
+  `IsCopyServableCatalogRequest` in `src/yb/tserver/pg_client_session.cc`. The
+  cost this hid is one master round trip per fresh connection, for the shared
+  catalog preload (`pg_authid`, `pg_database`, `pg_yb_catalog_version`,
+  `pg_yb_logical_client_version`), which is 200 ms on a region 100 ms away.
+  Measured by `PgLocalCatalogTest.FreshBackendDoesNotPayMasterCatalogLatency`;
+  details in `notes/worklog2.md`.
 - Major version upgrade postponed (guard only).
 - Serving is not disabled after repeated poll failures (plan 7.2); the lease
   lapse covers a master outage, but a poll-only failure keeps serving at the
@@ -953,6 +960,72 @@ guard. Also noted: the commit flips `ysql_yb_ddl_transaction_block_enabled`,
 default on in every build flavor, on the user's instruction; this changes the
 mode existing debug and fastdebug tests run in.
 
+## Status of the default-on CI runs (2026-09-14)
+
+Details of every test, its failure message and its explanation are in `notes/worklog2.md`; this
+section carries only the counts and what has to be done.
+
+| Launch | Diff | Base | Unique failed items |
+|---|---|---|---|
+| 169341 | D58090 / 315855 | `748104ff13` | 201 |
+| 169670 | D58090 / 315957 | `34f97f9f63f6` | 23 |
+
+The two launches do not share a base commit, so the drop from 201 to 23 is not attributable to the
+fix commits alone and the part of it that is base drift has not been separated.
+
+Launch 169670's 23, by cause:
+
+| Count | Cause | State |
+|---:|---|---|
+| 15 | The version token does not represent every catalog write (pattern 1 below) | understood, two TODOs below |
+| 2 | A test's hardcoded catalog-version propagation deadline (pattern 3 below) | understood, TODO below |
+| 1 | A tablet-level test flag reaches the copy's tablet (pattern 2 below) | understood, TODO below |
+| 2 | Not ours: they fail identically with `enable_local_tserver_catalog=false` | closed |
+| 3 | Open | see below |
+
+The three patterns, each of which produced more than one failure and none of which is a one-off:
+
+1. **The catalog version a backend reports is the only ordering token between a catalog writer and
+   a catalog reader, and it does not represent every catalog write.** Both guards in
+   `LocalCatalogCompleteTime` read that token: the version wait
+   (`src/yb/tserver/pg_client_session.cc:3563-3587`) and the own-write floor
+   (`:3598-3617`, recorded only under `is_ddl_mode` at `:4594-4604`), as does the exposure gate
+   (`src/yb/tserver/heartbeater.cc:560-573`). A write escapes the token either by incrementing no
+   version, or by raising the version row with a raw `UPDATE pg_yb_catalog_version`, which writes
+   the row but advances no backend's `yb_catalog_cache_version` -- that happens only on a DDL commit
+   (`src/postgres/src/backend/utils/misc/pg_yb_utils.c:3044`, `:3443`) or on a read of shared
+   memory. Underneath both, the copy's complete time C is a step function that moves only when a
+   poll lands, so the exposure is a window of one `local_catalog_poll_interval_ms` (default 100 ms);
+   83 ms of it was measured directly.
+2. **The copy is a tablet on every tserver, so anything written for "every tablet" now also applies
+   to it.** Two instances so far: `conflict_resolve_keys_verification-itest` in launch 169341, where
+   the copy's writes landed in the golden `TEST_file_to_dump_docdb_writes` file and which was fixed
+   at `src/yb/tablet/tablet.cc:2238`, and `PgLibPqTest.ReplayDeletedTableInColocatedDBPostUpgrade`
+   in launch 169670.
+3. **The exposure gate lengthens catalog version propagation by about one poll interval plus one
+   heartbeat interval, roughly 1.1 s,** so any test that bounds propagation with a fixed sleep is at
+   risk. Two instances so far.
+
+The production surface of pattern 1 is small and was audited. Catalog write sites outside a DDL
+commit: `src/postgres/src/backend/catalog/yb_catalog/yb_catalog_version.c:209`, `:344`, `:759` and
+`:866`, which are the version mechanism itself; `YBCExecuteUpdateLoginAttempts`
+(`src/postgres/src/backend/executor/ybModifyTable.c:1310`); `yb_reset_analyze_statistics`
+(`src/postgres/src/backend/catalog/yb_system_functions.sql:20-92`); and
+`ybInsertPendingNotifiesToTable` (`src/postgres/src/backend/commands/async.c:2979`), which writes
+the notifications table in the system database rather than a catalog the copy holds. Launch 169670
+hit two of those. The rest of pattern 1's failures come through the
+`yb_non_ddl_txn_for_sys_tables_allowed` escape hatch, which is a test-only surface.
+
+Still open, all three narrowed but not closed:
+
+- `TestPgSequencesWithServerCacheFlag#testCacheFlagValueHigherThanCacheOption` and
+  `#testLowerThanDefaultCacheFlagValue`. The whole class runs clean locally with the copy on, 53
+  tests and 0 failures in 657 s, and the launch needed 5 and 6 attempts, so these are timing
+  failures under CI load. The window is not identified and no copy-off control has been run.
+- `BackupUpgradeTest.TestRestoreBackupAfterRollback`. A 631 s harness timeout inside
+  `yb::ExternalYbController::RunBackupCommand()`; the SIGSEGV in the log is `run-with-timeout`
+  killing the child, not a crash of ours. Not run locally, because it needs yb-controller.
+
 ## TODOs after the core plan
 
 - Lease loss and regain: complete phase 6 semantics, including master-side
@@ -971,6 +1044,72 @@ mode existing debug and fastdebug tests run in.
   `last_apply_safe_time_` per stream today, `src/yb/cdc/xcluster_producer.cc:347-359`).
 - Filter non-PG rows of the system catalog out of the stream and the snapshot
   if space matters.
+- TODO (2026-09-14): make the copy refuse a catalog snapshot whose session raised the version row
+  by hand. A raw `UPDATE pg_yb_catalog_version` writes the row but advances no backend's
+  `yb_catalog_cache_version`, so the version wait
+  (`src/yb/tserver/pg_client_session.cc:3563-3587`) is satisfied at the old number and the read is
+  served below the write. The same session's own statement and any backend that connects afterwards
+  are both exposed. Covering it through the existing GUC refusal is probably enough, because every
+  site that raises the row by hand also sets `yb_non_ddl_txn_for_sys_tables_allowed`
+  (`src/postgres/src/backend/catalog/yb_system_functions.sql:92`,
+  `src/postgres/src/test/regress/sql/yb.orig.planner_base_scans_cost_model.sql:24`), but that has
+  not been checked against every caller. Launch 169670 items covered: `TestPgRegressPlanner`,
+  `TestPgRegressResetAnalyze`, `TestPgCostModelSeekNextEstimation` x2.
+- TODO (2026-09-14): keep tablet-level test flags and tablet-level global assertions off the copy's
+  tablet. `TEST_invalidate_last_change_metadata_op` is set on every tserver by
+  `src/yb/yql/pgwrapper/pg_libpq-test.cc:1840` to simulate an upgrade from a release that never
+  recorded the last change metadata op id; the copy's metadata takes that branch
+  (`src/yb/tablet/tablet_metadata.cc:1187-1191`), its apply marker becomes `-1.-1`, the
+  `kChangeMetadata` that adds the system catalog tables raises the flush marker to `1.581`, the
+  check at `src/yb/tablet/tablet_metadata.cc:1355-1359` fails, and
+  `src/yb/tablet/operations/operation_driver.cc:425` turns that into a glog FATAL that kills the
+  tserver. Reproduces deterministically. This is the second instance of the pattern; the first was
+  fixed at `src/yb/tablet/tablet.cc:2238`. Worth a general sweep rather than a second point fix.
+- TODO (2026-09-14): fix the two tests whose catalog version propagation deadline the exposure gate
+  now exceeds. `WaitForCatalogVersionToPropagate`
+  (`src/yb/yql/pgwrapper/libpq_test_base.cc:417-424`) is a flat 2 s sleep whose own comment already
+  says it may return too early; make it wait on the condition.
+  `PgCatalogVersionTest.IncrementAllDBCatalogVersions` and `PgBackendsTest.MultipleWaiters` are the
+  two, and the second passes locally in one run, so it is load sensitivity rather than a fixed cost.
+- TODO (2026-09-14, decided by the user): send every read of the role profile catalogs to master
+  and never to the copy. The place to do it is `AllOpsAreReadsOfLocalCatalogTables`
+  (`src/yb/tserver/local_catalog_read.cc:35-56`), which already rejects a request per table id by
+  looking each op's `table_id` up in the copy's metadata; add `pg_yb_role_profile` and
+  `pg_yb_profile` to that rejection. The cost is one extra master read per authentication, on a path
+  that already makes several. The alternative considered and not taken was to have the counter write
+  increment the catalog version: that would make both existing guards fire and needs no new
+  mechanism, but `pg_yb_role_profile` is `BKI_SHARED_RELATION`
+  (`src/postgres/src/include/catalog/pg_yb_role_profile.h:28`), so the bump would have to be global
+  across every database, and it would fire on every failed login, turning a password-guessing burst
+  into a burst of global bumps that invalidate every backend's catalog cache on every tserver;
+  `YbResetFailedAttemptsIfAllowed` would add bumps on successful logins whenever the counter was
+  non-zero. Launch 169670 items covered: `TestYbRoleProfile` x4 and
+  `YsqlRoleProfileDuringMajorUpgradeTest.RoleProfileWritesDisabled`, plus
+  `TestYbRoleProfile#testAdminCanLockAndUnlock[0]`, which the launch did not list but which fails
+  locally. For the record, the counter write increments nothing today: there is no version-increment
+  call in `src/postgres/src/backend/commands/yb_profile.c`, in `YBCExecuteUpdateLoginAttempts`
+  (`src/postgres/src/backend/executor/ybModifyTable.c:1298-1367`) or in
+  `src/postgres/src/backend/libpq/auth.c`; `pg_yb_role_profile` has no syscache entry, so PG's
+  invalidation machinery, which is what drives a version bump, never fires for it; and the write is
+  a `YB_SINGLE_SHARD_TRANSACTION` issued outside DDL mode.
+- TODO (2026-09-14): take the copy out of the read path for a session that has
+  `yb_non_ddl_txn_for_sys_tables_allowed` set, and keep it out until that
+  session's writes are provably in the copy. A DML run under that GUC writes
+  system catalog rows without a DDL commit and without a catalog version
+  increment, so neither guard in `LocalCatalogCompleteTime` fires: the backend's
+  `backend_catalog_version` does not move
+  (`src/yb/tserver/pg_client_session.cc:3563-3587`), and
+  `own_catalog_write_floor_` is stored only under `is_ddl_mode`
+  (`src/yb/tserver/pg_client_session.cc:4594-4604`). The session's next catalog
+  read is then answered from the copy at C, below its own write, and returns the
+  pre-write value. `TryServeCatalogReadsLocally` already refuses to serve a
+  request that itself carries the GUC
+  (`src/yb/tserver/pg_client_session.cc:3704-3711`); what is missing is that the
+  refusal does not persist past the statement that set it. Confirmed by
+  `TestYsqlUpgrade#updatePgNodeTreeType`, which writes `pg_proc.proargdefaults`
+  and reads back the value initdb wrote. Launch 169670 items covered:
+  `TestYsqlUpgrade` x5, `TestPgUpdatePrimaryKey#basicSystemTables`,
+  `TestPgCostModelSeekNextEstimation` x2.
 - Eager apply: carry the DDL's own WAL records in the lock-release message to
   skip the poll round trip on the DDL path.
 - Change records in the lock release: promoted to Phase 8 below (plan2.md
