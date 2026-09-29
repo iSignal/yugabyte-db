@@ -78,6 +78,7 @@
 
 #include "yb/util/atomic.h"
 #include "yb/util/locks.h"
+#include "yb/util/metrics_fwd.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/net/sockaddr.h"
 #include "yb/util/one_time_bool.h"
@@ -722,6 +723,8 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   // synchronously in TriggerRelcacheInitConnection waiting for this callback; if shutdown leaves
   // them orphaned they hold their inbound connection open and wedge reactor join at teardown.
   void AbortInFlightRelcacheInitConnections() EXCLUDES(lock_);
+  void ScheduleCatalogPreloadRefresh(const std::string& dbname) EXCLUDES(lock_);
+  void MakeCatalogPreloadRefreshConnection(const std::string& dbname) EXCLUDES(lock_);
   void DoUpdateMasterAddresses();
 
   std::map<std::string, std::string> ValidateConfCsvViaPg(
@@ -775,6 +778,12 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   // finishes.
   std::map<std::string, std::vector<StdStatusCallback>> in_flight_superuser_connections_
       GUARDED_BY(lock_);
+
+  // Databases with a catalog preload refresh connection scheduled or running. Further refresh
+  // requests for such a database are coalesced into it.
+  std::unordered_set<std::string> pending_catalog_preload_refreshes_ GUARDED_BY(lock_);
+  scoped_refptr<Counter> catalog_preload_refresh_requests_;
+  scoped_refptr<Counter> catalog_preload_refresh_connections_;
 
 #ifdef __linux__
   std::unique_ptr<TServerCgroupManager> cgroup_manager_;

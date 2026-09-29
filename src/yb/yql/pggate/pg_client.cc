@@ -1684,10 +1684,11 @@ class PgClient::Impl : public BigDataFetcher {
     return resp;
   }
 
-  Status TriggerRelcacheInitConnection(std::string dbname) {
+  Status TriggerRelcacheInitConnection(std::string dbname, bool schedule_catalog_preload_refresh) {
     tserver::PgTriggerRelcacheInitConnectionRequestPB req;
     tserver::PgTriggerRelcacheInitConnectionResponsePB resp;
     req.set_database_name(dbname);
+    req.set_schedule_catalog_preload_refresh(schedule_catalog_preload_refresh);
     RETURN_NOT_OK(DoSyncRPC(&PgClientServiceProxy::TriggerRelcacheInitConnection,
         req, resp, PggateRPC::kTriggerRelcacheInitConnection));
     return ResponseStatus(resp);
@@ -2463,7 +2464,11 @@ Result<tserver::PgSetTserverCatalogMessageListResponsePB> PgClient::SetTserverCa
 }
 
 Status PgClient::TriggerRelcacheInitConnection(const std::string& dbname) {
-  return impl_->TriggerRelcacheInitConnection(dbname);
+  return impl_->TriggerRelcacheInitConnection(dbname, false /* schedule_catalog_preload_refresh */);
+}
+
+Status PgClient::ScheduleCatalogPreloadRefresh(const std::string& dbname) {
+  return impl_->TriggerRelcacheInitConnection(dbname, true /* schedule_catalog_preload_refresh */);
 }
 
 Status PgClient::EnumerateActiveTransactions(

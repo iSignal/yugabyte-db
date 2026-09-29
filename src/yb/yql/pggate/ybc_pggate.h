@@ -1113,6 +1113,7 @@ YbcStatus YBCInitTransaction(const YbcPgInitTransactionData *data);
 YbcStatus YBCCommitTransactionIntermediate(const YbcPgInitTransactionData *data);
 
 YbcStatus YBCTriggerRelcacheInitConnection(const char* dbname);
+YbcStatus YBCScheduleCatalogPreloadRefresh(const char* dbname);
 
 YbcFlushDebugContext YBCMakeFlushDebugContextBeginSubTxn(uint32_t id, const char *name);
 YbcFlushDebugContext YBCMakeFlushDebugContextEndSubTxn(uint32_t id);

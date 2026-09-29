@@ -2799,6 +2799,10 @@ Status PgApiImpl::TriggerRelcacheInitConnection(const std::string& dbname) {
   return pg_client_.TriggerRelcacheInitConnection(dbname);
 }
 
+Status PgApiImpl::ScheduleCatalogPreloadRefresh(const std::string& dbname) {
+  return pg_client_.ScheduleCatalogPreloadRefresh(dbname);
+}
+
 Status PgApiImpl::Init(std::optional<uint64_t> session_id) {
   RETURN_NOT_OK(interrupter_->Start());
   RETURN_NOT_OK(clock_->Init());

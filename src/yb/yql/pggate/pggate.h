@@ -907,6 +907,7 @@ class PgApiImpl {
   void DdlEnableForceCatalogModification();
 
   Status TriggerRelcacheInitConnection(const std::string& dbname);
+  Status ScheduleCatalogPreloadRefresh(const std::string& dbname);
 
   Status NewGlobalViewRead(PgGlobalViewRead** handle);
   YbcPgGvScanResult ExecGlobalViewScan(
