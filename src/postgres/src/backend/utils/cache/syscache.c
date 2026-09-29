@@ -99,6 +99,7 @@
 #include "utils/fmgroids.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/yb_preload_exclusion.h"
 #include "yb/yql/pggate/ybc_gflags.h"
 #include "yb_internal_conn.h"
 #include <assert.h>
@@ -1306,57 +1307,6 @@ YbShouldPreloadCatcacheLists(void)
 	kind = YbLookupInternalConnKindByBackendType(MyBackendType);
 	return kind != YB_INTERNAL_CONN_KIND_NONE &&
 		YbInternalConnKindDescriptors[kind].preload_lists_in_minimal_mode;
-}
-
-/*
- * Whether a tuple of a relation-scoped catalog belongs to a relation that the
- * relcache preload in progress excludes (ysql_catalog_preload_exclude_schemas).
- * All tuples of an excluded relation are skipped together, which keeps the
- * per-relation catcache lists built below complete for the relations kept.
- */
-static bool
-YbIsPreloadExcludedTuple(Oid catalog_relid, HeapTuple tuple)
-{
-	Oid			relid;
-
-	switch (catalog_relid)
-	{
-		case RelationRelationId:
-			relid = ((Form_pg_class) GETSTRUCT(tuple))->oid;
-			break;
-		case AttributeRelationId:
-			relid = ((Form_pg_attribute) GETSTRUCT(tuple))->attrelid;
-			break;
-		case StatisticRelationId:
-			relid = ((Form_pg_statistic) GETSTRUCT(tuple))->starelid;
-			break;
-		case IndexRelationId:
-			relid = ((Form_pg_index) GETSTRUCT(tuple))->indexrelid;
-			break;
-		case ConstraintRelationId:
-			relid = ((Form_pg_constraint) GETSTRUCT(tuple))->conrelid;
-			break;
-		case RewriteRelationId:
-			relid = ((Form_pg_rewrite) GETSTRUCT(tuple))->ev_class;
-			break;
-		case PartitionedRelationId:
-			relid = ((Form_pg_partitioned_table) GETSTRUCT(tuple))->partrelid;
-			break;
-		case TypeRelationId:
-			{
-				Form_pg_type typ = (Form_pg_type) GETSTRUCT(tuple);
-
-				/* Array types of excluded row types go with them. */
-				if (OidIsValid(typ->typelem) &&
-					YbIsPreloadExcludedRowType(typ->typelem))
-					return true;
-				relid = typ->typrelid;
-				break;
-			}
-		default:
-			return false;
-	}
-	return OidIsValid(relid) && YbIsPreloadExcludedRelation(relid);
 }
 
 /*

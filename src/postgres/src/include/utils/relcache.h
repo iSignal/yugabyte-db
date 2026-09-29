@@ -179,7 +179,4 @@ extern long YbGetRelCacheInitFileRevalidationFailed(void);
 
 extern void YbPrefetchRequiredData(bool preload_rel_cache);
 
-extern bool YbIsPreloadExcludedRelation(Oid relid);
-extern bool YbIsPreloadExcludedRowType(Oid typid);
-
 #endif							/* RELCACHE_H */
