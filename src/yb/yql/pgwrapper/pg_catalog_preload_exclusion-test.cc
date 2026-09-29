@@ -40,6 +40,7 @@ namespace yb::pgwrapper {
 namespace {
 
 constexpr auto kDbName = "exclusion_db";
+constexpr auto kReader = "reader";
 
 struct CacheMemoryUsage {
   int64_t cache_context_bytes;
@@ -135,12 +136,28 @@ class PgCatalogPreloadExclusionMissTest : public PgCatalogPreloadExclusionTest {
     auto conn = ASSERT_RESULT(ConnectToDB(kDbName));
     ASSERT_OK(conn.Execute("CREATE SCHEMA incl"));
     ASSERT_OK(conn.Execute("CREATE SCHEMA excl"));
+    ASSERT_OK(conn.ExecuteFormat("CREATE ROLE $0 LOGIN", kReader));
+    ASSERT_OK(conn.ExecuteFormat("GRANT USAGE ON SCHEMA incl, excl TO $0", kReader));
+    ASSERT_OK(conn.Execute(
+        "CREATE FUNCTION bump_v() RETURNS trigger LANGUAGE plpgsql AS "
+        "$$ BEGIN NEW.v := NEW.v + 1; RETURN NEW; END $$"));
+    // Triggers, defaults, CHECK constraints and policies are built into relcache entries from
+    // the pg_trigger, pg_attrdef, pg_constraint and pg_policy rows prefetched with preload.
+    // Superusers bypass row level security, so the policy only applies to kReader.
     for (const auto* table : {"incl.t", "excl.t"}) {
-      ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0 (k INT PRIMARY KEY, v INT)", table));
+      ASSERT_OK(conn.ExecuteFormat(
+          "CREATE TABLE $0 (k INT PRIMARY KEY, v INT, w INT DEFAULT 7 CHECK (w > 0))", table));
       ASSERT_OK(conn.ExecuteFormat("CREATE INDEX ON $0 (v)", table));
       ASSERT_OK(conn.ExecuteFormat(
           "INSERT INTO $0 SELECT i, i * 10 FROM generate_series(1, 10) i", table));
       ASSERT_OK(conn.ExecuteFormat("ANALYZE $0", table));
+      ASSERT_OK(conn.ExecuteFormat(
+          "CREATE TRIGGER bump BEFORE INSERT ON $0 FOR EACH ROW EXECUTE FUNCTION bump_v()",
+          table));
+      ASSERT_OK(conn.ExecuteFormat("ALTER TABLE $0 ENABLE ROW LEVEL SECURITY", table));
+      ASSERT_OK(conn.ExecuteFormat(
+          "CREATE POLICY p ON $0 FOR SELECT TO $1 USING (k <= 5)", table, kReader));
+      ASSERT_OK(conn.ExecuteFormat("GRANT SELECT ON $0 TO $1", table, kReader));
     }
     // Relations in the kept schema that depend on relations in the excluded one.
     ASSERT_OK(conn.Execute(
@@ -166,7 +183,8 @@ TEST_F(PgCatalogPreloadExclusionMissTest, ExcludedSchemaMissesGoToMaster) {
     ASSERT_EQ(ASSERT_RESULT(MasterReads(conn, kExclQuery)), 0);
   }
 
-  ASSERT_OK(SetExcludeSchemasFlag(Format("postgres@$0:$1", db_oid_, excl_oid_)));
+  ASSERT_OK(SetExcludeSchemasFlag(Format(
+      "postgres@$0:$1;$2@$0:$1", db_oid_, excl_oid_, kReader)));
 
   auto conn = ASSERT_RESULT(ConnectToDB(kDbName));
   ASSERT_EQ(ASSERT_RESULT(MasterReads(conn, kInclQuery)), 0);
@@ -180,6 +198,20 @@ TEST_F(PgCatalogPreloadExclusionMissTest, ExcludedSchemaMissesGoToMaster) {
   ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int32_t>(kExclQuery)), 30);
   ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>(
       "SELECT count(*) FROM excl.t WHERE v >= 50")), 6);
+
+  for (const auto* table : {"incl.t", "excl.t"}) {
+    auto rel_conn = ASSERT_RESULT(ConnectToDB(kDbName));
+    ASSERT_OK(rel_conn.ExecuteFormat("INSERT INTO $0 (k, v) VALUES (100, 5)", table));
+    ASSERT_EQ((ASSERT_RESULT((rel_conn.FetchRow<int32_t, int32_t>(
+        Format("SELECT v, w FROM $0 WHERE k = 100", table))))), std::make_tuple(6, 7));
+    auto status = rel_conn.ExecuteFormat("INSERT INTO $0 VALUES (101, 1, -1)", table);
+    ASSERT_NOK(status);
+    ASSERT_STR_CONTAINS(status.ToString(), "violates check constraint");
+
+    auto reader_conn = ASSERT_RESULT(ConnectAs(kReader));
+    ASSERT_EQ(ASSERT_RESULT(reader_conn.FetchRow<int64_t>(
+        Format("SELECT count(*) FROM $0", table))), 5);
+  }
 
   auto fk_conn = ASSERT_RESULT(ConnectToDB(kDbName));
   ASSERT_OK(fk_conn.Execute("INSERT INTO incl.child VALUES (1, 1)"));
