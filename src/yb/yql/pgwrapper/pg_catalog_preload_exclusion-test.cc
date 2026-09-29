@@ -75,13 +75,14 @@ Result<int64_t> CacheMemoryContextBytes(PGConn& conn) {
 // Preloads enough catalogs that, without exclusion, a simple query on a relation reads nothing
 // from master. pg_operator and pg_amop are not in the ysql_catalog_preload_additional_tables
 // default list, and they are not relation-scoped, so they must stay fully loaded under exclusion.
-// pg_statistic_ext lets relcache preload fill each relation's extended statistics list.
+// pg_statistic holds the per-column ANALYZE stats the planner looks up, and pg_statistic_ext lets
+// relcache preload fill each relation's extended statistics list.
 class PgCatalogPreloadExclusionTest : public PgMiniTestBase {
  protected:
   void SetUp() override {
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_catalog_preload_additional_tables) = true;
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_catalog_preload_additional_table_list) =
-        "pg_operator,pg_amop,pg_statistic_ext";
+        "pg_operator,pg_amop,pg_statistic,pg_statistic_ext";
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_enable_auto_analyze) = false;
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_enable_relcache_init_optimization) = false;
     PgMiniTestBase::SetUp();
@@ -139,6 +140,7 @@ class PgCatalogPreloadExclusionMissTest : public PgCatalogPreloadExclusionTest {
       ASSERT_OK(conn.ExecuteFormat("CREATE INDEX ON $0 (v)", table));
       ASSERT_OK(conn.ExecuteFormat(
           "INSERT INTO $0 SELECT i, i * 10 FROM generate_series(1, 10) i", table));
+      ASSERT_OK(conn.ExecuteFormat("ANALYZE $0", table));
     }
     // Relations in the kept schema that depend on relations in the excluded one.
     ASSERT_OK(conn.Execute(
@@ -220,12 +222,14 @@ TEST_F(PgCatalogPreloadExclusionMissTest, ExclusionMatchesRoleAndDatabase) {
 // schemas, and both schemas excluded.
 TEST_F(PgCatalogPreloadExclusionTest, CacheMemoryShrinksWithExclusion) {
   const int kNumTables = RegularBuildVsSanitizers(100, 10);
-  constexpr int kNumColumns = 20;
+  constexpr int kNumColumns = 30;
   const std::vector<std::string> kSchemas = {"s1", "s2"};
 
   std::string columns;
+  std::string values;
   for (int c = 1; c <= kNumColumns; ++c) {
     columns += Format("$0c$1 INT", c == 1 ? "" : ", ", c);
+    values += Format("$0(i * $1) % 997", c == 1 ? "" : ", ", c);
   }
 
   std::vector<Oid> schema_oids;
@@ -236,11 +240,17 @@ TEST_F(PgCatalogPreloadExclusionTest, CacheMemoryShrinksWithExclusion) {
       for (int t = 0; t < kNumTables; ++t) {
         ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0.t$1 ($2)", schema, t, columns));
         ASSERT_OK(conn.ExecuteFormat(
-            "CREATE INDEX NONCONCURRENTLY ON $0.t$1 (c1)", schema, t));
+            "CREATE INDEX NONCONCURRENTLY ON $0.t$1 (c1, c2, c3, c4)", schema, t));
         ASSERT_OK(conn.ExecuteFormat(
-            "CREATE INDEX NONCONCURRENTLY ON $0.t$1 (c2, c3)", schema, t));
+            "CREATE INDEX NONCONCURRENTLY ON $0.t$1 (c5, c6, c7, c8)", schema, t));
+        ASSERT_OK(conn.ExecuteFormat(
+            "INSERT INTO $0.t$1 SELECT $2 FROM generate_series(1, 1000) i", schema, t, values));
+        ASSERT_OK(conn.ExecuteFormat("ANALYZE $0.t$1", schema, t));
       }
       schema_oids.push_back(ASSERT_RESULT(SchemaOid(conn, schema)));
+      ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>(Format(
+          "SELECT count(*) FROM pg_statistic s JOIN pg_class c ON c.oid = s.starelid "
+          "WHERE c.relnamespace = $0", schema_oids.back()))), kNumTables * kNumColumns);
     }
   }
 
