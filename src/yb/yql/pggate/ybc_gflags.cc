@@ -104,9 +104,11 @@ DEFINE_NON_RUNTIME_string(ysql_catalog_preload_exclude_schemas, "",
     "Schemas whose relations are left out of the catalog caches and relcache built by "
     "catalog preloading, per (login role, database). The preloaded catalog data is still "
     "fetched in full; relations in excluded schemas are loaded on demand when used. "
-    "Format: semicolon-separated entries "
-    "<role_name>@<database_oid>:<schema_oid>[,<schema_oid>...]. "
-    "Example: role1@16384:16500,16501;role2@16384:16502");
+    "Format: semicolon-separated entries <role>@<database>:<schema>[,<schema>...]. "
+    "Names follow SQL identifier rules, as in search_path: unquoted names are downcased, and "
+    "double-quoted names keep their case and may contain the separator characters. "
+    "Schema names are looked up at each preload; pg_catalog and pg_toast cannot be excluded. "
+    "Example: role1@db1:sales,\"Audit\";role2@db1:reporting");
 
 DEFINE_RUNTIME_bool(ysql_preload_pg_authid_for_auth, true,
     "If true, YSQL preloads the pg_authid catalog caches (by-name and by-OID) "

@@ -91,9 +91,6 @@ class PgCatalogPreloadExclusionTest : public PgMiniTestBase {
                           METRIC_handler_latency_yb_tserver_TabletServerService_Read);
     auto conn = ASSERT_RESULT(Connect());
     ASSERT_OK(conn.ExecuteFormat("CREATE DATABASE $0 WITH COLOCATION = true", kDbName));
-    conn = ASSERT_RESULT(ConnectToDB(kDbName));
-    db_oid_ = ASSERT_RESULT(conn.FetchRow<PGOid>(
-        "SELECT oid FROM pg_database WHERE datname = current_database()"));
   }
 
   size_t NumTabletServers() override { return 1; }
@@ -102,10 +99,6 @@ class PgCatalogPreloadExclusionTest : public PgMiniTestBase {
     LOG(INFO) << "ysql_catalog_preload_exclude_schemas=" << value;
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_catalog_preload_exclude_schemas) = value;
     return RestartPostgres();
-  }
-
-  Result<Oid> SchemaOid(PGConn& conn, const std::string& schema) {
-    return conn.FetchRow<PGOid>(Format("SELECT '$0'::regnamespace::oid", schema));
   }
 
   Result<PGConn> ConnectAs(const std::string& user) {
@@ -125,7 +118,6 @@ class PgCatalogPreloadExclusionTest : public PgMiniTestBase {
     });
   }
 
-  Oid db_oid_ = kInvalidOid;
   std::optional<SingleMetricWatcher> master_reads_;
 };
 
@@ -167,10 +159,7 @@ class PgCatalogPreloadExclusionMissTest : public PgCatalogPreloadExclusionTest {
         "CREATE TABLE incl.parted_p0 PARTITION OF incl.parted FOR VALUES FROM (0) TO (100)"));
     ASSERT_OK(conn.Execute(
         "CREATE TABLE excl.parted_p1 PARTITION OF incl.parted FOR VALUES FROM (100) TO (200)"));
-    excl_oid_ = ASSERT_RESULT(SchemaOid(conn, "excl"));
   }
-
-  Oid excl_oid_ = kInvalidOid;
 };
 
 TEST_F(PgCatalogPreloadExclusionMissTest, ExcludedSchemaMissesGoToMaster) {
@@ -183,8 +172,7 @@ TEST_F(PgCatalogPreloadExclusionMissTest, ExcludedSchemaMissesGoToMaster) {
     ASSERT_EQ(ASSERT_RESULT(MasterReads(conn, kExclQuery)), 0);
   }
 
-  ASSERT_OK(SetExcludeSchemasFlag(Format(
-      "postgres@$0:$1;$2@$0:$1", db_oid_, excl_oid_, kReader)));
+  ASSERT_OK(SetExcludeSchemasFlag(Format("postgres@$0:excl;$1@$0:excl", kDbName, kReader)));
 
   auto conn = ASSERT_RESULT(ConnectToDB(kDbName));
   ASSERT_EQ(ASSERT_RESULT(MasterReads(conn, kInclQuery)), 0);
@@ -236,11 +224,21 @@ TEST_F(PgCatalogPreloadExclusionMissTest, ExclusionMatchesRoleAndDatabase) {
     ASSERT_OK(conn.Execute("CREATE ROLE other_role SUPERUSER LOGIN"));
   }
 
-  // Entries for another role, another database, a system schema, and malformed entries must
-  // leave postgres unaffected.
+  // Entries for another role or database, names that differ only in case when quoted, system
+  // schemas, and malformed entries must leave postgres unaffected. An unterminated quote runs to
+  // the end of the flag, so that entry goes last.
   ASSERT_OK(SetExcludeSchemasFlag(Format(
-      "other_role@$0:$1;postgres@$2:$1;postgres@$0:11;garbage;postgres@x:$1;postgres@$0:1x",
-      db_oid_, excl_oid_, db_oid_ + 1)));
+      "other_role@$0:excl;"
+      "postgres@yugabyte:excl;"
+      "\"POSTGRES\"@$0:excl;"
+      "postgres@\"EXCLUSION_DB\":excl;"
+      "postgres@$0:\"EXCL\";"
+      "postgres@$0:pg_catalog,pg_toast;"
+      "garbage;"
+      "postgres@$0:;"
+      "postgres@$0:excl,;"
+      "postgres@$0:\"excl",
+      kDbName)));
 
   auto conn = ASSERT_RESULT(ConnectToDB(kDbName));
   ASSERT_EQ(ASSERT_RESULT(MasterReads(conn, kExclQuery)), 0);
@@ -248,6 +246,46 @@ TEST_F(PgCatalogPreloadExclusionMissTest, ExclusionMatchesRoleAndDatabase) {
   auto other_conn = ASSERT_RESULT(ConnectAs("other_role"));
   ASSERT_GT(ASSERT_RESULT(MasterReads(other_conn, kExclQuery)), 0);
   ASSERT_EQ(ASSERT_RESULT(other_conn.FetchRow<int32_t>(kExclQuery)), 30);
+}
+
+// Schema names follow SQL identifier rules, as in search_path, and are looked up at each preload.
+TEST_F(PgCatalogPreloadExclusionMissTest, ExclusionMatchesSchemaNames) {
+  // The name contains every separator of the flag format, and a double quote.
+  constexpr auto kQuotedSchema = R"("Odd;Name@:,""x")";
+  constexpr auto kInclQuery = "SELECT * FROM incl.t";
+  {
+    auto conn = ASSERT_RESULT(ConnectToDB(kDbName));
+    ASSERT_OK(conn.ExecuteFormat("CREATE SCHEMA $0", kQuotedSchema));
+    ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0.t (k INT PRIMARY KEY)", kQuotedSchema));
+    ASSERT_OK(conn.Execute("CREATE TABLE public.t (k INT PRIMARY KEY)"));
+  }
+
+  // "later" doesn't exist yet. public has a system OID but holds user relations.
+  ASSERT_OK(SetExcludeSchemasFlag(Format(
+      "postgres@$0: $1 , PUBLIC,later ;", kDbName, kQuotedSchema)));
+
+  auto conn = ASSERT_RESULT(ConnectToDB(kDbName));
+  ASSERT_EQ(ASSERT_RESULT(MasterReads(conn, kInclQuery)), 0);
+  ASSERT_GT(ASSERT_RESULT(MasterReads(conn, Format("SELECT * FROM $0.t", kQuotedSchema))), 0);
+  ASSERT_GT(ASSERT_RESULT(MasterReads(conn, "SELECT * FROM public.t")), 0);
+
+  ASSERT_OK(conn.Execute("CREATE SCHEMA later"));
+  ASSERT_OK(conn.Execute("CREATE TABLE later.t (k INT PRIMARY KEY)"));
+  {
+    auto new_conn = ASSERT_RESULT(ConnectToDB(kDbName));
+    ASSERT_EQ(ASSERT_RESULT(MasterReads(new_conn, kInclQuery)), 0);
+    ASSERT_GT(ASSERT_RESULT(MasterReads(new_conn, "SELECT * FROM later.t")), 0);
+  }
+
+  // A schema recreated under the same name gets a new OID and stays excluded.
+  ASSERT_OK(conn.Execute("DROP SCHEMA later CASCADE"));
+  ASSERT_OK(conn.Execute("CREATE SCHEMA later"));
+  ASSERT_OK(conn.Execute("CREATE TABLE later.t2 (k INT PRIMARY KEY)"));
+  {
+    auto new_conn = ASSERT_RESULT(ConnectToDB(kDbName));
+    ASSERT_EQ(ASSERT_RESULT(MasterReads(new_conn, kInclQuery)), 0);
+    ASSERT_GT(ASSERT_RESULT(MasterReads(new_conn, "SELECT * FROM later.t2")), 0);
+  }
 }
 
 // Compares the catalog cache footprint of a fresh backend with nothing, one of two equally sized
@@ -264,7 +302,6 @@ TEST_F(PgCatalogPreloadExclusionTest, CacheMemoryShrinksWithExclusion) {
     values += Format("$0(i * $1) % 997", c == 1 ? "" : ", ", c);
   }
 
-  std::vector<Oid> schema_oids;
   {
     auto conn = ASSERT_RESULT(ConnectToDB(kDbName));
     for (const auto& schema : kSchemas) {
@@ -279,10 +316,9 @@ TEST_F(PgCatalogPreloadExclusionTest, CacheMemoryShrinksWithExclusion) {
             "INSERT INTO $0.t$1 SELECT $2 FROM generate_series(1, 1000) i", schema, t, values));
         ASSERT_OK(conn.ExecuteFormat("ANALYZE $0.t$1", schema, t));
       }
-      schema_oids.push_back(ASSERT_RESULT(SchemaOid(conn, schema)));
       ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>(Format(
           "SELECT count(*) FROM pg_statistic s JOIN pg_class c ON c.oid = s.starelid "
-          "WHERE c.relnamespace = $0", schema_oids.back()))), kNumTables * kNumColumns);
+          "WHERE c.relnamespace = '$0'::regnamespace", schema))), kNumTables * kNumColumns);
     }
   }
 
@@ -303,10 +339,8 @@ TEST_F(PgCatalogPreloadExclusionTest, CacheMemoryShrinksWithExclusion) {
   };
 
   const auto none = ASSERT_RESULT(measure(""));
-  const auto one = ASSERT_RESULT(measure(
-      Format("postgres@$0:$1", db_oid_, schema_oids[0])));
-  const auto both = ASSERT_RESULT(measure(
-      Format("postgres@$0:$1,$2", db_oid_, schema_oids[0], schema_oids[1])));
+  const auto one = ASSERT_RESULT(measure(Format("postgres@$0:s1", kDbName)));
+  const auto both = ASSERT_RESULT(measure(Format("postgres@$0:s1,s2", kDbName)));
 
   const auto one_saved = none.cache_context_bytes - one.cache_context_bytes;
   const auto both_saved = none.cache_context_bytes - both.cache_context_bytes;

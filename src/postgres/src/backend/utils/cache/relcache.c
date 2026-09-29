@@ -116,6 +116,7 @@
 #include "utils/catcache.h"
 #include "utils/partcache.h"
 #include "utils/relcache.h"
+#include "utils/varlena.h"
 #include "utils/yb_inheritscache.h"
 #include "utils/yb_tuplecache.h"
 #include "yb/yql/pggate/util/ybc_guc.h"
@@ -3152,11 +3153,13 @@ YbGetRelCacheInitFileRevalidationFailed()
 }
 
 /*
- * Namespaces excluded by ysql_catalog_preload_exclude_schemas for this
- * backend's (login role, database), parsed once per backend.
+ * Names of the schemas excluded by ysql_catalog_preload_exclude_schemas for
+ * this backend's (login role, database), parsed once per backend. They are
+ * resolved to OIDs at each preload, so a schema dropped and recreated under
+ * the same name stays excluded.
  */
-static List *yb_preload_excluded_nsps = NIL;
-static bool yb_preload_excluded_nsps_initialized = false;
+static List *yb_preload_excluded_nsp_names = NIL;
+static bool yb_preload_excluded_nsp_names_initialized = false;
 
 /*
  * Relations (and their row types) left out of the catalog caches and relcache
@@ -3175,92 +3178,87 @@ typedef struct YbPreloadExclusion
 
 static YbPreloadExclusion *yb_preload_exclusion = NULL;
 
-static bool
-YbParsePreloadExclusionOid(const char *str, Oid *result)
+/*
+ * Return the first separator in str that is outside double quotes, or NULL.
+ */
+static char *
+YbFindUnquotedSeparator(char *str, char separator)
 {
-	char	   *end;
-	unsigned long value;
+	bool		in_quotes = false;
 
-	if (*str < '0' || *str > '9')
-		return false;
-	errno = 0;
-	value = strtoul(str, &end, 10);
-	if (errno != 0 || *end != '\0' || value > PG_UINT32_MAX)
-		return false;
-	*result = (Oid) value;
-	return true;
+	for (; *str != '\0'; ++str)
+	{
+		if (*str == '"')
+			in_quotes = !in_quotes;
+		else if (*str == separator && !in_quotes)
+			return str;
+	}
+	return NULL;
 }
 
 /*
- * Parse one "<role_name>@<database_oid>:<schema_oid>[,<schema_oid>...]" entry
- * and, if it applies to this backend, append its schema OIDs to
- * yb_preload_excluded_nsps. The role name is split off at the last '@' before
- * the last ':' since only the OID parts have a restricted alphabet. A
- * malformed entry is ignored as a whole.
+ * Parse a single identifier in place, with the same rules as a search_path
+ * element: unquoted names are downcased, double-quoted names are kept as is.
+ */
+static bool
+YbParsePreloadExclusionName(char *raw, char **name)
+{
+	List	   *names;
+	bool		ok = (SplitIdentifierString(raw, ',', &names) &&
+					  list_length(names) == 1);
+
+	if (ok)
+		*name = linitial(names);
+	list_free(names);
+	return ok;
+}
+
+/*
+ * Parse one "<role>@<database>:<schema>[,<schema>...]" entry in place and, if
+ * it applies to this backend, append its schema names to
+ * yb_preload_excluded_nsp_names. A malformed entry is ignored as a whole.
  */
 static void
-YbParsePreloadExclusionEntry(const char *entry)
+YbParsePreloadExclusionEntry(char *entry)
 {
-	char	   *role = pstrdup(entry);
-	char	   *colon = strrchr(role, ':');
-	char	   *at;
-	Oid			db_oid;
-	char	   *saveptr;
-	List	   *nsps = NIL;
+	char	   *original = pstrdup(entry);
+	char	   *at = YbFindUnquotedSeparator(entry, '@');
+	char	   *colon = at ? YbFindUnquotedSeparator(at + 1, ':') : NULL;
+	char	   *role;
+	char	   *database;
+	List	   *nsp_names = NIL;
 	ListCell   *lc;
 	MemoryContext oldcxt;
 
 	if (colon == NULL)
 		goto malformed;
-	*colon = '\0';
-	at = strrchr(role, '@');
-	if (at == NULL || at == role)
-		goto malformed;
 	*at = '\0';
-	if (!YbParsePreloadExclusionOid(at + 1, &db_oid))
+	*colon = '\0';
+	if (!YbParsePreloadExclusionName(entry, &role) ||
+		!YbParsePreloadExclusionName(at + 1, &database) ||
+		!SplitIdentifierString(colon + 1, ',', &nsp_names) ||
+		nsp_names == NIL)
 		goto malformed;
 
-	for (char *token = strtok_r(colon + 1, ",", &saveptr); token != NULL;
-		 token = strtok_r(NULL, ",", &saveptr))
+	if (strcmp(role, MyProcPort->user_name) == 0 &&
+		strcmp(database, MyProcPort->database_name) == 0)
 	{
-		Oid			nsp_oid;
-
-		if (!YbParsePreloadExclusionOid(token, &nsp_oid))
-			goto malformed;
-		nsps = lappend_oid(nsps, nsp_oid);
+		oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+		foreach(lc, nsp_names)
+			yb_preload_excluded_nsp_names =
+				lappend(yb_preload_excluded_nsp_names, pstrdup(lfirst(lc)));
+		MemoryContextSwitchTo(oldcxt);
 	}
-
-	if (db_oid != MyDatabaseId || strcmp(role, MyProcPort->user_name) != 0)
-	{
-		list_free(nsps);
-		pfree(role);
-		return;
-	}
-
-	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
-	foreach(lc, nsps)
-	{
-		Oid			nsp_oid = lfirst_oid(lc);
-
-		if (nsp_oid < FirstNormalObjectId)
-			ereport(LOG,
-					(errmsg("ysql_catalog_preload_exclude_schemas: ignoring "
-							"system schema OID %u", nsp_oid)));
-		else
-			yb_preload_excluded_nsps =
-				list_append_unique_oid(yb_preload_excluded_nsps, nsp_oid);
-	}
-	MemoryContextSwitchTo(oldcxt);
-	list_free(nsps);
-	pfree(role);
+	list_free(nsp_names);
+	pfree(original);
 	return;
 
 malformed:
-	list_free(nsps);
-	pfree(role);
+	list_free(nsp_names);
 	ereport(LOG,
 			(errmsg("ysql_catalog_preload_exclude_schemas: ignoring "
-					"malformed entry \"%s\"", entry)));
+					"malformed entry \"%s\"", original)));
+	pfree(original);
 }
 
 static void
@@ -3268,26 +3266,72 @@ YbInitPreloadExcludedNamespaces(void)
 {
 	const char *flag = YBCGetGFlags()->ysql_catalog_preload_exclude_schemas;
 	char	   *flag_copy;
-	char	   *saveptr;
+	char	   *next;
 
-	if (yb_preload_excluded_nsps_initialized)
+	if (yb_preload_excluded_nsp_names_initialized)
 		return;
-	yb_preload_excluded_nsps_initialized = true;
+	yb_preload_excluded_nsp_names_initialized = true;
 
 	/*
 	 * Only client backends are matched, by their login role: the filter must
 	 * not change if the session user changes later.
 	 */
 	if (!IS_NON_EMPTY_STR_FLAG(flag) || MyProcPort == NULL ||
-		MyProcPort->user_name == NULL || YBCIsInitDbModeEnvVarSet() ||
-		IsBinaryUpgrade || YbUseMinimalCatalogCachesPreload())
+		MyProcPort->user_name == NULL || MyProcPort->database_name == NULL ||
+		YBCIsInitDbModeEnvVarSet() || IsBinaryUpgrade ||
+		YbUseMinimalCatalogCachesPreload())
 		return;
 
 	flag_copy = pstrdup(flag);
-	for (char *entry = strtok_r(flag_copy, ";", &saveptr); entry != NULL;
-		 entry = strtok_r(NULL, ";", &saveptr))
-		YbParsePreloadExclusionEntry(entry);
+	for (char *entry = flag_copy; entry != NULL; entry = next)
+	{
+		next = YbFindUnquotedSeparator(entry, ';');
+		if (next != NULL)
+			*next++ = '\0';
+		if (entry[strspn(entry, " \t\n\r\f\v")] != '\0')
+			YbParsePreloadExclusionEntry(entry);
+	}
 	pfree(flag_copy);
+}
+
+/*
+ * Look up the excluded schema names in the prefetched pg_namespace rows. Like
+ * the pg_class scan in YbBeginPreloadExclusion, this must be a plain scan so
+ * that the prefetcher serves it.
+ */
+static List *
+YbResolvePreloadExcludedNamespaces(void)
+{
+	List	   *nsps = NIL;
+	Relation	pg_namespace_desc;
+	SysScanDesc scandesc;
+	HeapTuple	tuple;
+
+	pg_namespace_desc = table_open(NamespaceRelationId, AccessShareLock);
+	scandesc = systable_beginscan(pg_namespace_desc, InvalidOid,
+								  false /* indexOk */ , NULL, 0, NULL);
+	while (HeapTupleIsValid(tuple = systable_getnext(scandesc)))
+	{
+		Form_pg_namespace nspp = (Form_pg_namespace) GETSTRUCT(tuple);
+		ListCell   *lc;
+
+		foreach(lc, yb_preload_excluded_nsp_names)
+		{
+			if (strcmp(NameStr(nspp->nspname), lfirst(lc)) != 0)
+				continue;
+			if (IsCatalogNamespace(nspp->oid) || IsToastNamespace(nspp->oid))
+				ereport(LOG,
+						(errmsg("ysql_catalog_preload_exclude_schemas: "
+								"ignoring system schema \"%s\"",
+								NameStr(nspp->nspname))));
+			else
+				nsps = lappend_oid(nsps, nspp->oid);
+			break;
+		}
+	}
+	systable_endscan(scandesc);
+	table_close(pg_namespace_desc, AccessShareLock);
+	return nsps;
 }
 
 /*
@@ -3301,19 +3345,29 @@ YbBeginPreloadExclusion(int log_level)
 	MemoryContext oldcxt;
 	YbPreloadExclusion *exclusion;
 	HASHCTL		ctl;
+	List	   *nsps;
 	Relation	pg_class_desc;
 	SysScanDesc scandesc;
 	HeapTuple	tuple;
 
 	Assert(yb_preload_exclusion == NULL);
 	YbInitPreloadExcludedNamespaces();
-	if (yb_preload_excluded_nsps == NIL)
+	if (yb_preload_excluded_nsp_names == NIL)
 		return;
 
 	context = AllocSetContextCreate(CurrentMemoryContext,
 									"YbPreloadExclusion",
 									ALLOCSET_DEFAULT_SIZES);
 	oldcxt = MemoryContextSwitchTo(context);
+	nsps = YbResolvePreloadExcludedNamespaces();
+	if (nsps == NIL)
+	{
+		MemoryContextSwitchTo(oldcxt);
+		MemoryContextDelete(context);
+		elog(log_level, "Preloading relcache excludes no schemas: "
+			 "none of the configured schemas exist");
+		return;
+	}
 	exclusion = palloc0(sizeof(YbPreloadExclusion));
 	exclusion->context = context;
 	MemSet(&ctl, 0, sizeof(ctl));
@@ -3335,7 +3389,7 @@ YbBeginPreloadExclusion(int log_level)
 
 		if (IsSystemClass(relp->oid, relp))
 			continue;
-		if (!list_member_oid(yb_preload_excluded_nsps, relp->relnamespace))
+		if (!list_member_oid(nsps, relp->relnamespace))
 			continue;
 
 		hash_search(exclusion->relids, &relp->oid, HASH_ENTER, NULL);
@@ -3349,7 +3403,7 @@ YbBeginPreloadExclusion(int log_level)
 	elog(log_level,
 		 "Preloading relcache excludes %ld relation(s) in %d schema(s)",
 		 hash_get_num_entries(exclusion->relids),
-		 list_length(yb_preload_excluded_nsps));
+		 list_length(nsps));
 }
 
 static void
@@ -9870,7 +9924,7 @@ write_relcache_init_file(bool shared)
 	 * writes the file, which is shared with backends of other roles.
 	 */
 	if (IsYugaByteEnabled() &&
-		(YbCatalogPreloadRequired() || yb_preload_excluded_nsps != NIL))
+		(YbCatalogPreloadRequired() || yb_preload_excluded_nsp_names != NIL))
 		return;
 
 	/*
