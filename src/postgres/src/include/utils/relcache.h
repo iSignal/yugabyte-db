@@ -179,4 +179,7 @@ extern long YbGetRelCacheInitFileRevalidationFailed(void);
 
 extern void YbPrefetchRequiredData(bool preload_rel_cache);
 
+extern Size YbCatalogPreloadBaseShmemSize(void);
+extern void YbCatalogPreloadBaseShmemInit(void);
+
 #endif							/* RELCACHE_H */

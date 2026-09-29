@@ -2510,10 +2510,13 @@ void YBCStartSysTablePrefetching(
     YbcPgOid database_oid,
     YbcPgLastKnownCatalogVersionInfo version_info,
     YbcPgSysTablePrefetcherCacheMode cache_mode) {
+  // A zeroed version_read_time means the version was not read from the master (e.g. it came from
+  // tserver shared memory), so there is no read time to pin non-prefetched reads to.
   YBCStartSysTablePrefetchingImpl(PrefetcherOptions::CachingInfo{
       {
           version_info.version,
-          MakeReadHybridTime(version_info.version_read_time),
+          version_info.version_read_time.read
+              ? MakeReadHybridTime(version_info.version_read_time) : ReadHybridTime(),
           version_info.is_db_catalog_version_mode
       },
       database_oid, YBCMapPrefetcherCacheMode(cache_mode)});
@@ -3443,6 +3446,10 @@ YbcStatus YBCCommitTransactionIntermediate(const YbcPgInitTransactionData *data)
 
 YbcStatus YBCTriggerRelcacheInitConnection(const char* dbname) {
   return ToYBCStatus(pgapi->TriggerRelcacheInitConnection(dbname));
+}
+
+YbcStatus YBCScheduleCatalogPreloadRefresh(const char* dbname) {
+  return ToYBCStatus(pgapi->ScheduleCatalogPreloadRefresh(dbname));
 }
 
 YbcFlushDebugContext YBCMakeFlushDebugContextBeginSubTxn(uint32_t id, const char *name) {

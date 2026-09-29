@@ -94,6 +94,12 @@ TEST_F(PgRelcacheInitInternalConnTest, XClusterSetupConnGetsDedicatedBackendType
   ASSERT_EQ(backend_type, "yb xcluster setup backend");
 }
 
+TEST_F(PgRelcacheInitInternalConnTest, CatalogPreloadRefreshConnGetsDedicatedBackendType) {
+  auto conn = ASSERT_RESULT(ConnectAs(YbInternalConnKindWireName::kCatalogPreloadRefresh));
+  const auto backend_type = ASSERT_RESULT(CurrentBackendType(&conn));
+  ASSERT_EQ(backend_type, "yb catalog preload refresh backend");
+}
+
 TEST_F(PgRelcacheInitInternalConnTest, UnknownInternalConnKindIsRejected) {
   auto result = ConnectAs(/*yb_internal_conn_kind_wire_name=*/"not_a_real_kind");
   ASSERT_NOK(result);

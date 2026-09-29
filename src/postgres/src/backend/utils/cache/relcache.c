@@ -112,6 +112,9 @@
 #include "commands/yb_cmds.h"
 #include "partitioning/partdesc.h"
 #include "postmaster/postmaster.h"
+#include "storage/shmem.h"
+#include "storage/spin.h"
+#include "tcop/tcopprot.h"
 #include "utils/catcache.h"
 #include "utils/partcache.h"
 #include "utils/relcache.h"
@@ -197,6 +200,13 @@ static long YbNumRelCacheInitFileRevalidationFailed = 0L;
  * init file.
  */
 static bool YbNeedNewCacheFileForPgAuthBackend = false;
+
+/*
+ * Set when connection setup preloaded the catalog caches from the tserver
+ * response cache at an older catalog version than the tserver's, so that the
+ * caches must be caught up at the end of RelationCacheInitializePhase3.
+ */
+static bool YbPreloadedFromCachedBase = false;
 
 /*
  * in_progress_list is a stack of ongoing RelationBuildDesc() calls.  CREATE
@@ -2667,12 +2677,133 @@ YbAuthBackendUsesTserverResponseCache(uint64_t shared_catalog_version)
 		YbUseTserverResponseCacheForAuth(shared_catalog_version);
 }
 
+/*
+ * The tserver response cache is an LRU keyed by catalog version and does not
+ * know which versions it holds. Backends record here, per database, the newest
+ * catalog version at which a full connection-setup preload was served through
+ * the response cache, so that later connections can preload from that
+ * (probably still cached) version instead of missing the cache after every DDL.
+ */
+#define YB_CATALOG_PRELOAD_BASE_SLOTS 256
+
+typedef struct YbCatalogPreloadBaseSlot
+{
+	Oid			db_oid;
+	uint64_t	version;
+} YbCatalogPreloadBaseSlot;
+
+typedef struct YbCatalogPreloadBaseState
+{
+	slock_t		mutex;
+	YbCatalogPreloadBaseSlot slots[YB_CATALOG_PRELOAD_BASE_SLOTS];
+} YbCatalogPreloadBaseState;
+
+static YbCatalogPreloadBaseState *YbCatalogPreloadBase = NULL;
+
+Size
+YbCatalogPreloadBaseShmemSize(void)
+{
+	return sizeof(YbCatalogPreloadBaseState);
+}
+
+void
+YbCatalogPreloadBaseShmemInit(void)
+{
+	bool		found;
+
+	YbCatalogPreloadBase = ShmemInitStruct("YB catalog preload base",
+										   YbCatalogPreloadBaseShmemSize(),
+										   &found);
+	if (!found)
+	{
+		MemSet(YbCatalogPreloadBase, 0, YbCatalogPreloadBaseShmemSize());
+		SpinLockInit(&YbCatalogPreloadBase->mutex);
+	}
+}
+
+/*
+ * Return the slot for db_oid, claiming an empty one if claim is true. Returns
+ * NULL if there is no such slot. Caller must hold the mutex.
+ */
+static YbCatalogPreloadBaseSlot *
+YbFindCatalogPreloadBaseSlot(Oid db_oid, bool claim)
+{
+	for (int i = 0; i < YB_CATALOG_PRELOAD_BASE_SLOTS; ++i)
+	{
+		YbCatalogPreloadBaseSlot *slot =
+			&YbCatalogPreloadBase->slots[(db_oid + i) % YB_CATALOG_PRELOAD_BASE_SLOTS];
+
+		if (slot->db_oid == db_oid)
+			return slot;
+		if (slot->db_oid == InvalidOid)
+		{
+			if (!claim)
+				return NULL;
+			slot->db_oid = db_oid;
+			return slot;
+		}
+	}
+	return NULL;
+}
+
+static uint64_t
+YbGetCatalogPreloadBase(Oid db_oid)
+{
+	YbCatalogPreloadBaseSlot *slot;
+	uint64_t	version = 0;
+
+	if (!YbCatalogPreloadBase)
+		return 0;
+	SpinLockAcquire(&YbCatalogPreloadBase->mutex);
+	slot = YbFindCatalogPreloadBaseSlot(db_oid, false /* claim */ );
+	if (slot)
+		version = slot->version;
+	SpinLockRelease(&YbCatalogPreloadBase->mutex);
+	return version;
+}
+
+static void
+YbStampCatalogPreloadBase(Oid db_oid, uint64_t version)
+{
+	YbCatalogPreloadBaseSlot *slot;
+
+	if (!YbCatalogPreloadBase)
+		return;
+	SpinLockAcquire(&YbCatalogPreloadBase->mutex);
+	slot = YbFindCatalogPreloadBaseSlot(db_oid, true /* claim */ );
+	if (slot && slot->version < version)
+		slot->version = version;
+	SpinLockRelease(&YbCatalogPreloadBase->mutex);
+}
+
+/*
+ * Whether this connection-setup full preload may use the response cache keyed
+ * by the tserver's (shared memory) catalog version, or an older recorded base,
+ * rather than the master catalog version. Like the connection-auth prefetch,
+ * this trades seeing DDLs that have not reached this tserver via heartbeat for
+ * fewer master reads.
+ */
+static bool
+YbCanPreloadFromCachedBase(uint64_t shared_catalog_version)
+{
+	return *YBCGetGFlags()->ysql_enable_catalog_preload_from_cached_base &&
+		IsInitProcessingMode() &&
+		OidIsValid(MyDatabaseId) &&
+		YbCatalogPreloadRequired() &&
+		!YbUseMinimalCatalogCachesPreload() &&
+		!YbIsAuthBackend() &&
+		!YbIsAuthPassthroughInProgress(MyProcPort) &&
+		!YbNeedNewCacheFileForPgAuthBackend &&
+		YbUseTserverResponseCacheForAuth(shared_catalog_version);
+}
+
 static void
 YbRunWithPrefetcher(YbcStatus (*func) (YbRunWithPrefetcherContext *),
-					bool keep_prefetcher)
+					bool keep_prefetcher, bool allow_cached_base)
 {
 	YbcPgLastKnownCatalogVersionInfo catalog_version = {};
 	uint64_t	shared_catalog_version;
+	bool		use_cached_base = false;
 
 	HandleYBStatus(YBCGetSharedCatalogVersion(&shared_catalog_version));
 	/*
@@ -2688,7 +2819,7 @@ YbRunWithPrefetcher(YbcStatus (*func) (YbRunWithPrefetcherContext *),
 	YbcPgSysTablePrefetcherCacheMode trust_mode =
 		use_tserver_cache_for_auth ? YB_YQL_PREFETCHER_TRUST_CACHE_AUTH
 		: YB_YQL_PREFETCHER_TRUST_CACHE;
-	YbPrefetcherStarterWithCache trust_cache = MakeStarterWithCache(trust_mode, &catalog_version);
+	YbPrefetcherStarterWithCache trust_cache;
 	YbPrefetcherStarterWithCache renew_soft = MakeStarterWithCache(YB_YQL_PREFETCHER_RENEW_CACHE_SOFT,
 																   &catalog_version);
 	YbPrefetcherStarterWithCache renew_hard = MakeStarterWithCache(YB_YQL_PREFETCHER_RENEW_CACHE_HARD,
@@ -2731,7 +2862,38 @@ YbRunWithPrefetcher(YbcStatus (*func) (YbRunWithPrefetcherContext *),
 		*YBCGetGFlags()->ysql_enable_read_request_caching)
 	{
 		starter_idx = 0;
-		if (use_tserver_cache_for_auth)
+		use_cached_base = allow_cached_base &&
+			YbCanPreloadFromCachedBase(shared_catalog_version);
+		if (use_cached_base)
+		{
+			uint64_t	db_shared_version = YbGetSharedCatalogVersion();
+			uint64_t	base_version = YbGetCatalogPreloadBase(MyDatabaseId);
+
+			/*
+			 * Cached data under key N is a snapshot of version N or newer, so
+			 * the preload ends at some version V >= N and
+			 * YbCatchUpFromCachedBasePreload applies the invalidation messages
+			 * for V..db_shared_version. The refresh backend exists to fill the
+			 * cache at the latest version, so it never uses an older base.
+			 */
+			catalog_version.version = db_shared_version;
+			if (MyBackendType != YB_CATALOG_PRELOAD_REFRESH_BACKEND &&
+				base_version != 0 &&
+				base_version < db_shared_version &&
+				db_shared_version - base_version <=
+				*YBCGetGFlags()->ysql_max_invalidation_message_queue_size)
+			{
+				catalog_version.version = base_version;
+				YbPreloadedFromCachedBase = true;
+			}
+			memset(&catalog_version.version_read_time,
+				   0,
+				   sizeof(catalog_version.version_read_time));
+			catalog_version.is_db_catalog_version_mode =
+				YBIsDBCatalogVersionMode();
+			trust_mode = YB_YQL_PREFETCHER_TRUST_CACHE;
+		}
+		else if (use_tserver_cache_for_auth)
 		{
 			/*
 			 * yb_pgindent does not like struct assigned to struct, so assign
@@ -2747,6 +2909,7 @@ YbRunWithPrefetcher(YbcStatus (*func) (YbRunWithPrefetcherContext *),
 		else
 			catalog_version = YbGetCatalogCacheVersionForTablePrefetching();
 	}
+	trust_cache = MakeStarterWithCache(trust_mode, &catalog_version);
 	for (;;)
 	{
 		YbcStatus	status = YbRunWithPrefetcherImpl(prefetcher_starters[starter_idx],
@@ -2764,6 +2927,13 @@ YbRunWithPrefetcher(YbcStatus (*func) (YbRunWithPrefetcherContext *),
 		/* Reset catalog caches before next attempt */
 		ResetCatalogCaches();
 	}
+
+	/*
+	 * Every caching starter leaves the responses for this key in the cache,
+	 * so later connections can preload from it.
+	 */
+	if (use_cached_base && prefetcher_starters[starter_idx] != &no_cache)
+		YbStampCatalogPreloadBase(MyDatabaseId, catalog_version.version);
 }
 
 static Oid
@@ -3316,7 +3486,8 @@ YbPreloadRelCacheImpl(YbRunWithPrefetcherContext *ctx)
 void
 YBPreloadRelCache()
 {
-	YbRunWithPrefetcher(&YbPreloadRelCacheImpl, false /* keep_prefetcher */ );
+	YbRunWithPrefetcher(&YbPreloadRelCacheImpl, false /* keep_prefetcher */ ,
+						false /* allow_cached_base */ );
 }
 
 static YbcStatus
@@ -3382,7 +3553,59 @@ YbPrefetchRequiredData(bool preload_rel_cache)
 	YbRunWithPrefetcher((preload_rel_cache ?
 						 &YbPrefetchRequiredDataWithRelCache :
 						 &YbPrefetchRequiredDataWithoutRelCache),
-						true /* keep_prefetcher */ );
+						true /* keep_prefetcher */ ,
+						preload_rel_cache /* allow_cached_base */ );
+}
+
+/*
+ * Bring the caches preloaded from an older cached catalog version up to the
+ * tserver's catalog version by applying the tserver's invalidation messages.
+ * If that is not possible (e.g. the messages are no longer retained), the
+ * local catalog version stays behind, and the first statement's catalog
+ * version check does the usual refresh, falling back to a full refresh from
+ * the master.
+ */
+static void
+YbCatchUpFromCachedBasePreload(void)
+{
+	uint64_t	preloaded_version = YbGetCatalogCacheVersion();
+	uint64_t	shared_version = YbGetSharedCatalogVersion();
+	bool		caught_up = true;
+
+	YbPreloadedFromCachedBase = false;
+
+	/*
+	 * Invalidation messages cannot be applied while reads are served from the
+	 * prefetched snapshot. Catalog reads during the rest of connection setup
+	 * go to the master instead.
+	 */
+	YBCStopSysTablePrefetching();
+
+	if (preloaded_version < shared_version)
+	{
+		yb_refresh_cache_in_progress = true;
+		PG_TRY();
+		{
+			caught_up = YBRefreshCacheUsingInvalMsgs();
+		}
+		PG_FINALLY();
+		{
+			yb_refresh_cache_in_progress = false;
+		}
+		PG_END_TRY();
+		yb_pgstat_set_catalog_version(YbGetCatalogCacheVersion());
+	}
+
+	elog(LOG,
+		 "catalog caches preloaded from cached catalog version %" PRIu64
+		 " %s tserver catalog version %" PRIu64 " for database %u",
+		 preloaded_version,
+		 caught_up ? "caught up to" : "could not catch up to",
+		 shared_version, MyDatabaseId);
+
+	/* Ask the tserver to eventually refill the cache at the latest version. */
+	HandleYBStatusAtErrorLevel(YBCScheduleCatalogPreloadRefresh(YBCGetDatabaseName(MyDatabaseId)),
+							   WARNING);
 }
 
 /*
@@ -7182,6 +7405,10 @@ RelationCacheInitializePhase3(void)
 		write_relcache_init_file(true);
 		write_relcache_init_file(false);
 	}
+
+	/* YB: must run after the init files are written from the preloaded data */
+	if (YbPreloadedFromCachedBase)
+		YbCatchUpFromCachedBasePreload();
 }
 
 /*

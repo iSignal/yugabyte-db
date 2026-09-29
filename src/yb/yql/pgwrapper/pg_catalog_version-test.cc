@@ -10,6 +10,8 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 
+#include <regex>
+
 #include "yb/common/entity_ids.h"
 #include "yb/common/wire_protocol.h"
 #include "yb/gutil/strings/util.h"
@@ -4448,6 +4450,155 @@ $$ LANGUAGE plpgsql;
     ASSERT_NOK_STR_CONTAINS(
         fn_status,
         "The catalog snapshot used for this transaction has been invalidated");
+  }
+}
+
+class PgCatalogPreloadCachedBaseTest : public PgCatalogVersionTest {
+ protected:
+  static constexpr auto* kRefreshRequests = "ysql_catalog_preload_refresh_requests";
+  static constexpr auto* kRefreshConnections = "ysql_catalog_preload_refresh_connections";
+
+  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
+    PgCatalogVersionTest::UpdateMiniClusterOptions(options);
+    options->extra_tserver_flags.insert(
+        options->extra_tserver_flags.end(),
+        {"--ysql_catalog_preload_additional_tables=true",
+         "--ysql_enable_read_request_cache_for_connection_auth=true",
+         "--ysql_enable_catalog_preload_from_cached_base=true",
+         "--ysql_enable_auto_analyze=false",
+         "--ysql_catalog_preload_refresh_min_delay_ms=500",
+         "--ysql_catalog_preload_refresh_max_delay_ms=1000",
+         // Only new connections record the cached base; the background refresh that would
+         // advance it to the latest catalog version never runs.
+         "--TEST_skip_catalog_preload_refresh=true"});
+  }
+
+  Result<int64_t> GetTServerCounter(const char* metric_name) {
+    return pg_ts->GetMetric<int64>("server", "yb.tabletserver", metric_name, "value");
+  }
+
+  struct CachedBasePreload {
+    uint64_t base_version;
+    uint64_t caught_up_version;
+  };
+
+  // Opens a new connection. Also returns the older cached catalog version it preloaded from and
+  // the version it caught up to, or nullopt if it preloaded at the tserver's catalog version.
+  Result<std::pair<PGConn, std::optional<CachedBasePreload>>> ConnectAndGetCachedBasePreload() {
+    const auto requests_before = VERIFY_RESULT(GetTServerCounter(kRefreshRequests));
+    LogWaiter waiter(pg_ts, "catalog caches preloaded from cached catalog version");
+    auto conn = VERIFY_RESULT(Connect());
+    // Only a connection that preloaded from an older cached base requests a refresh.
+    if (VERIFY_RESULT(GetTServerCounter(kRefreshRequests)) == requests_before) {
+      return std::make_pair(std::move(conn), std::nullopt);
+    }
+    RETURN_NOT_OK(waiter.WaitFor(30s * kTimeMultiplier));
+    const auto line = waiter.matched_log_line();
+    static const std::regex kPattern(
+        "preloaded from cached catalog version ([0-9]+) caught up to tserver catalog version "
+        "([0-9]+)");
+    std::smatch match;
+    SCHECK(std::regex_search(line, match, kPattern), IllegalState,
+           Format("Unexpected log line: $0", line));
+    return std::make_pair(
+        std::move(conn),
+        CachedBasePreload{std::stoull(match[1].str()), std::stoull(match[2].str())});
+  }
+
+  static Status CheckSchemaAfterDdls(PGConn* conn) {
+    SCHECK_EQ(VERIFY_RESULT(conn->FetchRow<std::string>("SELECT v FROM t1 WHERE k = 1")), "a",
+              IllegalState, "Unexpected t1 row");
+    return ResultToStatus(conn->FetchRow<PGUint64>("SELECT COUNT(*) FROM t2"));
+  }
+};
+
+// After a few DDLs, new connections preload from the older catalog version that the tserver
+// response cache still holds, and catch up with invalidation messages during connection setup.
+TEST_F(PgCatalogPreloadCachedBaseTest, PreloadFromFrozenCachedBase) {
+  // The first connection finds no cached base: it preloads at the tserver's catalog version and
+  // records that version as the base.
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE t1 (k INT PRIMARY KEY)"));
+  ASSERT_OK(conn.Execute("ALTER TABLE t1 ADD COLUMN v TEXT"));
+  ASSERT_OK(conn.Execute("CREATE TABLE t2 (k INT PRIMARY KEY)"));
+  ASSERT_OK(conn.Execute("INSERT INTO t1 VALUES (1, 'a')"));
+  const auto version = ASSERT_RESULT(GetCatalogVersion(&conn));
+  WaitForCatalogVersionToPropagate();
+
+  const auto full_refreshes_before = GetInt64MetricsHelper("CatCacheRefresh");
+  const auto delta_refreshes_before = GetInt64MetricsHelper("CatCacheDeltaRefresh");
+  constexpr int kNumConnections = 3;
+  std::optional<uint64_t> frozen_base_version;
+  for (int i = 0; i < kNumConnections; ++i) {
+    auto [new_conn, preload] = ASSERT_RESULT(ConnectAndGetCachedBasePreload());
+    ASSERT_TRUE(preload) << i;
+    LOG(INFO) << "Preloaded from " << preload->base_version << ", caught up to "
+              << preload->caught_up_version;
+    ASSERT_LT(preload->base_version, version);
+    ASSERT_EQ(preload->caught_up_version, version);
+    // Without the refresh, every new connection preloads from the same base.
+    if (frozen_base_version) {
+      ASSERT_EQ(preload->base_version, *frozen_base_version);
+    }
+    frozen_base_version = preload->base_version;
+    ASSERT_OK(CheckSchemaAfterDdls(&new_conn));
+  }
+  // Each connection caught up with one incremental refresh during connection setup, so its first
+  // statement needed no further refresh.
+  ASSERT_EQ(GetInt64MetricsHelper("CatCacheDeltaRefresh"),
+            delta_refreshes_before + kNumConnections);
+  ASSERT_EQ(GetInt64MetricsHelper("CatCacheRefresh"), full_refreshes_before);
+  ASSERT_GE(ASSERT_RESULT(GetTServerCounter(kRefreshRequests)), kNumConnections);
+  ASSERT_EQ(ASSERT_RESULT(GetTServerCounter(kRefreshConnections)), 0);
+}
+
+// The background refresh connection refills the response cache at the latest catalog version,
+// advancing the base that later connections preload from.
+TEST_F(PgCatalogPreloadCachedBaseTest, BackgroundRefreshAdvancesCachedBase) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE t1 (k INT PRIMARY KEY)"));
+  ASSERT_OK(conn.Execute("ALTER TABLE t1 ADD COLUMN v TEXT"));
+  ASSERT_OK(conn.Execute("CREATE TABLE t2 (k INT PRIMARY KEY)"));
+  ASSERT_OK(conn.Execute("INSERT INTO t1 VALUES (1, 'a')"));
+  const auto version1 = ASSERT_RESULT(GetCatalogVersion(&conn));
+  WaitForCatalogVersionToPropagate();
+
+  {
+    auto [new_conn, preload] = ASSERT_RESULT(ConnectAndGetCachedBasePreload());
+    ASSERT_TRUE(preload);
+    ASSERT_LT(preload->base_version, version1);
+    ASSERT_EQ(preload->caught_up_version, version1);
+  }
+
+  ASSERT_OK(cluster_->SetFlag(pg_ts, "TEST_skip_catalog_preload_refresh", "false"));
+  {
+    // Still preloads from the old base, and requests a refresh that now runs.
+    auto [new_conn, preload] = ASSERT_RESULT(ConnectAndGetCachedBasePreload());
+    ASSERT_TRUE(preload);
+    ASSERT_LT(preload->base_version, version1);
+  }
+  ASSERT_OK(WaitFor(
+      [this]() -> Result<bool> {
+        return VERIFY_RESULT(GetTServerCounter(kRefreshConnections)) > 0;
+      },
+      30s * kTimeMultiplier, "catalog preload refresh connection"));
+
+  {
+    // The refresh recorded version1 as the base, so there is nothing to catch up.
+    auto [new_conn, preload] = ASSERT_RESULT(ConnectAndGetCachedBasePreload());
+    ASSERT_FALSE(preload) << preload->base_version;
+    ASSERT_OK(CheckSchemaAfterDdls(&new_conn));
+  }
+
+  ASSERT_OK(conn.Execute("ALTER TABLE t2 ADD COLUMN v TEXT"));
+  const auto version2 = ASSERT_RESULT(GetCatalogVersion(&conn));
+  WaitForCatalogVersionToPropagate();
+  {
+    auto [new_conn, preload] = ASSERT_RESULT(ConnectAndGetCachedBasePreload());
+    ASSERT_TRUE(preload);
+    ASSERT_EQ(preload->base_version, version1);
+    ASSERT_EQ(preload->caught_up_version, version2);
+    ASSERT_OK(ResultToStatus(new_conn.FetchRow<PGUint64>("SELECT COUNT(v) FROM t2")));
   }
 }
 
