@@ -72,15 +72,16 @@ Result<int64_t> CacheMemoryContextBytes(PGConn& conn) {
 
 } // namespace
 
-// Preloads enough catalogs that, without exclusion, planning a simple query on a relation misses
-// no catalog cache. pg_operator and pg_amop are not in the ysql_catalog_preload_additional_tables
+// Preloads enough catalogs that, without exclusion, a simple query on a relation reads nothing
+// from master. pg_operator and pg_amop are not in the ysql_catalog_preload_additional_tables
 // default list, and they are not relation-scoped, so they must stay fully loaded under exclusion.
+// pg_statistic_ext lets relcache preload fill each relation's extended statistics list.
 class PgCatalogPreloadExclusionTest : public PgMiniTestBase {
  protected:
   void SetUp() override {
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_catalog_preload_additional_tables) = true;
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_catalog_preload_additional_table_list) =
-        "pg_operator,pg_amop";
+        "pg_operator,pg_amop,pg_statistic_ext";
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_enable_auto_analyze) = false;
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_enable_relcache_init_optimization) = false;
     PgMiniTestBase::SetUp();
@@ -157,25 +158,19 @@ TEST_F(PgCatalogPreloadExclusionMissTest, ExcludedSchemaMissesGoToMaster) {
   constexpr auto kInclQuery = "SELECT v FROM incl.t WHERE k = 3";
   constexpr auto kExclQuery = "SELECT v FROM excl.t WHERE k = 3";
 
-  // Planning a relation's first query reads pg_statistic_ext, which is never cached, so each
-  // relation's first-use reads are compared with the same query without exclusion.
-  size_t incl_base, excl_base;
   {
     auto conn = ASSERT_RESULT(ConnectToDB(kDbName));
-    incl_base = ASSERT_RESULT(MasterReads(conn, kInclQuery));
-    excl_base = ASSERT_RESULT(MasterReads(conn, kExclQuery));
+    ASSERT_EQ(ASSERT_RESULT(MasterReads(conn, kInclQuery)), 0);
+    ASSERT_EQ(ASSERT_RESULT(MasterReads(conn, kExclQuery)), 0);
   }
 
   ASSERT_OK(SetExcludeSchemasFlag(Format("postgres@$0:$1", db_oid_, excl_oid_)));
 
   auto conn = ASSERT_RESULT(ConnectToDB(kDbName));
-  const auto incl_reads = ASSERT_RESULT(MasterReads(conn, kInclQuery));
+  ASSERT_EQ(ASSERT_RESULT(MasterReads(conn, kInclQuery)), 0);
   const auto excl_reads = ASSERT_RESULT(MasterReads(conn, kExclQuery));
-  LOG(INFO) << "First-use master reads without exclusion: incl.t=" << incl_base
-            << " excl.t=" << excl_base << "; with excl excluded: incl.t=" << incl_reads
-            << " excl.t=" << excl_reads;
-  ASSERT_EQ(incl_reads, incl_base);
-  ASSERT_GT(excl_reads, excl_base)
+  LOG(INFO) << "First-use master reads of excluded excl.t: " << excl_reads;
+  ASSERT_GT(excl_reads, 0)
       << "excluded relation should have been loaded from master on first use";
   ASSERT_EQ(ASSERT_RESULT(MasterReads(conn, kExclQuery)), 0)
       << "excluded relation should be cached after first use";
@@ -214,13 +209,10 @@ TEST_F(PgCatalogPreloadExclusionMissTest, ExclusionMatchesRoleAndDatabase) {
       db_oid_, excl_oid_, db_oid_ + 1)));
 
   auto conn = ASSERT_RESULT(ConnectToDB(kDbName));
-  const auto postgres_reads = ASSERT_RESULT(MasterReads(conn, kExclQuery));
+  ASSERT_EQ(ASSERT_RESULT(MasterReads(conn, kExclQuery)), 0);
 
   auto other_conn = ASSERT_RESULT(ConnectAs("other_role"));
-  const auto other_reads = ASSERT_RESULT(MasterReads(other_conn, kExclQuery));
-  LOG(INFO) << "First-use master reads of excl.t: postgres=" << postgres_reads
-            << " other_role=" << other_reads;
-  ASSERT_GT(other_reads, postgres_reads);
+  ASSERT_GT(ASSERT_RESULT(MasterReads(other_conn, kExclQuery)), 0);
   ASSERT_EQ(ASSERT_RESULT(other_conn.FetchRow<int32_t>(kExclQuery)), 30);
 }
 
