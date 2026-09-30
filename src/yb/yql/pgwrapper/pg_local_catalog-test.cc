@@ -924,6 +924,48 @@ TEST_F(PgLocalCatalogTest, CheckpointTooOldReseeds) {
   ASSERT_GT(delta, 0) << RoutingCounters(0) << "; " << RoutingCounters(1);
 }
 
+// A DDL transaction that is open while a copy is re-seeded has written catalog rows that the copy
+// receives through the remote bootstrap, as intents in its own tablet, and not as records from the
+// poller. Only the transaction's later writes and its APPLY record arrive through the poller. The
+// DDL's rows must still be readable on that tserver once the DDL has committed. Disabled: the
+// copy does not apply those intents yet (notes/todos.md T3(b)).
+TEST_F(PgLocalCatalogTest, DISABLED_DdlOpenAcrossReseedIsVisibleAfterCommit) {
+  ASSERT_OK(WaitForAllServing());
+  auto ddl_conn = ASSERT_RESULT(ConnectTo(1));
+  ASSERT_OK(ddl_conn.Execute("BEGIN"));
+  ASSERT_OK(ddl_conn.Execute("CREATE TABLE open_across_reseed (k INT PRIMARY KEY, v TEXT)"));
+
+  const auto reseeds_before = ASSERT_RESULT(Counter(0, METRIC_local_catalog_reseeds));
+  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_poll_checkpoint_too_old", "true"));
+  ASSERT_OK(LoggedWaitFor(
+      [this, reseeds_before]() -> Result<bool> {
+        auto reseeds = Counter(0, METRIC_local_catalog_reseeds);
+        return reseeds.ok() && *reseeds > reseeds_before;
+      },
+      120s, "The copy to be re-seeded after CHECKPOINT_TOO_OLD"));
+  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_poll_checkpoint_too_old", "false"));
+  ASSERT_OK(WaitForServing(0));
+
+  ASSERT_OK(ddl_conn.Execute("INSERT INTO open_across_reseed VALUES (1, 'one')"));
+  ASSERT_OK(ddl_conn.Execute("COMMIT"));
+  // The coordinator forgets the transaction once master has applied it, and then answers a status
+  // request for it with ABORTED.
+  SleepFor(5s * kTimeMultiplier);
+
+  auto from_copy = ASSERT_RESULT(ConnectTo(0));
+  auto copy_result = from_copy.FetchRow<std::string>("SELECT v FROM open_across_reseed");
+  const auto copy_counters = RoutingCounters(0);
+
+  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_disable_serving", "true"));
+  auto from_master = ASSERT_RESULT(ConnectTo(0));
+  auto master_result = from_master.FetchRow<std::string>("SELECT v FROM open_across_reseed");
+  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_disable_serving", "false"));
+
+  ASSERT_EQ(ASSERT_RESULT(std::move(master_result)), "one");
+  ASSERT_TRUE(copy_result.ok()) << copy_result.status() << "; " << copy_counters;
+  ASSERT_EQ(*copy_result, "one") << copy_counters;
+}
+
 // A session that writes catalog rows outside a DDL, the way a YSQL upgrade's migrations do, can
 // hold uncommitted catalog rows that exist only on master, so its catalog reads go to master.
 TEST_F(PgLocalCatalogTest, NonDdlSysTableSessionReadsMaster) {
