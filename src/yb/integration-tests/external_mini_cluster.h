@@ -506,6 +506,11 @@ class ExternalMiniCluster : public MiniClusterBase {
   Status WaitForTabletServersToAcceptYSQLConnection(
       const std::vector<size_t>& indexes, MonoTime deadline);
 
+  // Waits until every tablet server that has a local copy of the master system catalog serves
+  // catalog reads from it. A tablet server whose flags do not allow the copy has none, and is
+  // skipped.
+  Status WaitForLocalCatalogCopiesToServe(MonoTime deadline);
+
   // Runs gtest assertions that no servers have crashed.
   void AssertNoCrashes();
 

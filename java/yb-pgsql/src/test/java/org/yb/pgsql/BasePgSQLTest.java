@@ -108,6 +108,10 @@ public class BasePgSQLTest extends BaseMiniClusterTest {
 
   protected final long WAIT_FOR_PG_AFTER_CLUSTER_START_TIMEOUT_MS = 30000;
 
+  private static final String LOCAL_CATALOG_SERVING_STATE_METRIC = "local_catalog_serving_state";
+  // LocalCatalogServingState::kServing in src/yb/tserver/local_catalog_replica.h.
+  private static final int LOCAL_CATALOG_SERVING_STATE_SERVING = 1;
+
   private boolean pg_connection_check_after_startup = true;
 
   // Postgres settings.
@@ -463,6 +467,7 @@ public class BasePgSQLTest extends BaseMiniClusterTest {
         BuildTypeUtil.nonSanitizerVsSanitizer(1, 3);
     waitForAllTServerPgWebservers(pgStartTimeoutMs);
     verifyClusterAcceptsPGConnections(pgStartTimeoutMs);
+    waitForLocalCatalogCopiesToServe(pgStartTimeoutMs);
 
     connection = createTestRole();
     allowSchemaPublic();
@@ -533,6 +538,25 @@ public class BasePgSQLTest extends BaseMiniClusterTest {
     for (MiniYBDaemon ts : miniCluster.getTabletServers().values()) {
       TestUtils.waitForServer(ts.getLocalhostIP(), ts.getPgsqlWebPort(), timeoutMs);
     }
+  }
+
+  /**
+   * Waits until every tablet server that has a local copy of the master system catalog serves
+   * catalog reads from it. A tablet server whose flags do not allow the copy has no
+   * local_catalog_serving_state metric, and is skipped.
+   */
+  protected void waitForLocalCatalogCopiesToServe(long timeoutMs) throws Exception {
+    if (!pg_connection_check_after_startup) {
+      return;
+    }
+    for (MiniYBDaemon ts : miniCluster.getTabletServers().values()) {
+      TestUtils.waitFor(() -> {
+        Metrics.Counter state = new Metrics(ts.getLocalhostIP(), ts.getWebPort(), "server")
+            .getCounter(LOCAL_CATALOG_SERVING_STATE_METRIC);
+        return state == null || state.value == LOCAL_CATALOG_SERVING_STATE_SERVING;
+      }, timeoutMs);
+    }
+    LOG.info("Local catalog copies are serving");
   }
 
   protected void disablePGConnectionCheck() {

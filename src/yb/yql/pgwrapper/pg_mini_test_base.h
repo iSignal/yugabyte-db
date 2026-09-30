@@ -100,6 +100,11 @@ class PgMiniTestBase : public MiniClusterTestWithClient<MiniCluster> {
 
   Status SetupPGCallbacksAndStartPG(uint16_t pg_port, size_t pg_ts_idx);
 
+  // Waits until every tablet server that has a local copy of the master system catalog serves
+  // catalog reads from it. A tablet server whose flags do not allow the copy has none, and is
+  // skipped.
+  Status WaitForLocalCatalogCopiesToServe();
+
   Status RestartPostgres();
 
   std::unique_ptr<PgSupervisor> pg_supervisor_;

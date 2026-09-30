@@ -27,9 +27,11 @@
 #include "yb/master/mini_master.h"
 #include "yb/master/sys_catalog_initialization.h"
 
+#include "yb/tserver/local_catalog_replica.h"
 #include "yb/tserver/mini_tablet_server.h"
 #include "yb/tserver/tablet_server.h"
 
+#include "yb/util/backoff_waiter.h"
 #include "yb/util/metrics.h"
 #include "yb/util/status.h"
 #include "yb/util/status_format.h"
@@ -96,6 +98,7 @@ void PgMiniTestBase::SetUp() {
   ASSERT_OK(cluster_->Start(ExtraTServerOptions()));
 
   ASSERT_OK(SetupPGCallbacksAndStartPG(pg_port, kPgTsIndex));
+  ASSERT_OK(WaitForLocalCatalogCopiesToServe());
   DontVerifyClusterBeforeNextTearDown();
 
   ASSERT_OK(MiniClusterTestWithClient<MiniCluster>::CreateClient());
@@ -157,6 +160,19 @@ Status PgMiniTestBase::SetupPGCallbacksAndStartPG(uint16_t pg_port, size_t pg_ts
       [this] { return StartPostgres(); }, [this] { StopPostgres(); },
       [this] { return MakeConnSettings(); });
   return pg_ts->StartPgIfConfigured();
+}
+
+Status PgMiniTestBase::WaitForLocalCatalogCopiesToServe() {
+  for (const auto& mini_ts : cluster_->mini_tablet_servers()) {
+    auto* replica = mini_ts->server()->local_catalog_replica();
+    if (!replica) {
+      continue;
+    }
+    RETURN_NOT_OK(WaitFor(
+        [replica]() -> Result<bool> { return replica->IsServing(); }, 60s * kTimeMultiplier,
+        Format("Local catalog copy on tserver $0 to serve", mini_ts->server()->permanent_uuid())));
+  }
+  return Status::OK();
 }
 
 Status PgMiniTestBase::RecreatePgSupervisor() {

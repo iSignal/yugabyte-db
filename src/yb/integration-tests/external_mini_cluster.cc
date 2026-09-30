@@ -84,6 +84,7 @@
 #include "yb/server/server_base.proxy.h"
 #include "yb/rpc/secure.h"
 
+#include "yb/tserver/local_catalog_replica.h"
 #include "yb/tserver/tserver_admin.proxy.h"
 #include "yb/tserver/tserver_service.proxy.h"
 
@@ -420,6 +421,10 @@ Status ExternalMiniCluster::Start(rpc::Messenger* messenger) {
   }
   if (opts_.enable_ysql && opts_.wait_for_tservers_to_accept_ysql_connections) {
     RETURN_NOT_OK(WaitForTabletServersToAcceptYSQLConnection(
+        MonoTime::Now() + kTabletServerRegistrationTimeout));
+  }
+  if (opts_.enable_ysql) {
+    RETURN_NOT_OK(WaitForLocalCatalogCopiesToServe(
         MonoTime::Now() + kTabletServerRegistrationTimeout));
   }
 
@@ -1772,6 +1777,23 @@ Status ExternalMiniCluster::WaitForTabletServersToAcceptYSQLConnection(
           return result.ok();
         },
         deadline, "Waiting for tservers to accept ysql connections"));
+  }
+  return Status::OK();
+}
+
+Status ExternalMiniCluster::WaitForLocalCatalogCopiesToServe(MonoTime deadline) {
+  LOG(INFO) << "Waiting for the tservers' local catalog copies to serve.";
+  for (const auto& ts : tablet_servers_) {
+    RETURN_NOT_OK(Wait(
+        [&ts]() -> Result<bool> {
+          auto state = ts->GetMetric<int64_t>(
+              "server", /* entity_id= */ nullptr, "local_catalog_serving_state", "value");
+          if (!state.ok()) {
+            return state.status().IsNotFound();
+          }
+          return *state == std::to_underlying(tserver::LocalCatalogServingState::kServing);
+        },
+        deadline, Format("Local catalog copy on $0 to serve", ts->id())));
   }
   return Status::OK();
 }
