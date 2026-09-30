@@ -2805,3 +2805,218 @@ commit. The default is unchanged: `true` under `NDEBUG`, `false` otherwise, the 
 `enable_object_locking_for_table_locks` and `ysql_enable_concurrent_ddl`, which the copy requires.
 D57801's test plan now carries `Jenkins: release`, so CI runs only the lane where object locking and
 the copy are both on.
+
+## Fifth default-on CI run (D57801 diff 318234, launch 173734): 59 release failures, triaged
+
+**The launch.** D57801 diff 318234, base `53aae8dc4efb`, alma8/clang21/release, test plan
+`Jenkins: release, rebase: no`, started 2026-09-28T20:03Z, finished 23:54Z. 13297 executions, 59
+failed, 415 skipped, no retries. No baseline run (`skip-baseline-unrunnable-127`). The fastdebug
+lane (launch 173733) and the asan lane (launch 173735) also ran; their only failures are
+`PggateTestCatalog.TestCopydb` and `TestDml`, the harness crash in row J below.
+
+**Against launch 169670.** All 23 failures of 169670 fail again. The other 36 are not all new
+defects. Twelve of them (the four upgrade tests, the six apply-blocking tests, `kWAL_Read` and
+`CachedVersion`) also failed on every attempt in 169670 and were then marked INTERRUPTED, so the
+FAILED list of 169670 did not show them. The bases of the two launches differ by 3 commits, and
+none of the 59 tests was added between them.
+
+Triage used ReportPortal logs only. No local run was made for this table. Per-group detail, with
+timelines and log excerpts, was written to the session scratchpad (`triage_g1.md`, `triage_g2.md`,
+`triage_g3.md`); the conclusions are below.
+
+| Row | Pattern | Tests | N | Severity | Confidence |
+|---|---|---|---|---|---|
+| A | A rollback to the old binary crashes every tserver on the copy's tablet | `UpgradeFrom_2024_2_3_0/BasicUpgradeTest.TestRollback/0`, `UpgradeFrom_2_25_0_0/BasicUpgradeTest.TestRollback/0`, `CdcUpgradeTest.RollbackBeforeFinalize`, `BackupUpgradeTest.TestRestoreBackupAfterRollback` | 4 | crash, blocks rollback | verified from log |
+| B | A tserver SIGSEGV when a local multi-read fails partway | `YbAdminSnapshotScheduleTestWithYsqlColocationRestoreParam.PgsqlSequenceUndoCreateSequence/NotColocated_PITR` | 1 | crash | verified from log and code |
+| C | A catalog write that is neither a DDL commit nor a version bump is invisible to the next read from the copy | the 15 of 169670, plus `TestYbRoleProfile.testAdminCanLockAndUnlock[0]`, `PgCloneTest.CloneWithAlterDatabaseSet`, `TestPgRegressYbIndexCheck`, `TestPgRegressYbIndexCheckSingleSnapshot` | 19 | wrong result | 17 verified; the two index-check suites are a hypothesis |
+| D | A DDL transaction open while a copy bootstraps loses the rows it wrote before the bootstrap, on that copy (`todos.md` T3(b)) | `TestPgSequencesWithServerCacheFlag` x5, `TestPgSequencesWithCacheFlag` x3 | 8 | wrong result | reproduced by `DdlOpenAcrossReseedIsVisibleAfterCommit` |
+| E | A new connection does not see a committed `CREATE DATABASE` when `ysql_enable_object_locking_infra` is false | `PgObjectLocksTestMixModeDuringPromotion` x4 | 4 | wrong result | timeline verified, mechanism a hypothesis |
+| F | The copy's tablet cannot replay an AutoFlags config operation copied from master's WAL | `PgLocksV76UpgradeTest.TestPgLocksViewAdvisoryLocksSupport` | 1 | copy outage | outage verified; the stale row type the test saw is not explained |
+| G | A test flag that stops transaction apply also stops master's catalog apply, so the copy freezes and the DDL's lock release fails | `PgTxnTest.RepackWithDelayedApplyBefore`, `RepackWithDelayedApplyAfter`, `RepackDisabledPreservesPackedRow`, `CDCSDKYsqlTest.TestOriginIdSurvivesApplyResend`, `XClusterDDLReplicationTest.VectorIndexLateWriteAfterBackfillMissing`, `PgMiniTest.DDLWithRestart` | 6 | hang | 5 verified from log; the xCluster test's log was lost |
+| H | The heartbeat gate skips every report while the copy lags master's version-cache read time, so a version bump without a lock release is never published (`todos.md` T1) | `PgBackendsTest.CachedVersion`, `TserverUnresponsiveNoShutdown`, `MultipleWaiters`, `PgCatalogVersionTest.IncrementAllDBCatalogVersions` | 4 | hang/timeout | reproduced for `CachedVersion` with a lagging copy; the other three are assumed to share it |
+| I | Linked to the copy by history, mechanism unknown | `WaitStateITest/AshTestVerifyOccurrence.VerifyWaitStateEntered/kWAL_Read`, `PgGlobalViewsTest.TestOneTServerDown` | 2 | hang | unknown; `TestOneTServerDown` passed 11 of 11 local runs |
+| J | Test assumption or test harness | `PggateTestCatalog.TestDml`, `PgSnapshotTooOldTest.DefaultTablespaceGuc`, `PgLibPqTest.ReplayDeletedTableInColocatedDBPostUpgrade` | 3 | test only | verified |
+| K | Not the copy, or a flake | `PgsqlCreateTable/2`, `CDCSDKConsistentStreamTest.TestGetChangesDuringLoadTxn`, `TestPgRegressParallel.testPgRegressBigParallel`, `WaitStateITest.AshCql`, `PgWaitQueuesProbeForwardingTest.ForwardProbeDuringDetectorShutdown`, `MasterFullCompactionMonitoringTest.CompactionStateDuringAdminCompaction`, `org.yb.cql.TestIndex.testUniqueIndexUpdate` | 7 | none for the copy | the first two reproduce with the copy off (see launch 169670); the other five have no log link to the copy |
+
+### Row A: the old binary replays the copy's tablet and crashes
+
+`BackupUpgradeTest.TestRestoreBackupAfterRollback` shows the whole sequence:
+
+```
+23:37:18  tservers restart in the new version; each remote-bootstraps tablet
+          00000000000000000000000000000001 (the copy) from master m-3
+23:37:36  "Rolling back upgrade"; AutoFlags rolled back to config version 1
+23:37:49  "Restarting yb-tserver ts-1 in old version" (2025.1.1.0)
+          ts-1 bootstraps T 00000000000000000000000000000001, replays 3 of 5 segments
+          SIGSEGV (@0x8) in yb::tablet::Tablet::ApplyKeyValueRowOperations()
+23:37:52  ts-2: same;  23:37:55  ts-3: same
+23:38:08  "Cluster rolled back to old version" -- with no tserver alive
+23:47:30  run-with-timeout kills the test inside the backup restore
+```
+
+The old binary does not know the copy. It finds the copy's tablet in its tablet metadata, opens it as
+an ordinary tablet and replays master's sys catalog WAL entries, which it cannot apply. The two
+`BasicUpgradeTest.TestRollback/0` cases and `CdcUpgradeTest.RollbackBeforeFinalize` show the same
+crash, in `TransactionParticipant::Add()` and `WriteTransactionalBatch`. Nothing gates the creation
+of the copy's tablet on an AutoFlag, so the tablet exists as soon as the new binary runs, before the
+upgrade is finalized, and a rollback is still allowed at that point.
+
+### Row B: the local multi-read error path reads freed sidecars
+
+`TryServeCatalogReadsLocally` calls `ExecuteLocalCatalogReads`
+(`src/yb/tserver/local_catalog_read.cc:95-133`), which appends one response per op and points each
+response's `rows_data_sidecar` into `sidecars`. When an op fails after earlier ops succeeded (in the
+CI log the copy's tablet was shutting down), the caller stores the error, calls
+`data->sidecars.Reset()`, and then, when the request uses the response cache, calls
+`cache_setter({data->resp, ExtractRowsSidecar(data->resp, data->sidecars)})`
+(`src/yb/tserver/pg_client_session.cc:3860-3875`). `ExtractRowsSidecar` follows the sidecar indices
+of the responses that were already appended, into the buffer that `Reset()` freed, and the tserver
+takes SIGSEGV in `WriteBuffer::ExtractContinuousBlock`. Before `7b0a6a9df2d` the requests the copy
+served did not use the response cache, so this path had no caller.
+
+### Row D: a DDL transaction open while a copy bootstraps loses its early rows on that copy
+
+**Root cause, reproduced.** This is `todos.md` T3(b). The copy's tablet is created by remote
+bootstrap from master's sys catalog tablet. When a YSQL DDL transaction is open at that moment, the
+rows it has already written arrive on the copy as ordinary transaction intents in the copy's own
+intents DB, either from the copied intents SST files or from replay of the copied WAL tail, and the
+copy's transaction participant starts tracking that transaction. The poller then resumes after the
+last copied WAL entry (`src/yb/tserver/local_catalog_poller.cc:198`), so those writes are never
+shipped again. The poller hands every shipped record to the xCluster write interface
+(`ApplyRecords`, `local_catalog_poller.cc:605-700`): a transactional write becomes an external
+intent keyed by the transaction, and the APPLY record applies only external intents. The DDL's later
+writes and its APPLY do arrive through the poller, so the APPLY applies only those later writes. The
+early rows stay behind as ordinary intents, which the copy never applies and later removes.
+
+```
+master: DDL txn T writes catalog rows R1 (pg_class, pg_type, ...)
+ts:     copy bootstraps from master -> R1 lands as T's ordinary intents on the copy
+ts:     poller resumes after the last copied WAL entry
+master: T writes R2 (pg_yb_catalog_version bump, invalidation messages), commits
+ts:     poller ships R2 as external intents and T's APPLY
+ts:     APPLY applies R2 only -> applied version moves to T's version, R1 never applied
+ts:     read after commit: version wait satisfied, pg_class row of R1 missing
+```
+
+The version wait does not help: it waits for the copy's applied version of the database, and that
+version comes from R2, which did arrive. The own-write floor (`todos.md` T12) is 0 here, but it plays
+no part, because the DDL incremented the version.
+
+**The CI occurrence.** In `TestPgSequencesWithCacheFlag#testDefaultCacheOption` on the spawned ts4:
+
+```
+23:35:39.131  ts4: RemoteBootstrap of T 00000000000000000000000000000001 from master
+23:35:40.911  backend 463598 starts; it runs CREATE SEQUENCE s1
+23:35:41.106  the copy's intents memtable later shows its oldest entry at op 1.653, this hybrid time
+23:35:41.185  remote bootstrap session opened on master; copied WAL ends at op 1.689
+23:35:41.319  copy on ts4: kBootstrapping -> kServing; poller resumes after 1.689
+23:35:41.345  CREATE SEQUENCE: "new version for database 13665 is 4"
+23:35:41.350  commit; local catalog version 4
+23:35:41.354  SELECT nextval('s1'): relation "s1" does not exist
+23:35:41.561  shutdown flush of the copy's intents memtable: 0 bytes (the intents were removed)
+```
+
+All 8 sequence failures spawn a fourth tserver and run `CREATE SEQUENCE` on it while that tserver's
+copy is still bootstrapping. The same 8 tests passed in launches 168892 and 167088 (copy off). A
+local run of `testDefaultCacheOption` passed because its copy finished bootstrapping 1.5 s before
+the DDL started.
+
+**Reproduction.** `PgLocalCatalogTest.DdlOpenAcrossReseedIsVisibleAfterCommit`
+(`src/yb/yql/pgwrapper/pg_local_catalog-test.cc`) opens `BEGIN; CREATE TABLE open_across_reseed`
+on tserver 1, forces a re-seed of tserver 0's copy with `TEST_local_catalog_poll_checkpoint_too_old`,
+then inserts and commits, waits 5 s, and reads the table on tserver 0. It fails on the first run
+(release, 14.5 s, `scratchpad/reseed_repro.log`):
+
+```
+02:46:45.736  ts-1 copy: kServing -> kReseeding
+02:46:47.965  remote bootstrap complete
+02:46:47.993  copy's participant: "LoadTransactions done: loaded 1 transactions"   (the open DDL)
+02:46:48.027  poller: "resuming from the last entry of the copied log: 1.671"
+02:46:48.499  poller: "Applied 5 records (... provisional: 2, transaction records: 1, by table:
+              [{pg_yb_catalog_version, 1}, {pg_yb_invalidation_messages, ...}])"
+              applied versions: db 13665 1 -> 2
+02:46:48.720  "DoCleanupIntentFiles: Intents SST file will be deleted" on the copy
+02:46:53.728  SELECT v FROM open_across_reseed on ts-1:
+              relation "open_across_reseed" does not exist   (served=16, serving_state=1)
+              the same query with TEST_local_catalog_disable_serving: 'one'
+```
+
+**Severity: High.** A committed DDL's catalog rows are missing from one tserver's copy, silently,
+for every session on that tserver, until the next re-seed. It needs only a copy that bootstraps or
+re-seeds while any DDL transaction is open: a tserver joining the cluster, a re-seed after master
+garbage-collected the poller's WAL position, a re-seed after a PITR restore. Long DDLs such as an
+index build widen the window.
+
+### Row E: the copy runs without the object-lock release that makes a DDL commit wait for it
+
+`LocalCatalogPrerequisitesMet` (`src/yb/tserver/local_catalog_replica.cc:160-162`) requires
+`enable_object_locking_for_table_locks` and `ysql_enable_concurrent_ddl`, but not
+`ysql_enable_object_locking_infra`. The fixture sets that AutoFlag to false
+(`src/yb/yql/pgwrapper/pg_object_locks-test.cc:916`). The copy then serves, but no object-lock
+release makes the DDL commit wait for the copies. A new backend's startup preload, which since
+`7b0a6a9df2d` reads `pg_database` from the copy, runs 24 ms after the `CREATE DATABASE` commit and
+fails with `database "testdb" does not exist`. On an upgraded cluster this AutoFlag stays false
+until finalize, so the same window exists in production between the binary upgrade and finalize.
+
+### Row G: apply-blocking test flags
+
+`TEST_transaction_ignore_applying_probability=1.0`, `TEST_disable_apply_committed_transactions` and
+`TEST_block_apply_intent` are process-wide. In a MiniCluster master runs in the same process, so
+the DDL's intents on master's sys catalog are never applied either. The copy's poll of
+`GetSysCatalogChanges` then takes its full 30 s timeout, the copy's complete time stays just below
+the DDL, and the lock release fails with "Local catalog copy did not catch up to ... before
+publishing catalog versions" (`src/yb/tserver/ts_local_lock_manager.cc:577-593`). The DDL's
+exclusive lock is still held, and the next DML waits in `LockAcquireExtended` until the test is
+killed. The same wait would occur in production if master's sys catalog apply stalled; that is not
+verified.
+
+### Row H: the heartbeat gate can hold back every report, so a version bump never reaches the tserver
+
+**Root cause, reproduced.** This is `todos.md` T1. A catalog version that no DDL lock release carries
+(here `yb_increment_all_db_catalog_versions`, which `LibPqTestBase::BumpCatalogVersion` uses)
+reaches a tserver only through the heartbeat. The heartbeat gate
+(`src/yb/tserver/heartbeater.cc:560-573`) publishes master's versions only when the copy's complete
+time C is at or above the response's `db_catalog_versions_read_time`. Otherwise it skips the whole
+report and asks for an immediate poll. That read time is the time of master's last version-cache
+refresh, which master repeats every half heartbeat interval, so it moves forward on every
+heartbeat. The immediate poll moves C to just after the skipped heartbeat, and the next heartbeat
+brings a read time about one interval newer again. A copy that lags by more than the refresh age at
+the moment of each heartbeat is therefore skipped on every heartbeat, and the version is never
+published.
+
+Launch 173734's CI log has no daemon lines at all during the 10 s wait (`CachedVersion`, log lines
+2191-2192 are adjacent), so the gate is not visible there. A local run with defaults passed; each
+bump took 1.0-1.15 s. With the copy made to lag, `--local_catalog_poll_interval_ms=1500`,
+`PgBackendsTest.CachedVersion` fails exactly as in CI ("wait for catalog version 2 to propagate
+didn't complete within 10015ms"), and ts-1 logs a skip on all 10 heartbeats of the window:
+
+```
+heartbeat   master's read time    copy's C at the heartbeat   C after the immediate poll
+02:57:40    02:57:40.507826       02:57:39.815811             02:57:40.639983
+02:57:41    02:57:41.508678       02:57:40.639983             02:57:41.644269
+02:57:42    02:57:42.509456       02:57:41.644269             02:57:42.647313
+...         (10 of 10 heartbeats skipped, 02:57:39.88 .. 02:57:49.92)
+```
+
+In CI the copy lags for a different reason, CI load, and the default poll interval applies. In
+launch 169670 `CachedVersion` failed 6 of 7 attempts and `MultipleWaiters` 6 of 8. T1's planned fix
+removes the dependence on timing: compare the copy's applied version A[db] with each published
+version instead of C with a read time, and hold the report until the copy catches up instead of
+skipping it.
+
+**Severity: High.** Versions bumped outside a lock release stay unpublished on that tserver for as
+long as the copy lags. Other effects, such as waits on the tserver's reported version, are not
+examined here.
+
+### Row I: `TestOneTServerDown` is not reproduced and shows no link to the copy
+
+In CI the `template1` relcache-init backend on ts-3 (pid 530127) acquired its session at
+23:37:21.725 and then logged nothing until it was cancelled at teardown. The same millisecond ts-3
+logged `Unable to find the leader for {transactions_tablet_id2}`, whose leader was on the stopped
+ts-2, and later the same for `{transactions_tablet_id3}`. Locally the same backend reads
+`pg_database` from the copy, requests a new transaction (`NextTxnMetaForPlain`), and starts its
+preload, all within about 40 ms. A new transaction becomes ready once its status tablet has been
+looked up (`LookupTabletDone`, `src/yb/client/transaction.cc:1898-1940`), without waiting for that
+tablet's leader. The test passed 11 of 11 local runs (release, routing log on); three of those runs
+also logged a leaderless lookup during the query. The cause of the CI stall is not established, and
+nothing in the log ties it to the copy.
