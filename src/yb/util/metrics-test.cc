@@ -69,7 +69,7 @@ DECLARE_bool(TEST_enable_sync_points);
 namespace yb {
 
 METRIC_DEFINE_entity(cdcsdk);
-METRIC_DEFINE_entity(table);
+METRIC_DECLARE_entity(table);
 METRIC_DEFINE_entity(tablet);
 METRIC_DEFINE_entity(test_entity);
 METRIC_DEFINE_entity(xcluster);
