@@ -14,6 +14,7 @@ include $(top_builddir)/src/Makefile.global
 
 OBJS = \
 	yb_inheritscache.o \
+	yb_preload_exclusion.o \
 	yb_tuplecache.o \
 	\
 	attoptcache.o \

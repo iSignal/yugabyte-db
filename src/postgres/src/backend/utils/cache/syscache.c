@@ -99,6 +99,7 @@
 #include "utils/fmgroids.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/yb_preload_exclusion.h"
 #include "yb/yql/pggate/ybc_gflags.h"
 #include "yb_internal_conn.h"
 #include <assert.h>
@@ -1344,6 +1345,7 @@ YbPreloadCatalogCache(int cache_id, int idx_cache_id)
 											  NULL /* key */ );
 
 	size_t		scanned = 0;
+	size_t		excluded = 0;
 	instr_time	start;
 
 	if (yb_debug_log_catcache_events)
@@ -1358,6 +1360,11 @@ YbPreloadCatalogCache(int cache_id, int idx_cache_id)
 			break;
 
 		scanned++;
+		if (YbIsPreloadExcludedTuple(cache->cc_reloid, ntp))
+		{
+			excluded++;
+			continue;
+		}
 		SetCatCacheTuple(cache, ntp, RelationGetDescr(relation));
 
 		if (idx_cache)
@@ -1539,19 +1546,22 @@ YbPreloadCatalogCache(int cache_id, int idx_cache_id)
 
 		INSTR_TIME_SET_CURRENT(duration);
 		INSTR_TIME_SUBTRACT(duration, start);
-		elog(LOG, "YbPreloadCatalogCache: %ld entries added for "
+		elog(LOG, "YbPreloadCatalogCache: %ld entries added (%ld excluded) for "
 			 "cache id %d, index oid %d (relation %s), took %ld us",
-			 scanned, cache->id, cache->cc_indexoid, cache->cc_relname,
-			 INSTR_TIME_GET_MICROSEC(duration));
+			 scanned - excluded, excluded, cache->id, cache->cc_indexoid,
+			 cache->cc_relname, INSTR_TIME_GET_MICROSEC(duration));
 	}
 
 	/*
 	 * Done: mark cache(s) as loaded. We can only safely set yb_cc_is_fully_loaded
-	 * if we did full preloading; minimal preloading doesn't load user objects.
+	 * if we did full preloading; minimal preloading doesn't load user objects,
+	 * and a cache missing excluded relations' tuples must keep going to the
+	 * catalog on a miss.
 	 */
 	if (!YBCIsInitDbModeEnvVarSet() &&
 		YbNeedAdditionalCatalogTables() &&
-		!YbUseMinimalCatalogCachesPreload())
+		!YbUseMinimalCatalogCachesPreload() &&
+		excluded == 0)
 	{
 		cache->yb_cc_is_fully_loaded = true;
 		if (idx_cache)

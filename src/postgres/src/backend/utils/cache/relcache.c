@@ -116,6 +116,7 @@
 #include "utils/partcache.h"
 #include "utils/relcache.h"
 #include "utils/yb_inheritscache.h"
+#include "utils/yb_preload_exclusion.h"
 #include "utils/yb_tuplecache.h"
 #include "yb/yql/pggate/util/ybc_guc.h"
 #include "yb/yql/pggate/ybc_gflags.h"
@@ -1465,6 +1466,9 @@ YBLoadRelations(YbUpdateRelationCacheState *state)
 		Oid			relid = relp->oid;
 
 		if (state->sys_relations_only && !IsSystemClass(relid, relp))
+			continue;
+
+		if (YbIsPreloadExcludedRelation(relid))
 			continue;
 
 		++num_tuples;
@@ -3205,7 +3209,7 @@ YbGetRelCacheInitFileRevalidationFailed()
 }
 
 static YbcStatus
-YbPreloadRelCacheImpl(YbRunWithPrefetcherContext *ctx)
+YbDoPreloadRelCache(YbRunWithPrefetcherContext *ctx)
 {
 	YbNumRelCachePreloads++;
 	int log_level =
@@ -3261,6 +3265,8 @@ YbPreloadRelCacheImpl(YbRunWithPrefetcherContext *ctx)
 
 	if (status)
 		return status;
+
+	YbBeginPreloadExclusion(log_level);
 
 	/*
 	 * The preloading catalog cache before processing relations will help to
@@ -3368,6 +3374,23 @@ YbPreloadRelCacheImpl(YbRunWithPrefetcherContext *ctx)
 	YbUpdateCatalogCacheVersion(YbGetMasterCatalogVersion());
 	elog(log_level, "Preloading relcache complete");
 	return NULL;
+}
+
+static YbcStatus
+YbPreloadRelCacheImpl(YbRunWithPrefetcherContext *ctx)
+{
+	YbcStatus	status;
+
+	PG_TRY();
+	{
+		status = YbDoPreloadRelCache(ctx);
+	}
+	PG_FINALLY();
+	{
+		YbEndPreloadExclusion();
+	}
+	PG_END_TRY();
+	return status;
 }
 
 void
@@ -9698,8 +9721,11 @@ write_relcache_init_file(bool shared)
 
 	/*
 	 * YB mode uses local-tserver prefetching instead of relcache file.
+	 * A backend with ysql_catalog_preload_exclude_schemas applied never
+	 * writes the file, which is shared with backends of other roles.
 	 */
-	if (IsYugaByteEnabled() && YbCatalogPreloadRequired())
+	if (IsYugaByteEnabled() &&
+		(YbCatalogPreloadRequired() || YbPreloadExclusionConfigured()))
 		return;
 
 	/*
