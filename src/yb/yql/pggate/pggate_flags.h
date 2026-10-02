@@ -47,6 +47,7 @@ DECLARE_bool(ysql_serializable_isolation_for_ddl_txn);
 DECLARE_bool(ysql_sleep_before_retry_on_txn_conflict);
 DECLARE_bool(TEST_yb_lwlock_crash_after_acquire_pg_stat_statements_reset);
 DECLARE_bool(ysql_enable_read_request_caching);
+DECLARE_bool(ysql_enable_catcache_response_caching);
 DECLARE_bool(ysql_enable_create_database_oid_collision_retry);
 DECLARE_bool(ysql_use_relcache_file);
 DECLARE_bool(ysql_use_optimized_relcache_update);

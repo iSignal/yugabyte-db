@@ -295,6 +295,12 @@ message TSHeartbeatResponsePB {
   optional tserver.DBCatalogVersionDataPB db_catalog_version_data = 20;
   optional tserver.DBCatalogInvalMessagesDataPB db_catalog_inval_messages_data = 28;
 
+  // Catalog version proof times (the catalog version watermark) for response-cache population
+  // reads. Unlike db_catalog_version_data this is sent on EVERY heartbeat (no fingerprint
+  // short-circuit): the latest-version guarantee must keep advancing even when versions are
+  // unchanged.
+  optional tserver.DBCatalogVersionProofDataPB db_catalog_version_proof_data = 32;
+
   optional encryption.UniverseKeyRegistryPB universe_key_registry = 11;
 
   optional cdc.ConsumerRegistryPB consumer_registry = 12;

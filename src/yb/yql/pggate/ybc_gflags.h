@@ -32,6 +32,7 @@ typedef struct {
   const bool*     ysql_sleep_before_retry_on_txn_conflict;
   const bool*     ysql_colocate_database_by_default;
   const bool*     ysql_enable_read_request_caching;
+  const bool*     ysql_enable_catcache_response_caching;
   const bool*     ysql_enable_profile;
   const bool*     ysql_disable_global_impact_ddl_statements;
   const bool*     ysql_minimal_catalog_caches_preload;

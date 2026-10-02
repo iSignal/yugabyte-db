@@ -225,6 +225,18 @@ typedef struct YbScanDescData
 	bool		quit_scan;
 
 	YBParallelPartitionKeys pscan;
+
+	/*
+	 * When non-NULL, the scan's response is cached at the tserver under
+	 * PgResponseCache using this key, enabling cross-backend sharing of a
+	 * keyless full-table catalog scan. Set by catcache/relcache miss scans
+	 * (see ybc_systable_beginscan_with_cache_key). The key prefix encodes
+	 * "<reloid>:<indexoid>:<catalog_version>"; pggate appends the serialized
+	 * read request to form the full key.
+	 */
+	const char *response_cache_key;
+	/* Catalog version the response cache key is keyed at (watermark population read times). */
+	uint64_t	response_cache_catalog_version;
 } YbScanDescData;
 
 extern void ybc_free_ybscan(YbScanDesc ybscan);
@@ -240,6 +252,31 @@ extern SysScanDesc ybc_systable_beginscan(Relation relation,
 										  Snapshot snapshot,
 										  int nkeys,
 										  ScanKey key);
+/*
+ * Like ybc_systable_beginscan, but when cache_response is true, issues a response-cacheable scan
+ * (so the response can be cached at the tserver and shared across backends). By default this is a
+ * KEYLESS full-table scan, with (nkeys, key) applied locally in PG via HeapKeyTest. If the relation
+ * is configured for prefix keying (yb_catalog_cache_key_columns), the leading key column(s) are
+ * bound on the scan and appended to the cache key, so the cached scan covers only that prefix; the
+ * remaining keys are still filtered locally. Either way systable_getnext yields only the matching
+ * tuples, so callers' scan loops are unchanged. The response cache key is built here from the ACTUAL
+ * scan target (base-table/PK vs a specific secondary index) so that scans returning rows in
+ * different orders are cached separately. cache_response=false behaves identically to
+ * ybc_systable_beginscan.
+ */
+extern SysScanDesc ybc_systable_beginscan_with_cache_key(Relation relation,
+														 Oid indexId,
+														 bool indexOK,
+														 Snapshot snapshot,
+														 int nkeys,
+														 ScanKey key,
+														 bool cache_response);
+/*
+ * Whether the scan's most recent read was served from the tserver response cache (true) vs read
+ * from master (false). Meaningful only for response-cache-backed scans; false otherwise. Must be
+ * called while the scan is still open (before systable_endscan).
+ */
+extern bool ybc_systable_scan_response_cache_hit(SysScanDesc scan);
 extern SysScanDesc ybc_systable_begin_default_scan(Relation relation,
 												   Oid indexId,
 												   bool indexOK,

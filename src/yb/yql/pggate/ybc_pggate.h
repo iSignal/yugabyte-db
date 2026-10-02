@@ -720,6 +720,16 @@ YbcStatus YBCPgSetForwardScan(YbcPgStatement handle, bool is_forward_scan);
 // Set prefix length for distinct index scans.
 YbcStatus YBCPgSetDistinctPrefixLength(YbcPgStatement handle, int distinct_prefix_length);
 
+// Set the response cache key for a catcache/relcache miss scan, enabling the tserver to cache the
+// keyless full-table scan response and share it across backends at the same catalog version.
+YbcStatus YBCPgSetResponseCacheKey(
+    YbcPgStatement handle, const char* cache_key, uint64_t catalog_version,
+    uint32_t version_db_oid);
+
+// Reports whether the most recent Perform for this scan was served from the tserver response cache
+// (true) or read from master (false). Used to log the source of a catcache/relcache miss.
+YbcStatus YBCPgGetResponseCacheHit(YbcPgStatement handle, bool *response_cache_hit);
+
 YbcStatus YBCPgExecSelect(YbcPgStatement handle, const YbcPgExecParameters *exec_params);
 
 // Gets the ybctids from a request. Returns a vector of all the results.
@@ -779,6 +789,12 @@ YbcStatus YBCPgGetSelfActiveTransaction(YbcPgUuid *txn_id, bool *is_null);
 YbcStatus YBCPgActiveTransactions(YbcPgSessionTxnInfo *infos, size_t num_infos);
 bool YBCPgIsDdlMode();
 bool YBCPgIsDdlModeWithRegularTransactionBlock();
+/*
+ * True once this session has written to a ysql catalog table outside DDL mode. Such writes do not
+ * bump the catalog version, so catalog reads in this session must bypass the version-keyed response
+ * cache for the rest of the session (see YbShouldResponseCacheCatalogRead).
+ */
+bool YBCPgHasNonDdlCatalogWrites();
 bool YBCCurrentTransactionUsesFastPath();
 bool YBCIsLegacyModeForCatalogOps();
 

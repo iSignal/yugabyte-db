@@ -17,6 +17,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "yb/common/pgsql_protocol.fwd.h"
@@ -134,6 +135,16 @@ class PgDmlRead : public PgDml {
 
   void UpgradeDocOp(PgDocOp::SharedPtr doc_op);
 
+  // Sets the prefix of the tserver response cache key for this read (catcache/relcache miss keyless
+  // full scan). The full key is this prefix plus the serialized read request. Empty => not cached.
+  void SetResponseCacheKey(
+      const char* cache_key, uint64_t catalog_version, uint32_t version_db_oid);
+
+  // True when the most recent Perform for this read was served from the tserver response cache.
+  [[nodiscard]] bool ResponseCacheHit() const {
+    return doc_op_ && doc_op_->response_cache_hit();
+  }
+
   [[nodiscard]] const LWPgsqlReadRequestPB* read_req() const { return read_req_.get(); }
 
   [[nodiscard]] bool IsReadFromYsqlCatalog() const;
@@ -217,6 +228,11 @@ class PgDmlRead : public PgDml {
   MergeSortKeysPtr merge_sort_keys_;
 
   std::optional<PgReadRange> scan_range_;
+
+  // Prefix of the response cache key for catcache/relcache miss reads; empty if not cached.
+  std::string response_cache_key_;
+  uint64_t response_cache_catalog_version_ = 0;
+  uint32_t response_cache_version_db_oid_ = 0;
 };
 
 }  // namespace yb::pggate

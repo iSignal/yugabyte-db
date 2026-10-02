@@ -3054,12 +3054,14 @@ Result<TableSizeInfo> YBClient::Data::GetTableDiskSize(
 }
 
 Status YBClient::Data::ReportYsqlDdlTxnStatus(
-    const TransactionMetadata& txn, bool is_committed, const CoarseTimePoint& deadline) {
+    const TransactionMetadata& txn, bool is_committed, bool has_docdb_schema_changes,
+    const CoarseTimePoint& deadline) {
   master::ReportYsqlDdlTxnStatusRequestPB req;
   master::ReportYsqlDdlTxnStatusResponsePB resp;
 
   req.set_transaction_id(txn.transaction_id.data(), txn.transaction_id.size());
   req.set_is_committed(is_committed);
+  req.set_has_docdb_schema_changes(has_docdb_schema_changes);
   RETURN_NOT_OK(SyncLeaderMasterRpc(
       deadline, req, &resp, "ReportYsqlDdlTxnStatus",
       &master::MasterDdlProxy::ReportYsqlDdlTxnStatusAsync));

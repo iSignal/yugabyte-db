@@ -226,6 +226,16 @@ DEFINE_RUNTIME_AUTO_PG_FLAG(bool, enable_object_locking_infra, kLocalPersisted, 
     "during upgrade. Both this flag and enable_object_locking_for_table_locks "
     "must be true to enable the feature.");
 
+DEFINE_RUNTIME_bool(ysql_enable_catalog_version_push_on_all_ddl, false,
+    "When true (and object locking is disabled), PG reports EVERY catalog-version-bumping DDL to "
+    "the master at commit - including DDLs with no DocDB schema changes (e.g. CREATE ROLE, GRANT) - "
+    "and the master synchronously pushes the new catalog version (and invalidation messages) to all "
+    "tservers via ReleaseObjectLocks, keeping the tserver catcache response cache consistent across "
+    "nodes without waiting for the next heartbeat. When false (the default), only DDLs with DocDB "
+    "schema changes are reported and the master does not push the catalog version to any tserver for "
+    "any DDL (the pre-existing behavior). Defined here in common flags so both the master and the "
+    "tserver/PG side gate on the same value.");
+
 DEFINE_RUNTIME_bool(pg_client_use_shared_memory, !yb::kIsMac,
                     "Use shared memory for executing read and write pg client queries");
 

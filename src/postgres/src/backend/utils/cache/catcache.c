@@ -2041,6 +2041,8 @@ SearchCatCacheMiss(CatCache *cache,
 	CatCTup    *ct;
 	bool		stale;
 	Datum		arguments[CATCACHE_MAXKEYS];
+	bool		yb_cache_response = false;
+	bool		yb_served_from_cache = false;
 
 	/* Initialize local parameter array */
 	arguments[0] = v1;
@@ -2122,12 +2124,19 @@ SearchCatCacheMiss(CatCache *cache,
 			cur_skey[2].sk_argument = v3;
 			cur_skey[3].sk_argument = v4;
 
-			scandesc = systable_beginscan(relation,
-										  cache->cc_indexoid,
-										  IndexScanOK(cache, cur_skey),
-										  NULL,
-										  nkeys,
-										  cur_skey);
+			/*
+			 * If response caching applies (pg_attribute), issue a keyless full
+			 * scan served from the shared tserver cache and filter to cur_skey
+			 * locally; otherwise scan with the key pushed to DocDB as usual.
+			 */
+			yb_cache_response = YbShouldResponseCacheCatalogRead();
+			scandesc = systable_beginscan_with_cache_key(relation,
+														 cache->cc_indexoid,
+														 IndexScanOK(cache, cur_skey),
+														 NULL,
+														 nkeys,
+														 cur_skey,
+														 yb_cache_response);
 
 			ct = NULL;
 			stale = false;
@@ -2149,10 +2158,26 @@ SearchCatCacheMiss(CatCache *cache,
 				break;			/* assume only one match */
 			}
 
+			/*
+			 * Record whether the keyless scan was served from the tserver
+			 * response cache (vs read from master) before ending the scan, so we
+			 * can log the source of this miss below.
+			 */
+			if (yb_cache_response)
+				yb_served_from_cache =
+					ybc_systable_scan_response_cache_hit(scandesc);
+
 			systable_endscan(scandesc);
 		} while (stale);
 
 		table_close(relation, AccessShareLock);
+
+		if (yb_cache_response && yb_debug_log_catcache_events)
+			ereport(LOG,
+					(errmsg("catalog cache miss on cache with id %d (%s): %s",
+							cache->id, cache->cc_relname,
+							yb_served_from_cache ? "served from response cache"
+							: "read from master")));
 
 		if (IsYugaByteEnabled() && ct == NULL)
 			YbNumCatalogCacheNegMisses[
@@ -2565,6 +2590,8 @@ SearchCatCacheList(CatCache *cache,
 		ScanKeyData cur_skey[CATCACHE_MAXKEYS];
 		Relation	relation;
 		SysScanDesc scandesc;
+		bool		yb_cache_response = false;
+		bool		yb_served_from_cache = false;
 
 		if (yb_debug_log_catcache_events)
 		{
@@ -2630,12 +2657,14 @@ SearchCatCacheList(CatCache *cache,
 			cur_skey[2].sk_argument = v3;
 			cur_skey[3].sk_argument = v4;
 
-			scandesc = systable_beginscan(relation,
-										  cache->cc_indexoid,
-										  IndexScanOK(cache, cur_skey),
-										  NULL,
-										  nkeys,
-										  cur_skey);
+			yb_cache_response = YbShouldResponseCacheCatalogRead();
+			scandesc = systable_beginscan_with_cache_key(relation,
+														 cache->cc_indexoid,
+														 IndexScanOK(cache, cur_skey),
+														 NULL,
+														 nkeys,
+														 cur_skey,
+														 yb_cache_response);
 
 			/* The list will be ordered iff we are doing an index scan */
 			ordered = (scandesc->irel != NULL);
@@ -2705,10 +2734,25 @@ SearchCatCacheList(CatCache *cache,
 				ct->refcount++;
 			}
 
+			/*
+			 * Record whether the keyless scan was served from the tserver
+			 * response cache (vs read from master) before ending the scan.
+			 */
+			if (yb_cache_response)
+				yb_served_from_cache =
+					ybc_systable_scan_response_cache_hit(scandesc);
+
 			systable_endscan(scandesc);
 		} while (in_progress_ent.dead);
 
 		table_close(relation, AccessShareLock);
+
+		if (yb_cache_response && yb_debug_log_catcache_events)
+			ereport(LOG,
+					(errmsg("catalog cache list miss on cache with id %d (%s): %s",
+							cache->id, cache->cc_relname,
+							yb_served_from_cache ? "served from response cache"
+							: "read from master")));
 
 		/* Now we can build the CatCList entry. */
 		oldcxt = MemoryContextSwitchTo(CacheMemoryContext);

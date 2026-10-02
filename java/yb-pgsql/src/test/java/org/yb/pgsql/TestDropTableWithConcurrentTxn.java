@@ -52,6 +52,14 @@ public class TestDropTableWithConcurrentTxn extends BasePgSQLTest {
     // TODO(29141): Fix the test with txn ddl and enable.
     flagMap.put("ysql_yb_ddl_transaction_block_enabled", "false");
     flagMap.put("enable_object_locking_for_table_locks", "false");
+    // Disable the tserver catcache response cache for this suite. These tests assert specific
+    // outcomes for a DML issued concurrently with a DROP on another connection, assuming the DML
+    // reads the latest catalog. The response cache serves version-keyed catalog scans at the
+    // reader's own (transaction-pinned, object-locking-disabled) catalog version, so the DML can
+    // operate on a catalog snapshot that predates the DROP (e.g. trying to update an
+    // already-dropped index -> OBJECT_NOT_FOUND). The response cache is covered by PgCatalogPerfTest
+    // / PgLibPqTest's Catcache* tests; here we exercise the non-cached concurrent DDL/DML path.
+    flagMap.put("ysql_enable_catcache_response_caching", "false");
     return flagMap;
   }
 

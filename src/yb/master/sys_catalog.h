@@ -258,13 +258,22 @@ class SysCatalogTable {
                                   uint64_t* catalog_version,
                                   uint64_t* last_breaking_version);
   // Read the ysql catalog version info for all databases from the pg_yb_catalog_version
-  // catalog table.
+  // catalog table. If read_time_used is non-null it receives the hybrid time the snapshot was
+  // read at - the proof "these versions were current as of T" consumed by the catalog version
+  // watermark (response-cache population read-time rule, see pg_client_session.cc).
   Status ReadYsqlAllDBCatalogVersions(
       const TableId& ysql_catalog_table_id,
-      DbOidToCatalogVersionMap* versions);
+      DbOidToCatalogVersionMap* versions,
+      HybridTime* read_time_used = nullptr);
   // Read the ysql catalog cache invalidation messages info for all databases from the
-  // pg_yb_invalidation_messages catalog table.
-  Result<DbOidVersionToMessageListMap> ReadYsqlCatalogInvalationMessages();
+  // pg_yb_invalidation_messages catalog table. If commit_times is non-null it receives, per
+  // (db_oid, current_version), the commit hybrid time of that version's row (its DocHybridTime) -
+  // the exact commit(V) consumed by the catalog version watermark. If read_time_used is non-null it
+  // receives the hybrid time this (possibly restarted) read actually used - the watermark's
+  // guaranteed read time for the highest version.
+  Result<DbOidVersionToMessageListMap> ReadYsqlCatalogInvalationMessages(
+      DbOidVersionToCommitTimeMap* commit_times = nullptr,
+      HybridTime* read_time_used = nullptr);
 
   // Read the pg_class catalog table. There is a separate pg_class table in each
   // YSQL database, read the information in the pg_class table for the database
@@ -447,7 +456,8 @@ class SysCatalogTable {
   Status ReadYsqlCatalogInvalationMessagesImpl(
       const ReadHybridTime& read_time,
       HybridTime* read_restart_ht,
-      DbOidVersionToMessageListMap& messages);
+      DbOidVersionToMessageListMap& messages,
+      DbOidVersionToCommitTimeMap* commit_times);
 
   // During a batch write operation, if the max batch bytes have been exceeded, performs a write and
   // creates a new writer. To avoid running the expensive ByteSizeLong calculation too frequently,

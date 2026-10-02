@@ -77,6 +77,13 @@ class ObjectLockInfoManager {
       rpc::RpcContext rpc);
   void ReleaseLocksForTxn(const TransactionId& txn_id);
 
+  // Synchronously pushes the latest YSQL catalog versions (and invalidation messages) to every live
+  // tserver, reusing the ReleaseObjectLock RPC with an empty lock set. Used when object locking is
+  // disabled to propagate a version-bumping DDL's new catalog version at commit time instead of
+  // waiting for the next heartbeat (keeps the catcache response cache consistent cross-node).
+  // Best-effort per tserver; returns after all reachable tservers have been updated or the deadline.
+  Status UpdateTServersWithLatestCatalogVersion(CoarseTimePoint deadline);
+
   Status RefreshYsqlLease(
       const RefreshYsqlLeaseRequestPB& req, RefreshYsqlLeaseResponsePB& resp, rpc::RpcContext& rpc,
       const LeaderEpoch& epoch);

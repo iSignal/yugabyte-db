@@ -36,6 +36,14 @@ public class TestPgRegressPgAuth extends BasePgRegressTestPorted {
     flagMap.put("ysql_enable_reindex", "true");
     // (Auto-Analyze #28391) Restart read required
     flagMap.put("ysql_enable_auto_analyze", "false");
+    // yb.port.privileges manipulates pg_largeobject_metadata via yb_non_ddl_txn_for_sys_tables_allowed
+    // WITHOUT incrementing the catalog version (an artificial PG-compat pattern; real users of that
+    // GUC bump the version at the end). With no version bump, a fresh connection can be served a
+    // catalog snapshot (response cache, or preload's fixed snapshot) that predates the change, so the
+    // change is not visible - the same staleness preloading would exhibit for any preloaded table.
+    // Disable catcache response caching for this test rather than special-casing this non-realistic
+    // flow in the read path.
+    flagMap.put("ysql_enable_catcache_response_caching", "false");
     return flagMap;
   }
 

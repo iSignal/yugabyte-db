@@ -41,6 +41,7 @@
 #include "yb/util/status_format.h"
 
 #include "yb/yql/pggate/pg_column.h"
+#include "yb/yql/pggate/pg_doc_op.h"
 #include "yb/yql/pggate/pg_expr.h"
 #include "yb/yql/pggate/pg_select_index.h"
 #include "yb/yql/pggate/pg_table.h"
@@ -203,6 +204,13 @@ void PgDmlRead::SetDistinctPrefixLength(int distinct_prefix_length) {
   } else {
     read_req_->set_prefix_length(distinct_prefix_length);
   }
+}
+
+void PgDmlRead::SetResponseCacheKey(
+    const char* cache_key, uint64_t catalog_version, uint32_t version_db_oid) {
+  response_cache_key_ = cache_key;
+  response_cache_catalog_version_ = catalog_version;
+  response_cache_version_db_oid_ = version_db_oid;
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -537,6 +545,16 @@ Status PgDmlRead::Exec(const YbcPgExecParameters* exec_params) {
 
   if (auto* secondary_index = SecondaryIndexQuery(); secondary_index) {
     RETURN_NOT_OK(secondary_index->AddBaseYbctidTarget());
+  }
+
+  // Route this read through the tserver response cache, if a key was set (catcache/relcache miss
+  // keyless full scan). The read op installs a custom sender that builds the full cache key from
+  // this prefix plus the serialized read request.
+  if (!response_cache_key_.empty()) {
+    if (auto* read_op = dynamic_cast<PgDocReadOp*>(doc_op_.get()); read_op) {
+      read_op->SetResponseCacheKey(
+          response_cache_key_, response_cache_catalog_version_, response_cache_version_db_oid_);
+    }
   }
 
   RETURN_NOT_OK(InitDocOp(doc_op_init_params));

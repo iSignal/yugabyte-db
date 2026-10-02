@@ -981,11 +981,27 @@ Status SysCatalogTable::ReadYsqlDBCatalogVersion(
 }
 
 Status SysCatalogTable::ReadYsqlAllDBCatalogVersions(
-    const TableId& ysql_catalog_table_id, DbOidToCatalogVersionMap* versions) {
+    const TableId& ysql_catalog_table_id, DbOidToCatalogVersionMap* versions,
+    HybridTime* read_time_used) {
   TRACE_EVENT0("master", "ReadYsqlAllDBCatalogVersions");
-  return ReadYsqlDBCatalogVersionImpl(
-      ysql_catalog_table_id, kInvalidOid, /*catalog_version=*/nullptr,
-      /*last_breaking_version=*/nullptr, versions);
+  // The catalog-version proof-time machinery (catalog version watermark; see
+  // YbShouldResponseCacheCatalogRead and the response-cache population read-time rule in
+  // pg_client_session.cc) needs the hybrid time this snapshot of versions was read at: a
+  // successful read returning version V at time T is the proof "V was still current at T".
+  // Capture the read time the (possibly restarted) read actually used.
+  if (read_time_used) {
+    *read_time_used = HybridTime::kInvalid;
+  }
+  return ReadWithRestarts(
+      [this, &ysql_catalog_table_id, versions, read_time_used](
+          const ReadHybridTime& read_ht, HybridTime* read_restart_ht) -> Status {
+        if (read_time_used) {
+          *read_time_used = read_ht.read;
+        }
+        return SysCatalogTable::ReadYsqlDBCatalogVersionImplWithReadTime(
+            ysql_catalog_table_id, kInvalidOid, read_ht, read_restart_ht,
+            /*catalog_version=*/nullptr, /*last_breaking_version=*/nullptr, versions);
+      });
 }
 
 Status SysCatalogTable::ReadYsqlDBCatalogVersionImpl(
@@ -1855,18 +1871,25 @@ Result<MaxOidPerSpace> SysCatalogTable::ReadHighestPreservableOids(uint32_t data
 }
 
 Result<DbOidVersionToMessageListMap>
-SysCatalogTable::ReadYsqlCatalogInvalationMessages() {
+SysCatalogTable::ReadYsqlCatalogInvalationMessages(
+    DbOidVersionToCommitTimeMap* commit_times, HybridTime* read_time_used) {
   if (RandomActWithProbability(FLAGS_TEST_simulate_catalog_message_read_failure)) {
     return STATUS(InternalError, "Injected pg_yb_invalidation_messages read failure for testing.");
   }
 
   TRACE_EVENT0("master", "ReadYsqlCatalogInvalationMessages");
   DbOidVersionToMessageListMap messages;
+  if (read_time_used) {
+    *read_time_used = HybridTime::kInvalid;
+  }
   RETURN_NOT_OK(ReadWithRestarts(
-      [this, &messages](
+      [this, &messages, commit_times, read_time_used](
           const ReadHybridTime& read_ht, HybridTime* read_restart_ht) -> Status {
+        if (read_time_used) {
+          *read_time_used = read_ht.read;
+        }
         return SysCatalogTable::ReadYsqlCatalogInvalationMessagesImpl(
-            read_ht, read_restart_ht, messages);
+            read_ht, read_restart_ht, messages, commit_times);
       }));
   return messages;
 }
@@ -1874,7 +1897,8 @@ SysCatalogTable::ReadYsqlCatalogInvalationMessages() {
 Status SysCatalogTable::ReadYsqlCatalogInvalationMessagesImpl(
     const ReadHybridTime& read_time,
     HybridTime* read_restart_ht,
-    DbOidVersionToMessageListMap& messages) {
+    DbOidVersionToMessageListMap& messages,
+    DbOidVersionToCommitTimeMap* commit_times) {
 
   auto read_data = VERIFY_RESULT(TableReadData(kTemplate1Oid, kPgYbInvalidationMessagesTableOid,
                                  read_time));
@@ -1882,6 +1906,9 @@ Status SysCatalogTable::ReadYsqlCatalogInvalationMessagesImpl(
   auto tablet = tablet_peer()->shared_tablet_maybe_null();
   SCHECK(tablet, ShutdownInProgress, "SysConfig is shutting down.");
   messages.clear();
+  if (commit_times) {
+    commit_times->clear();
+  }
   const auto db_oid_col_id = VERIFY_RESULT(schema.ColumnIdByName(kDbOidColumnName)).rep();
   const auto current_version_col_id = VERIFY_RESULT(
       schema.ColumnIdByName(kCurrentVersionColumnName)).rep();
@@ -1922,6 +1949,16 @@ Status SysCatalogTable::ReadYsqlCatalogInvalationMessagesImpl(
         messages.insert(std::make_pair(std::make_pair(db_oid, current_version), message_list));
     // There should not be any duplicate (db_oid, current_version) because it is a primary key.
     DCHECK(insert_result.second);
+
+    // Each row in pg_yb_invalidation_messages is written exactly once (a fresh insert per catalog
+    // version bump, in the same transaction that increments the version), so the row's write time
+    // is the exact commit time of that version - the watermark's superseded-version proof.
+    if (commit_times) {
+      const auto commit_ht = iter->LastFetchedRowWriteTime();
+      if (commit_ht.is_valid()) {
+        (*commit_times)[std::make_pair(db_oid, current_version)] = commit_ht.ToUint64();
+      }
+    }
   }
   *read_restart_ht = VERIFY_RESULT(iter->GetReadRestartData()).restart_time;
   return Status::OK();

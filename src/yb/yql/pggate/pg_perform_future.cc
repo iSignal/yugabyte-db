@@ -72,7 +72,14 @@ Result<PerformFuture::Data> PerformFuture::Get(PgSession& session) {
   auto future = std::move(future_);
   auto result = future.Get();
   RETURN_NOT_OK(PatchStatus(result.status, relations_));
-  session.TrySetCatalogReadPoint(result.catalog_read_time);
+  // A response-cache hit replays a cached response that may carry the catalog read time from whenever
+  // the entry was first populated (possibly by another backend, long ago). Adopting it would pin this
+  // session's subsequent LIVE catalog reads to that stale instant. Treat a hit like a local catcache
+  // hit: serve the cached rows without moving the catalog read point. (Version-keying of the cache
+  // entry already guarantees the cached rows are a consistent snapshot for the current version.)
+  if (!result.response_cache_hit) {
+    session.TrySetCatalogReadPoint(result.catalog_read_time);
+  }
   auto& metrics = session.metrics();
   for (const auto& op : result.operations) {
     const auto* response = op->response();
@@ -80,7 +87,7 @@ Result<PerformFuture::Data> PerformFuture::Get(PgSession& session) {
       metrics.RecordRequestMetrics(response->metrics(), op->is_read());
     }
   }
-  return Data{std::move(result.response), result.used_in_txn_limit};
+  return Data{std::move(result.response), result.used_in_txn_limit, result.response_cache_hit};
 }
 
 } // namespace yb::pggate

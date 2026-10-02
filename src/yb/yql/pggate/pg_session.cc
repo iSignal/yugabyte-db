@@ -498,6 +498,17 @@ class PgSession::RunHelper {
       return PerformFuture();
     }
 
+    // A response-cache key is computed from the LONE read op, and a cache hit replays a single-op
+    // response. If buffered write ops were combined into this Perform (which happens when session
+    // typing routes a catalog read onto the regular session, e.g. under
+    // yb_non_ddl_txn_for_sys_tables_allowed - including before any catalog write has latched the
+    // session off the cache), a hit would answer a multi-op request with one response: "Wrong
+    // number of responses: 1, while N expected". A cache-keyed read must be alone in its Perform;
+    // otherwise issue the read uncached.
+    if (cache_options && ops_info_.num_ops_taken_from_buffer > 0) {
+      cache_options.reset();
+    }
+
     if (PREDICT_FALSE(yb_debug_log_docdb_requests)) {
       LOG_WITH_PREFIX(INFO) << "Flushing collected operations, using session type: "
                             << ToString(session_type_) << " num ops: " << ops_info_.ops.Size();
@@ -763,6 +774,8 @@ PgIsolationLevel PgSession::GetIsolationLevel() {
   return pg_txn_manager_->GetPgIsolationLevel();
 }
 
+bool PgSession::IsDdlMode() const { return pg_txn_manager_->IsDdlMode(); }
+
 bool PgSession::IsHashBatchingEnabled() {
   return yb_enable_hash_batch_in &&
       GetIsolationLevel() != PgIsolationLevel::SERIALIZABLE;
@@ -919,6 +932,10 @@ Result<PerformFuture> PgSession::Perform(BufferableOperations&& ops, PerformOpti
     caching_info.set_key_value(std::move(cache_options.key_value));
     if (cache_options.lifetime_threshold_ms) {
       caching_info.mutable_lifetime_threshold_ms()->set_value(*cache_options.lifetime_threshold_ms);
+    }
+    if (cache_options.catalog_version != 0) {
+      caching_info.set_catalog_version(cache_options.catalog_version);
+      caching_info.set_version_db_oid(cache_options.version_db_oid);
     }
   }
 
@@ -1145,6 +1162,17 @@ Result<PerformFuture> PgSession::DoRunAsync(
   const auto group_session_type = VERIFY_RESULT(GetRequiredSessionType(
       *pg_txn_manager_, first_table, **first_table_op.operation,
       non_ddl_txn_for_sys_tables_allowed));
+  // Only CATALOG-session reads may carry a response-cache key. A version-keyed cache entry must be
+  // populated from a snapshot consistent with the backend's catalog version - which the catalog
+  // session's pinned catalog read point provides. Reads rerouted onto the REGULAR session
+  // (yb_non_ddl_txn_for_sys_tables_allowed, major upgrade) read at the TRANSACTION snapshot
+  // instead; mid-statement autonomous DDL commits advance the version while the statement snapshot
+  // stays old, so such a read would populate the NEW version's entry with PRE-DDL content (e.g.
+  // a pg_class-by-oid scan missing a just-created masking view -> "could not open relation with
+  // OID ..."), poisoning that version for the whole cluster.
+  if (cache_options && group_session_type != SessionType::kCatalog) {
+    cache_options.reset();
+  }
   if (group_session_type != SessionType::kCatalog &&
       options.marker != std::optional(PgSessionRunOperationMarker::ExplicitRowLock)) {
     RETURN_NOT_OK(Flush(explicit_row_lock_buffer_));
@@ -1193,6 +1221,13 @@ Result<PerformFuture> PgSession::DoRunAsync(
         has_catalog_write_ops_in_ddl_mode_ =
             has_catalog_write_ops_in_ddl_mode_ ||
             (is_ddl && op->is_write() && is_ysql_catalog_table);
+        // Latch non-DDL catalog writes for the session's lifetime: they don't bump the catalog
+        // version, so version-keyed cached catalog scans can never reflect them. The latch makes
+        // this session's later catcache/relcache miss reads bypass the response cache (see
+        // HasNonDdlCatalogWrites / YbShouldResponseCacheCatalogRead).
+        has_non_ddl_catalog_writes_ =
+            has_non_ddl_catalog_writes_ ||
+            (!is_ddl && op->is_write() && is_ysql_catalog_table);
         return runner.Apply(table, op);
     };
   for (auto table_op = first_table_op; !table_op.IsEmpty(); table_op = generator()) {
@@ -1210,12 +1245,13 @@ Result<PerformFuture> PgSession::DoRunAsync(
 }
 
 Result<PerformFuture> PgSession::RunAsync(
-    std::span<const PgsqlOpPtr> ops, const PgTableDesc& table, const RunOptions& options) {
+    std::span<const PgsqlOpPtr> ops, const PgTableDesc& table, const RunOptions& options,
+    std::optional<CacheOptions>&& cache_options) {
   const auto generator = [i = ops.begin(), end = ops.end(), t = &table]() mutable {
       using TO = TableOperation<PgsqlOpPtr>;
       return i != end ? TO{.operation = &*i++, .table = t} : TO();
   };
-  return DoRunAsync(make_lw_function(generator), options);
+  return DoRunAsync(make_lw_function(generator), options, std::move(cache_options));
 }
 
 Result<PerformFuture> PgSession::RunAsync(

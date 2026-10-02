@@ -473,7 +473,8 @@ class YBClient::Data {
 
   // Provide the status of the transaction to YB-Master.
   Status ReportYsqlDdlTxnStatus(
-      const TransactionMetadata& txn, bool is_committed, const CoarseTimePoint& deadline);
+      const TransactionMetadata& txn, bool is_committed, bool has_docdb_schema_changes,
+      const CoarseTimePoint& deadline);
 
   Status IsYsqlDdlVerificationInProgress(
     const TransactionMetadata& txn,

@@ -577,7 +577,7 @@ DEFINE_test_flag(int32, delay_split_registration_secs, 0,
 
 DECLARE_bool(ysql_enable_colocated_tables_with_tablespaces);
 
-DEFINE_NON_RUNTIME_bool(enable_heartbeat_pg_catalog_versions_cache, true,
+DEFINE_NON_RUNTIME_bool(enable_heartbeat_pg_catalog_versions_cache, false,
     "Whether to enable the use of heartbeat catalog versions cache for the "
     "pg_yb_catalog_version table which can help to reduce the number of reads "
     "from the table. This is more useful when there are many databases and/or "
@@ -10966,8 +10966,65 @@ Status CatalogManager::GetYsqlAllDBCatalogVersionsImpl(DbOidToCatalogVersionMap*
   // (Master::get_ysql_db_oid_to_cat_version_info_map), which gates this call on a GetTableInfo
   // check itself. Reading directly here avoids a SharedLock on the catalog manager's main
   // mutex_ on every heartbeat-rate refresh.
-  return sys_catalog_->ReadYsqlAllDBCatalogVersions(kPgYbCatalogVersionTableId, versions);
+  RETURN_NOT_OK(sys_catalog_->ReadYsqlAllDBCatalogVersions(
+      kPgYbCatalogVersionTableId, versions));
+  return Status::OK();
 }
+
+namespace {
+
+// Delta (in raw HybridTime units) subtracted from the next-higher version's commit time to bound a
+// lower version's guaranteed read time strictly below it. Start at 1; revisit if it causes read
+// restarts.
+constexpr uint64_t kCatalogVersionGuaranteedTimeDeltaHt = 1;
+
+// Builds the catalog version watermark from each db's current catalog version (from
+// pg_yb_catalog_version) and the per-(db, version) commit times read out of
+// pg_yb_invalidation_messages, plus the read time of that read. For each db, with versions sorted
+// ascending v[0] < ... < v[n-1] (where v[n-1] is the current catalog version):
+//   - the current (highest) version gets `read_time` (the master's current read time): reading
+//     there reflects its catalog and there is no higher version to exclude. This is set even when
+//     the current version has no invalidation-message row (e.g. a quiescent cluster with no recent
+//     DDL), so version-keyed catalog reads can still be served from the response cache.
+//   - every lower version v[i] gets commit(v[i+1]) - delta: the last instant the catalog still
+//     reflected exactly v[i], strictly before v[i+1] committed. If v[i+1] is the current version
+//     and it has no commit time (no inval-message row), fall back to commit(v[i]) - the earliest
+//     instant that still reflects exactly v[i].
+// So guaranteed(V) lies in [commit(V), commit(V+1)).
+DbOidToCatalogVersionGuaranteedTimeMap ComputeCatalogVersionGuaranteedTimes(
+    const DbOidVersionToCommitTimeMap& commit_times,
+    const DbOidToCatalogVersionMap& current_versions, HybridTime read_time) {
+  // Group inval-message commit times by db (ascending version within each db).
+  std::map<uint32_t, std::vector<std::pair<uint64_t, uint64_t>>> by_db;
+  for (const auto& [db_version, commit_ht] : commit_times) {
+    by_db[db_version.first].emplace_back(db_version.second, commit_ht);
+  }
+
+  DbOidToCatalogVersionGuaranteedTimeMap result;
+  for (const auto& [db_oid, version_info] : current_versions) {
+    const auto current_version = version_info.current_version;
+    auto versions = by_db[db_oid];  // ascending inval versions (may be empty), copy.
+    // Ensure the current catalog version is present as the highest entry, even with no inval row.
+    if (versions.empty() || versions.back().first < current_version) {
+      versions.emplace_back(current_version, 0 /* commit_ht unknown; unused for the highest */);
+    }
+    auto& db_guaranteed = result[db_oid];
+    for (size_t i = 0; i < versions.size(); ++i) {
+      if (i + 1 == versions.size()) {
+        // Highest (current) version: read at the master's current read time.
+        db_guaranteed[versions[i].first] = read_time.ToUint64();
+      } else {
+        const auto next_commit = versions[i + 1].second;
+        db_guaranteed[versions[i].first] = next_commit != 0
+            ? next_commit - kCatalogVersionGuaranteedTimeDeltaHt
+            : versions[i].second;  // own commit: in [commit(v), commit(v+1))
+      }
+    }
+  }
+  return result;
+}
+
+}  // namespace
 
 // Note: versions and fingerprint are outputs.
 Status CatalogManager::GetYsqlAllDBCatalogVersions(
@@ -11003,28 +11060,29 @@ Status CatalogManager::GetYsqlAllDBCatalogVersions(
 }
 
 Result<DbOidVersionToMessageListMap>
-CatalogManager::GetYsqlCatalogInvalationMessagesImpl() {
-  return sys_catalog_->ReadYsqlCatalogInvalationMessages();
+CatalogManager::GetYsqlCatalogInvalationMessagesImpl(
+    DbOidVersionToCommitTimeMap* commit_times, HybridTime* read_time_used) {
+  return sys_catalog_->ReadYsqlCatalogInvalationMessages(commit_times, read_time_used);
 }
 
 Result<DbOidVersionToMessageListMap> CatalogManager::GetYsqlCatalogInvalationMessages(
-    bool use_cache) {
+    const DbOidToCatalogVersionMap* current_versions,
+    DbOidToCatalogVersionGuaranteedTimeMap* guaranteed_times) {
   if (!FLAGS_ysql_yb_enable_invalidation_messages) {
     return DbOidVersionToMessageListMap();
   }
-  if (use_cache) {
-    SharedLock lock(heartbeat_pg_catalog_versions_cache_mutex_);
-    // We expect that the only caller uses this cache is the heartbeat service.
-    // Note that if the periodic background refresh task has not populated
-    // heartbeat_pg_inval_messages_cache_ yet after the master leader starts, or
-    // when the last periodic reading of pg_yb_invalidation_messages has failed, it will
-    // be std::nullopt. Returning empty map is fine, as invalidation messages are only
-    // used as an optimization and if not there PG simply falls back to full catalog
-    // refresh.
-    return heartbeat_pg_inval_messages_cache_.has_value() ? *heartbeat_pg_inval_messages_cache_
-                                                          : DbOidVersionToMessageListMap();
+  // Always read pg_yb_invalidation_messages fresh: the read yields both the per-version invalidation
+  // message lists and the per-version commit times, plus the read's own hybrid time, from which the
+  // catalog version watermark (guaranteed read times) is derived. current_versions supplies each
+  // db's current catalog version so the watermark covers it even with no inval-message row.
+  DbOidVersionToCommitTimeMap commit_times;
+  HybridTime read_time;
+  auto messages = GetYsqlCatalogInvalationMessagesImpl(&commit_times, &read_time);
+  if (messages.ok() && guaranteed_times && current_versions) {
+    *guaranteed_times =
+        ComputeCatalogVersionGuaranteedTimes(commit_times, *current_versions, read_time);
   }
-  return GetYsqlCatalogInvalationMessagesImpl();
+  return messages;
 }
 
 Status CatalogManager::InitializeTransactionTablesConfig(int64_t term) {

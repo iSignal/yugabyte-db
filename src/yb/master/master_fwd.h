@@ -169,6 +169,20 @@ using RetryingTSRpcTaskWithTablePtr = std::shared_ptr<RetryingTSRpcTaskWithTable
 struct PgCatalogVersion;
 using DbOidToCatalogVersionMap = std::map<uint32_t, PgCatalogVersion>;
 
+// (db_oid, catalog_version) -> commit hybrid time (raw uint64), harvested from the per-row write
+// times of pg_yb_invalidation_messages (one immutable row per version bump, so its write time is
+// the exact commit time of that version).
+using DbOidVersionToCommitTimeMap = std::map<std::pair<uint32_t, uint64_t>, uint64_t>;
+
+// The catalog version watermark sent to tservers: per database, for each catalog version V, the
+// guaranteed read time - a hybrid time (raw uint64) at which a read reflects exactly version V's
+// catalog content. The tserver response cache reads version-keyed catalog scans at this time.
+// Derived purely from pg_yb_invalidation_messages: the highest version uses the master's current
+// read time; every lower version V uses commit(V+1) minus a small delta (so the read lands in
+// [commit(V), commit(V+1))).
+using DbOidToCatalogVersionGuaranteedTimeMap =
+    std::map<uint32_t, std::map<uint64_t, uint64_t>>;
+
 // This map represents pg_yb_invalidation_messages: (db_oid, current_version) => inval messages.
 // If the message value is nullopt, it means a SQL null value. If it is empty string, it means
 // there is no invalidation messages associated with this (db_oid, current_version). A PG

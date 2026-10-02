@@ -324,6 +324,7 @@ DEFINE_RUNTIME_bool(reject_writes_when_disk_full, kRejectWritesWhenDiskFullDefau
     "Reject incoming writes to the tablet if we are running out of disk space.");
 
 DECLARE_bool(enable_object_locking_for_table_locks);
+DECLARE_bool(ysql_yb_enable_invalidation_messages);
 DECLARE_bool(ysql_enable_object_locking_infra);
 
 METRIC_DEFINE_gauge_uint64(server, ts_split_op_added, "Split OPs Added to Leader",
@@ -3936,8 +3937,25 @@ void TabletServiceImpl::ReleaseObjectLocks(
   TRACE("Start ReleaseObjectLocks");
   VLOG(2) << "Received ReleaseObjectLocks RPC: " << req->DebugString();
   if (!FLAGS_enable_object_locking_for_table_locks) {
-    LOG_WITH_FUNC(INFO)
-        << "Flag enable_object_locking_for_table_locks disabled. Ignoring release request.";
+    // Object locking is disabled, so there are no locks to release. However the master still uses
+    // this RPC (with no object_locks) to push the latest catalog version synchronously at DDL
+    // commit, so backends across all tservers observe a version-bumping DDL without waiting for the
+    // next heartbeat (keeps the catcache response cache fresh cross-node). Apply that payload here;
+    // do not run the (disabled) lock-release path or the lease check.
+    if (req->has_db_catalog_version_data()) {
+      if (FLAGS_ysql_yb_enable_invalidation_messages && req->has_db_catalog_inval_messages_data()) {
+        server_->SetYsqlDBCatalogVersionsWithInvalMessages(
+            req->db_catalog_version_data(), req->db_catalog_inval_messages_data());
+      } else {
+        server_->SetYsqlDBCatalogVersions(req->db_catalog_version_data());
+      }
+    }
+    // Apply the catalog version watermark too, so a backend on this tserver can serve version-keyed
+    // catcache reads at the just-bumped version immediately, rather than waiting for the next
+    // heartbeat to deliver the guaranteed read time.
+    if (req->has_db_catalog_version_proof_data()) {
+      server_->SetYsqlDBCatalogVersionProofs(req->db_catalog_version_proof_data());
+    }
     return context.RespondSuccess();
   }
 

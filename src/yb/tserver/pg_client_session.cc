@@ -151,6 +151,7 @@ DECLARE_bool(ysql_yb_allow_replication_slot_ordering_modes);
 DECLARE_bool(ysql_yb_enable_advisory_locks);
 DECLARE_bool(ysql_yb_ddl_transaction_block_enabled);
 DECLARE_bool(enable_object_locking_for_table_locks);
+DECLARE_bool(ysql_enable_catalog_version_push_on_all_ddl);
 DECLARE_bool(ysql_enable_object_locking_infra);
 DECLARE_bool(ysql_yb_enable_ddl_savepoint_support);
 
@@ -880,6 +881,25 @@ struct QueryData<PerformQueryTraits> final : public QueryDataBase<PerformQueryTr
       : QueryDataBase(session_id, arena, req, resp, sidecars, std::move(response_sender)),
         table_cache(table_cache_) {}
 
+  ~QueryData() {
+    // Backstop for the response-cache loader contract: this Perform registered as the loader for a
+    // cache entry (cache_setter is set) but is being destroyed without FlushDone having delivered a
+    // response - it failed between response_cache().Get() and flush (e.g. table resolution or
+    // session setup error). Feed the failure to the cache; otherwise the entry stays in the loading
+    // state and every later read of the same key queues as a waiter that is never notified - those
+    // backends hang until their RPC deadline ("Timed out waiting kResponseSent"). A failure
+    // response transitions the entry to kReadyFailure: queued waiters receive the error and the
+    // entry is not served to future lookups (the next read re-loads it).
+    if (cache_setter) {
+      if (!resp.has_status()) {
+        StatusToPB(
+            STATUS(RuntimeError, "Perform aborted before populating response cache entry"),
+            resp.mutable_status());
+      }
+      cache_setter({resp, ExtractRowsSidecar(resp, sidecars)});
+    }
+  }
+
   void FlushDone(client::FlushStatus* flush_status) {
     TabletReadTime used_read_time;
     if (VLOG_IS_ON(3)) {
@@ -907,6 +927,8 @@ struct QueryData<PerformQueryTraits> final : public QueryDataBase<PerformQueryTr
     }
     if (cache_setter) {
       cache_setter({resp, ExtractRowsSidecar(resp, sidecars)});
+      // Mark the loader contract as fulfilled so the destructor backstop doesn't deliver twice.
+      cache_setter = {};
     }
     if (used_read_time_applier) {
       used_read_time_applier(std::move(used_read_time));
@@ -916,6 +938,9 @@ struct QueryData<PerformQueryTraits> final : public QueryDataBase<PerformQueryTr
 
   void Apply(const PgResponseCache::Response& value) override {
     resp = *value.response;
+    // This Perform was served from the response cache (a hit, or coalesced onto an in-flight read),
+    // not read from master. Flag it so PG can log the source of the catcache/relcache miss.
+    resp.set_response_cache_hit(true);
     auto rows_data_it = value.rows_data.begin();
     for (auto& op : *resp.mutable_responses()) {
       if (op.has_rows_data_sidecar()) {
@@ -3145,23 +3170,41 @@ class PgClientSession::Impl {
       const client::YBTransactionPtr& txn, PgClientSessionKind used_session_kind, bool is_ddl,
       bool has_docdb_schema_changes, const TransactionMetadata* metadata,
       std::optional<bool> commit, CoarseTimePoint deadline) {
+    // Report the DDL transaction status to the YB-Master at commit. The master uses this for:
+    //   1. The DDL-atomicity verification callback, which it only runs when has_docdb_schema_changes
+    //      is true. This is the original reason to report, and is the only one needed when object
+    //      locking is enabled (object locking's lock-release path already propagates the new catalog
+    //      version to tservers synchronously).
+    //   2. When the synchronous catalog-version push is enabled (and object locking is disabled), to
+    //      push the new catalog version to tservers, keeping the catcache response cache consistent
+    //      cross-node without waiting for the next heartbeat. This needs the report for EVERY
+    //      catalog-version-bumping DDL, including ones with no DocDB schema changes (e.g. CREATE
+    //      ROLE, GRANT).
+    // So report for no-schema-change DDLs only when the push feature is on. The transaction_id may
+    // be nil for such a DDL; that is fine because the master skips the verification callback (which
+    // needs the id) when has_docdb_schema_changes is false. When the push feature is off we revert
+    // to the original behavior: report only DDLs with DocDB schema changes.
+    const bool report_for_catalog_version_push =
+        FLAGS_ysql_enable_catalog_version_push_on_all_ddl &&
+        !FLAGS_enable_object_locking_for_table_locks;
+    if (commit.has_value() && metadata && FLAGS_report_ysql_ddl_txn_status_to_master &&
+        (has_docdb_schema_changes || report_for_catalog_version_push)) {
+      TEST_SYNC_POINT(
+          "PgClientSession::DdlAtomicityFinishTransaction:BeforeReportYsqlDdlTxnStatus");
+
+      // If we failed to report the status of this DDL transaction, we can just log and ignore
+      // it, as the poller in the YB-Master will figure out the status of this transaction using
+      // the transaction status tablet and PG catalog.
+      WARN_NOT_OK(
+          client_.ReportYsqlDdlTxnStatus(*metadata, *commit, has_docdb_schema_changes),
+          Format("Sending ReportYsqlDdlTxnStatus call of $0 failed", *commit));
+    }
+
     // If this transaction was DDL that had DocDB syscatalog changes, then the YB-Master may have
-    // any operations postponed to the end of transaction. If the status is known
-    // (commit.has_value() is true), then report the status of the transaction and wait for the
-    // post-processing by YB-Master to end.
+    // any operations postponed to the end of transaction. Wait for the post-processing by
+    // YB-Master to end.
     if (YsqlDdlRollbackEnabled() && metadata && !metadata->transaction_id.IsNil()) {
       if (has_docdb_schema_changes ) {
-        if (commit.has_value() && FLAGS_report_ysql_ddl_txn_status_to_master) {
-          TEST_SYNC_POINT(
-              "PgClientSession::DdlAtomicityFinishTransaction:BeforeReportYsqlDdlTxnStatus");
-
-          // If we failed to report the status of this DDL transaction, we can just log and ignore
-          // it, as the poller in the YB-Master will figure out the status of this transaction using
-          // the transaction status tablet and PG catalog.
-          WARN_NOT_OK(client_.ReportYsqlDdlTxnStatus(*metadata, *commit),
-                      Format("Sending ReportYsqlDdlTxnStatus call of $0 failed", *commit));
-        }
-
         if (FLAGS_ysql_ddl_transaction_wait_for_ddl_verification) {
           // Wait for DDL verification to end. This may include actions such as a) removing an added
           // column in case of ADD COLUMN abort b) dropping a column marked for deletion in case of
@@ -3285,12 +3328,63 @@ class PgClientSession::Impl {
     RETURN_NOT_OK(ValidateRequestForXCluster(options, data));
 
     if (options.has_caching_info()) {
-      VLOG_WITH_PREFIX(3)
-          << "Executing read from response cache for session " << data->req.session_id();
-      data->cache_setter = VERIFY_RESULT(response_cache().Get(
-          options.mutable_caching_info(), deadline, data));
-      if (!data->cache_setter) {
-        return Status::OK();
+      // Catalog version watermark gate: an entry keyed at catalog version V may only be POPULATED
+      // from a snapshot provably consistent with V. The proof is a hybrid time at which the
+      // master observed V still current (heartbeat-propagated). Without a proof for (db, V) -
+      // tserver behind the requester (the DDL issuer's immediate next read), versions skipped in
+      // a burst that backfill couldn't prove, or no heartbeat yet - serve the read UNCACHED at
+      // the requester's own semantics rather than risk caching cross-epoch content.
+      // catalog_version == 0 marks non-versioned (preload-style) entries: no gate.
+      std::optional<uint64_t> proof_ht;
+      const auto& caching_info = options.caching_info();
+      if (caching_info.catalog_version() != 0) {
+        // The proof MUST be looked up under the db whose catalog version counter the key is keyed
+        // at (version_db_oid = the reading backend's MyDatabaseId), NOT key_group. For shared
+        // catalogs (pg_database, pg_authid, ...) key_group is the table's physical home (template1)
+        // while the version belongs to the reader's own database; since every database versions
+        // independently, (template1, vN) and (reader_db, vN) are unrelated instants and looking up
+        // the wrong one yields a confidently-wrong stale read time.
+        const auto version_db = caching_info.version_db_oid();
+        if (context_.tablet_server) {
+          proof_ht = context_.tablet_server->GetYsqlCatalogVersionProofHt(
+              version_db, caching_info.catalog_version());
+        }
+        if (!proof_ht) {
+          VLOG_WITH_PREFIX(2)
+              << "no catalog version proof for db " << version_db
+              << " version " << caching_info.catalog_version() << " - reading uncached";
+          options.clear_caching_info();
+        }
+      }
+      if (options.has_caching_info()) {
+        VLOG_WITH_PREFIX(3)
+            << "Executing read from response cache for session " << data->req.session_id();
+        data->cache_setter = VERIFY_RESULT(response_cache().Get(
+            options.mutable_caching_info(), deadline, data));
+        if (!data->cache_setter) {
+          return Status::OK();
+        }
+        if (proof_ht && options.use_catalog_session()) {
+          // This request is the entry's LOADER: force its read time to the proof time, the
+          // watermark-guaranteed instant at which the keyed version was still current. For the
+          // latest version this advances with every master poll (never stale -> no Snapshot too
+          // old); for superseded versions it is the last instant the version was provably
+          // current. Reading at a FIXED proven past time is race-free: later commits cannot
+          // change what was current at that instant.
+          ReadHybridTime::SingleTime(HybridTime(*proof_ht)).ToPB(options.mutable_read_time());
+          VLOG_WITH_PREFIX(1)
+              << "response cache LOADER: key_group=" << caching_info.key_group()
+              << " version_db=" << caching_info.version_db_oid()
+              << " version=" << caching_info.catalog_version()
+              << " key=" << caching_info.key_value()
+              << " proof_ht=" << HybridTime(*proof_ht)
+              << " (read at this proof time)";
+        } else if (options.use_catalog_session()) {
+          VLOG_WITH_PREFIX(1)
+              << "response cache LOADER (no proof override): key_group="
+              << caching_info.key_group() << " version=" << caching_info.catalog_version()
+              << " key=" << caching_info.key_value();
+        }
       }
     }
 

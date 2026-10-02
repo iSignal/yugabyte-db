@@ -49,6 +49,12 @@
 #include "yb/yql/pggate/util/ybc_util.h"
 
 DEFINE_NON_RUNTIME_bool(ysql_enable_read_request_caching, true, "Enable read request caching");
+DEFINE_NON_RUNTIME_bool(
+    ysql_enable_catcache_response_caching, true,
+    "Enable tserver response caching for individual catalog cache miss reads. "
+    "When enabled, catalog table reads triggered by catcache/relcache misses are issued as keyless "
+    "full-table scans, cached at the tserver, and shared across backends reading at the same "
+    "catalog version. The miss path then filters the cached full scan in PG to the wanted rows.");
 DEFINE_NON_RUNTIME_uint32(pg_cache_response_renew_soft_lifetime_limit_ms, 3 * 60 * 1000,
     "Lifetime limit for response cache soft renewing process");
 DEFINE_NON_RUNTIME_uint32(pg_cache_response_trust_auth_lifetime_limit_ms, 60 * 1000,

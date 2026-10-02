@@ -57,6 +57,12 @@ class YQLRowwiseIteratorIf {
   // Returns max seen hybrid time. Only used by tests for validation.
   virtual HybridTime TEST_MaxSeenHt();
 
+  // Commit (write) hybrid time of the row most recently returned by FetchNext/PgFetchNext.
+  // Reliable only for rows written by a single immutable insert (no later column-level updates),
+  // e.g. pg_yb_invalidation_messages rows, where it is exactly that row's commit time. Returns
+  // an invalid HybridTime for iterators that do not track it (system/virtual tables).
+  virtual HybridTime LastFetchedRowWriteTime() const;
+
   virtual std::string ToString() const = 0;
 
   //------------------------------------------------------------------------------------------------

@@ -614,6 +614,7 @@ Status DoProcessResponse(
     result.catalog_read_time = ReadHybridTime::FromPB(data.resp.catalog_read_time());
   }
   result.used_in_txn_limit = HybridTime::FromPB(data.resp.used_in_txn_limit_ht());
+  result.response_cache_hit = data.resp.response_cache_hit();
   result.operations = std::move(data.operations);
   return Status::OK();
 }

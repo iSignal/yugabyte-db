@@ -46,6 +46,10 @@ HybridTime YQLRowwiseIteratorIf::TEST_MaxSeenHt() {
   return HybridTime::kInvalid;
 }
 
+HybridTime YQLRowwiseIteratorIf::LastFetchedRowWriteTime() const {
+  return HybridTime::kInvalid;
+}
+
 Result<bool> YQLRowwiseIteratorIf::FetchTuple(Slice tuple_id, qlexpr::QLTableRow* row) {
   return STATUS(NotSupported, "This iterator cannot fetch tuple id");
 }

@@ -123,7 +123,14 @@ class CatalogManagerIf : public tserver::TabletPeerLookupIf {
       bool use_cache,
       DbOidToCatalogVersionMap* versions,
       uint64_t* fingerprint) = 0;
-  virtual Result<DbOidVersionToMessageListMap> GetYsqlCatalogInvalationMessages(bool use_cache) = 0;
+  // Reads pg_yb_invalidation_messages and returns the per-(db, version) invalidation message lists.
+  // If current_versions and guaranteed_times are both non-null it also receives the catalog version
+  // watermark derived from the same read: per db, the guaranteed read time for each version (the
+  // current version from current_versions = this read's time, lower versions = next-higher version's
+  // commit time minus delta).
+  virtual Result<DbOidVersionToMessageListMap> GetYsqlCatalogInvalationMessages(
+      const DbOidToCatalogVersionMap* current_versions = nullptr,
+      DbOidToCatalogVersionGuaranteedTimeMap* guaranteed_times = nullptr) = 0;
   virtual Status GetYsqlDBCatalogVersion(
       uint32_t db_oid, uint64_t* catalog_version, uint64_t* last_breaking_version,
       bool use_cache = false) = 0;

@@ -83,6 +83,8 @@ METRIC_DECLARE_entity(server);
 METRIC_DECLARE_counter(rpc_inbound_calls_created);
 METRIC_DECLARE_counter(rpc_inbound_calls_failed);
 METRIC_DECLARE_histogram(handler_latency_yb_tserver_TabletServerService_Read);
+METRIC_DECLARE_counter(pg_response_cache_queries);
+METRIC_DECLARE_counter(pg_response_cache_hits);
 
 namespace yb::pgwrapper {
 
@@ -2991,6 +2993,21 @@ class PgLibPqTestDisableObjectLockingNoRetry : public PgLibPqTestDisableObjectLo
   void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
     options->extra_tserver_flags.emplace_back(
         "--TEST_ysql_disable_transparent_cache_refresh_retry=true");
+    // This test validates legacy transparent-retry-on-stale-catalog behavior, and relies on the
+    // post-DDL heartbeat-propagation lag to create a stale catalog version on the DML node (so the
+    // retry-disabled SELECT hits "schema version mismatch"). Two parts of the response-cache feature
+    // (active here because this fixture sets object-locking=false) would defeat that premise, so
+    // disable both:
+    //   - the synchronous catalog-version push delivers the new version to the DML node immediately,
+    //     removing the staleness window entirely;
+    //   - the catcache response cache serves the DML node a consistent stale snapshot, changing the
+    //     staleness symptom from "schema version mismatch" to a stale name-resolution miss
+    //     ("relation does not exist") that this test's assertion does not expect.
+    // In production the transparent retry (enabled) absorbs either symptom; this test disables retry
+    // to assert on the raw error, so it must also disable the feature to see the legacy one.
+    options->extra_master_flags.emplace_back(
+        "--ysql_enable_catalog_version_push_to_tservers_on_ddl=false");
+    options->extra_tserver_flags.emplace_back("--ysql_enable_catcache_response_caching=false");
     PgLibPqTestDisableObjectLocking::UpdateMiniClusterOptions(options);
   }
 };
@@ -5762,6 +5779,624 @@ TEST_F(PgLibPqTestDropTableIfExistsCascadeRetry, DropTableIfExistsCascadeRetry) 
   // The fix ensures that the pendingDeletes list is cleared before the retry,
   // preventing the "SMgrRelation hashtable corrupted" double-close error.
   ASSERT_OK(conn.Execute("DROP TABLE IF EXISTS drop_retry_test CASCADE"));
+}
+
+// Exercises the L1 response-cache-backed catalog-miss path for pg_attribute. When a backend builds
+// a user table's relcache, RelationBuildTupleDesc issues a KEYLESS pg_attribute scan whose response
+// is cached at the tserver under "<reloid>:<indexoid>:<catalog_version>" and filtered locally in
+// PG (see relcache.c, catcache.c, yb_scan.c). The entry is shared across backends on the same
+// tserver at the same catalog version. No special flags are needed (the feature defaults on); only
+// vmodule is set so the test log shows the per-key HIT/MISS decisions.
+class PgCatcacheResponseCacheTest : public PgLibPqTest {
+ protected:
+  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
+    PgLibPqTest::UpdateMiniClusterOptions(options);
+    // The catcache-miss response-cache path is gated off when object locking is enabled
+    // (YbShouldResponseCacheCatalogRead). enable_object_locking_for_table_locks defaults to TRUE in
+    // release builds (NDEBUG) and FALSE in debug, so without pinning it these feature tests would
+    // exercise the feature only in fastdebug and fail their ASSERT_GT(hits/queries) in release.
+    // Pin it off on master and tservers so the feature is active in every build mode.
+    // (The PgCatcacheResponseCacheObjectLockTest subclass re-enables it afterwards for its own case.)
+    options->extra_master_flags.push_back("--enable_object_locking_for_table_locks=false");
+    options->extra_tserver_flags.push_back("--enable_object_locking_for_table_locks=false");
+    // The synchronous catalog-version push (report every DDL + master pushes to all tservers) is
+    // off by default. These tests assert IMMEDIATE cross-node cache consistency after a DDL, which
+    // depends on that push, so enable it on both master (initiates the push) and tservers (PG side
+    // reports every DDL).
+    options->extra_master_flags.push_back("--ysql_enable_catalog_version_push_on_all_ddl=true");
+    options->extra_tserver_flags.push_back("--ysql_enable_catalog_version_push_on_all_ddl=true");
+    // vmodule propagates to the postgres backend and tserver processes.
+    options->extra_tserver_flags.emplace_back("--vmodule=pg_response_cache=2,pg_doc_op=2");
+    // Log every PG-side catcache/relcache miss so the test log shows the misses that the response
+    // cache HIT/MISS lines (above) correspond to.
+    options->extra_tserver_flags.emplace_back(
+        "--ysql_pg_conf_csv=yb_debug_log_catcache_events=true");
+  }
+
+  // Server-level pg_response_cache counter on a given tserver.
+  static Result<int64_t> ResponseCacheMetric(
+      ExternalTabletServer* ts, const MetricPrototype& proto) {
+    return ts->GetMetric<int64_t>(&METRIC_ENTITY_server, "yb.tabletserver", &proto, "value");
+  }
+};
+
+TEST_F_EX(PgLibPqTest, CatcacheResponseCacheSharing, PgCatcacheResponseCacheTest) {
+  auto* ts = cluster_->tablet_server(0);
+
+  // Initial connection: create the table and let this backend build the relcache init file.
+  // It is not reused; the test exercises only succeeding connections.
+  {
+    auto init_conn = ASSERT_RESULT(ConnectToTs(*ts));
+    ASSERT_OK(init_conn.Execute(
+        "CREATE TABLE resp_cache_attr_t (c1 int, c2 text, c3 bool, c4 int, c5 text)"));
+    ASSERT_OK(init_conn.Execute("INSERT INTO resp_cache_attr_t VALUES (1, 'a', true, 2, 'b')"));
+  }
+
+  // Workload that, on a fresh backend, drives BOTH pg_attribute access paths this feature caches:
+  //  - relcache build (RelationBuildTupleDesc -> keyless scan via AttributeRelidNumIndexId), and
+  //  - catcache point lookups (SearchCatCacheMiss for ATTNUM / ATTNAME).
+  // A self-join with USING resolves the join column by name (get_attnum -> ATTNAME), and renaming a
+  // column reference exercises ATTNUM; the plain SELECT covers the relcache build.
+  const auto run_workload = [](PGConn* conn) -> Status {
+    RETURN_NOT_OK(conn->Execute("SET yb_debug_log_catcache_events = ON"));
+    RETURN_NOT_OK(ResultToStatus(conn->Fetch("SELECT * FROM resp_cache_attr_t")));
+    RETURN_NOT_OK(ResultToStatus(conn->Fetch(
+        "SELECT a.c2, b.c5 FROM resp_cache_attr_t a JOIN resp_cache_attr_t b USING (c1)")));
+    RETURN_NOT_OK(ResultToStatus(conn->Fetch(
+        "SELECT c1 AS renamed FROM resp_cache_attr_t WHERE c4 = 2")));
+    return Status::OK();
+  };
+
+  // First succeeding connection: its accesses lazily build the relcache and do catcache point
+  // lookups, populating the tserver response cache. Measured tightly around the workload (after
+  // connection startup) so preload activity is excluded.
+  auto conn1 = ASSERT_RESULT(ConnectToTs(*ts));
+  const auto queries_before = ASSERT_RESULT(
+      ResponseCacheMetric(ts, METRIC_pg_response_cache_queries));
+  ASSERT_OK(run_workload(&conn1));
+  const auto queries_after = ASSERT_RESULT(
+      ResponseCacheMetric(ts, METRIC_pg_response_cache_queries));
+  ASSERT_GT(queries_after, queries_before)
+      << "first backend's relcache/catcache misses should query the response cache";
+
+  // Second succeeding connection at the same catalog version: the pg_attribute scans are served
+  // from the shared response cache (hits), rather than re-read from master.
+  auto conn2 = ASSERT_RESULT(ConnectToTs(*ts));
+  const auto hits_before = ASSERT_RESULT(
+      ResponseCacheMetric(ts, METRIC_pg_response_cache_hits));
+  ASSERT_OK(run_workload(&conn2));
+  const auto hits_after = ASSERT_RESULT(
+      ResponseCacheMetric(ts, METRIC_pg_response_cache_hits));
+  ASSERT_GT(hits_after, hits_before)
+      << "second backend should be served the pg_attribute scans from the shared cache";
+}
+
+TEST_F_EX(PgLibPqTest, CatcacheResponseCacheInvalidationOnDDL, PgCatcacheResponseCacheTest) {
+  auto* ts = cluster_->tablet_server(0);
+
+  {
+    auto init_conn = ASSERT_RESULT(ConnectToTs(*ts));
+    ASSERT_OK(init_conn.Execute("CREATE TABLE resp_cache_inval_t (c1 int, c2 text)"));
+  }
+
+  // Populate and share the response cache entry at the current catalog version: conn1 misses,
+  // conn2 is served from the shared entry (hit).
+  {
+    auto conn1 = ASSERT_RESULT(ConnectToTs(*ts));
+    ASSERT_RESULT(conn1.Fetch("SELECT * FROM resp_cache_inval_t"));
+  }
+  {
+    auto conn2 = ASSERT_RESULT(ConnectToTs(*ts));
+    const auto hits_before = ASSERT_RESULT(
+        ResponseCacheMetric(ts, METRIC_pg_response_cache_hits));
+    ASSERT_RESULT(conn2.Fetch("SELECT * FROM resp_cache_inval_t"));
+    const auto hits_after = ASSERT_RESULT(
+        ResponseCacheMetric(ts, METRIC_pg_response_cache_hits));
+    ASSERT_GT(hits_after, hits_before) << "pre-DDL: entry should be shared";
+  }
+
+  // Bump the catalog version with an unrelated DDL.
+  {
+    auto ddl_conn = ASSERT_RESULT(ConnectToTs(*ts));
+    ASSERT_OK(ddl_conn.Execute("CREATE TABLE resp_cache_inval_other (k int)"));
+  }
+
+  // A fresh connection now reads at the new catalog version. Its keyless pg_attribute scan computes
+  // a different cache key, so it must NOT be served from the stale pre-DDL entry: the cache key at
+  // the new version does not exist yet, so the scan MISSES and reads from master (after which the
+  // new-version entry is populated and subsequent reads may hit it). We detect the miss as a query
+  // that was not a hit: misses = queries - hits must increase across the SELECT. Contrast with the
+  // sharing test, where a same-version fresh backend is served entirely from cache (no new miss).
+  auto conn3 = ASSERT_RESULT(ConnectToTs(*ts));
+  const auto queries_before = ASSERT_RESULT(
+      ResponseCacheMetric(ts, METRIC_pg_response_cache_queries));
+  const auto hits_before = ASSERT_RESULT(
+      ResponseCacheMetric(ts, METRIC_pg_response_cache_hits));
+  ASSERT_RESULT(conn3.Fetch("SELECT * FROM resp_cache_inval_t"));
+  const auto queries_after = ASSERT_RESULT(
+      ResponseCacheMetric(ts, METRIC_pg_response_cache_queries));
+  const auto hits_after = ASSERT_RESULT(
+      ResponseCacheMetric(ts, METRIC_pg_response_cache_hits));
+  ASSERT_GT(queries_after - queries_before, hits_after - hits_before)
+      << "post-DDL relcache build must miss at the new version (read master), not reuse the stale "
+         "pre-DDL entry";
+}
+
+// Adapted from the reference PoC's CatcacheMissResponseCacheSharing. A plpgsql function call drives
+// misses across MANY catalog caches (pg_proc by-name list + PROCOID, pg_type, pg_namespace,
+// pg_language, plus relcache builds) - exercising the response-cache path for all caches, not just
+// pg_attribute. The first backend populates the shared cache; a second backend at the same catalog
+// version is served ENTIRELY from it: every response-cache query during its call is a hit, so it
+// makes no master read (the new-design equivalent of the PoC's master_read_rpc == 0 assertion).
+TEST_F_EX(PgLibPqTest, CatcacheResponseCacheAllCachesSharing, PgCatcacheResponseCacheTest) {
+  auto* ts = cluster_->tablet_server(0);
+
+  {
+    auto init_conn = ASSERT_RESULT(ConnectToTs(*ts));
+    ASSERT_OK(init_conn.Execute(
+        "CREATE FUNCTION yb_rc_test_fn(v int) RETURNS int AS $$ BEGIN RETURN v; END; $$ "
+        "LANGUAGE plpgsql"));
+  }
+
+  // First succeeding connection: compiling/calling the function misses across many catalog caches,
+  // populating the shared tserver response cache.
+  {
+    auto conn1 = ASSERT_RESULT(ConnectToTs(*ts));
+    ASSERT_OK(conn1.Execute("SET yb_debug_log_catcache_events = ON"));
+    ASSERT_EQ(ASSERT_RESULT(conn1.FetchRow<int32_t>("SELECT yb_rc_test_fn(1)")), 1);
+  }
+
+  // Second connection at the same catalog version: every catalog miss is served from the shared
+  // cache (hits advance), and there are NO new misses (queries delta == hits delta), i.e. the call
+  // makes no master read.
+  auto conn2 = ASSERT_RESULT(ConnectToTs(*ts));
+  ASSERT_OK(conn2.Execute("SET yb_debug_log_catcache_events = ON"));
+  const auto queries_before = ASSERT_RESULT(
+      ResponseCacheMetric(ts, METRIC_pg_response_cache_queries));
+  const auto hits_before = ASSERT_RESULT(
+      ResponseCacheMetric(ts, METRIC_pg_response_cache_hits));
+  ASSERT_EQ(ASSERT_RESULT(conn2.FetchRow<int32_t>("SELECT yb_rc_test_fn(1)")), 1);
+  const auto queries_after = ASSERT_RESULT(
+      ResponseCacheMetric(ts, METRIC_pg_response_cache_queries));
+  const auto hits_after = ASSERT_RESULT(
+      ResponseCacheMetric(ts, METRIC_pg_response_cache_hits));
+  ASSERT_GT(hits_after, hits_before)
+      << "second backend should be served catalog misses from the shared cache";
+  ASSERT_EQ(queries_after - queries_before, hits_after - hits_before)
+      << "second backend should have no response-cache misses (fully served from cache, no master "
+         "read)";
+}
+
+// The headline property of this design: because the cached artifact is the FULL keyless scan (not a
+// per-key entry), DISTINCT keys share it. conn1 resolves the '+' operator - missing and populating
+// the full pg_operator (and pg_proc for int4pl, ...) scans. conn2 then resolves the DIFFERENT '-'
+// operator (int4mi): with full-scan caching it is served entirely from those same cached scans, so
+// it makes no new miss. Under the rejected per-key design, conn2's '-' lookup would have missed.
+TEST_F_EX(PgLibPqTest, CatcacheResponseCacheDistinctKeySharing, PgCatcacheResponseCacheTest) {
+  auto* ts = cluster_->tablet_server(0);
+
+  // First backend resolves '+' (int4 + int4), populating the full pg_operator / pg_proc scans.
+  {
+    auto conn1 = ASSERT_RESULT(ConnectToTs(*ts));
+    ASSERT_OK(conn1.Execute("SET yb_debug_log_catcache_events = ON"));
+    ASSERT_EQ(ASSERT_RESULT(conn1.FetchRow<int32_t>("SELECT 1 + 1")), 2);
+  }
+
+  // Second backend resolves the DIFFERENT '-' operator (same operands). It is served from the
+  // cached full scans populated by conn1 - hits advance and there are no new misses - even though
+  // the '-' operator/function keys were never individually looked up before.
+  auto conn2 = ASSERT_RESULT(ConnectToTs(*ts));
+  ASSERT_OK(conn2.Execute("SET yb_debug_log_catcache_events = ON"));
+  const auto queries_before = ASSERT_RESULT(
+      ResponseCacheMetric(ts, METRIC_pg_response_cache_queries));
+  const auto hits_before = ASSERT_RESULT(
+      ResponseCacheMetric(ts, METRIC_pg_response_cache_hits));
+  ASSERT_EQ(ASSERT_RESULT(conn2.FetchRow<int32_t>("SELECT 1 - 1")), 0);
+  const auto queries_after = ASSERT_RESULT(
+      ResponseCacheMetric(ts, METRIC_pg_response_cache_queries));
+  const auto hits_after = ASSERT_RESULT(
+      ResponseCacheMetric(ts, METRIC_pg_response_cache_hits));
+  ASSERT_GT(hits_after, hits_before)
+      << "second backend's '-' lookup should be served from the cached full pg_operator/pg_proc scans";
+  ASSERT_EQ(queries_after - queries_before, hits_after - hits_before)
+      << "a distinct key ('-' vs '+') must still be fully served from the cached full scan: "
+         "full-scan caching shares across keys, unlike per-key caching";
+}
+
+// Correctness guard for the converted relcache-build scans. The keyless full scans are filtered
+// locally in PG (HeapKeyTest), which must reproduce exactly the rows an index scan returns - across
+// pg_attrdef (defaults), pg_constraint (CHECK + FK), pg_rewrite (rules), pg_index, and pg_inherits
+// (inheritance). A fresh connection rebuilds all of rc_parent's relcache via these cached scans;
+// the assertions fail if any scan returns wrong/misordered rows.
+TEST_F_EX(PgLibPqTest, CatcacheResponseCacheRelcacheCorrectness, PgCatcacheResponseCacheTest) {
+  auto* ts = cluster_->tablet_server(0);
+
+  {
+    auto setup = ASSERT_RESULT(ConnectToTs(*ts));
+    ASSERT_OK(setup.Execute(
+        "CREATE TABLE rc_parent (id int PRIMARY KEY, v int DEFAULT 7 CHECK (v >= 0))"));
+    ASSERT_OK(setup.Execute("CREATE INDEX rc_parent_v_idx ON rc_parent(v)"));
+    ASSERT_OK(setup.Execute("CREATE TABLE rc_child (id int PRIMARY KEY REFERENCES rc_parent(id))"));
+    ASSERT_OK(setup.Execute("CREATE TABLE rc_inh () INHERITS (rc_parent)"));
+    ASSERT_OK(setup.Execute("CREATE RULE rc_rule AS ON DELETE TO rc_parent DO INSTEAD NOTHING"));
+    ASSERT_OK(setup.Execute("INSERT INTO rc_parent(id) VALUES (1)"));  // v defaults to 7
+  }
+
+  // Fresh connection: rebuilds rc_parent's relcache from the cached keyless scans, then exercises
+  // each catalog the converted scans feed.
+  auto conn = ASSERT_RESULT(ConnectToTs(*ts));
+  ASSERT_OK(conn.Execute("SET yb_debug_log_catcache_events = ON"));
+
+  // pg_attrdef: column default applied.
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int32_t>("SELECT v FROM rc_parent WHERE id = 1")), 7);
+  // pg_constraint (CHECK): violation rejected.
+  ASSERT_NOK(conn.Execute("INSERT INTO rc_parent(id, v) VALUES (2, -1)"));
+  // pg_constraint (FK): referencing a missing parent rejected, valid one accepted.
+  ASSERT_NOK(conn.Execute("INSERT INTO rc_child(id) VALUES (999)"));
+  ASSERT_OK(conn.Execute("INSERT INTO rc_child(id) VALUES (1)"));
+  // pg_rewrite (rule): DELETE does nothing.
+  ASSERT_OK(conn.Execute("DELETE FROM rc_parent WHERE id = 1"));
+  ASSERT_EQ(
+      ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM ONLY rc_parent WHERE id = 1")), 1);
+  // pg_inherits (inheritance): parent scan includes child rows.
+  ASSERT_OK(conn.Execute("INSERT INTO rc_inh(id) VALUES (10)"));
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM rc_parent")), 2);
+}
+
+// Distinct-RELATION sharing for relcache builds. p1 and p2 are two partitioned parents of identical
+// shape (each with a secondary index and a partition), created at the same catalog version. conn1
+// builds p1's relcache (and its index/partition relcache) via keyless full scans of
+// pg_class/pg_attribute/pg_index/pg_partitioned_table/pg_inherits; conn2 builds p2's relcache - a
+// DIFFERENT relation - and is served entirely from those same cached full scans (which are keyed by
+// (catalog, scan-target, version), not by relid). The secondary indexes ensure index-relation
+// relcache builds (and the by-index scans) are exercised too.
+TEST_F_EX(PgLibPqTest, CatcacheResponseCachePartitionedRelcacheSharing, PgCatcacheResponseCacheTest) {
+  auto* ts = cluster_->tablet_server(0);
+
+  {
+    auto setup = ASSERT_RESULT(ConnectToTs(*ts));
+    for (const auto* p : {"p1", "p2"}) {
+      ASSERT_OK(setup.ExecuteFormat("CREATE TABLE $0 (id int, v int) PARTITION BY RANGE (id)", p));
+      ASSERT_OK(setup.ExecuteFormat("CREATE INDEX $0_v_idx ON $0 (v)", p));
+      ASSERT_OK(setup.ExecuteFormat(
+          "CREATE TABLE $0_part PARTITION OF $0 FOR VALUES FROM (0) TO (100)", p));
+    }
+  }
+
+  // conn1 builds p1's relcache (parent, index, partition) from master, populating the shared scans.
+  {
+    auto conn1 = ASSERT_RESULT(ConnectToTs(*ts));
+    ASSERT_OK(conn1.Execute("SET yb_debug_log_catcache_events = ON"));
+    ASSERT_RESULT(conn1.Fetch("SELECT * FROM p1 WHERE v = 1"));
+  }
+
+  // conn2 builds p2's relcache at the same catalog version. Because the cached artifacts are the
+  // full catalog scans (not per-relation entries), conn2 is served entirely from conn1's entries:
+  // hits advance, no new misses - even though p2 is a different relation never built before.
+  auto conn2 = ASSERT_RESULT(ConnectToTs(*ts));
+  ASSERT_OK(conn2.Execute("SET yb_debug_log_catcache_events = ON"));
+  const auto queries_before = ASSERT_RESULT(
+      ResponseCacheMetric(ts, METRIC_pg_response_cache_queries));
+  const auto hits_before = ASSERT_RESULT(
+      ResponseCacheMetric(ts, METRIC_pg_response_cache_hits));
+  ASSERT_RESULT(conn2.Fetch("SELECT * FROM p2 WHERE v = 1"));
+  const auto queries_after = ASSERT_RESULT(
+      ResponseCacheMetric(ts, METRIC_pg_response_cache_queries));
+  const auto hits_after = ASSERT_RESULT(
+      ResponseCacheMetric(ts, METRIC_pg_response_cache_hits));
+  ASSERT_GT(hits_after, hits_before)
+      << "p2's relcache build should be served from the full scans populated by p1's build";
+  ASSERT_EQ(queries_after - queries_before, hits_after - hits_before)
+      << "p2 (a distinct partitioned relation, with index) must be fully served from the cached "
+         "full scans, with no new miss";
+}
+
+// Regression guard for the inherits-cache recursion crash: the inherits cache miss handler must not
+// reach the optimized (cache-backed) pg_inherits scan, or it recurses. This DDL-heavy sequence
+// (ADD COLUMN DEFAULT / table rewrite / UNIQUE / CHECK / DROP TYPE CASCADE, then fresh-connection
+// relcache rebuilds) reproduced a segfault during ALTER ... ADD COLUMN ... DEFAULT random().
+TEST_F_EX(PgLibPqTest, CatcacheResponseCacheDdlChurnNoRecursion, PgCatcacheResponseCacheTest) {
+  auto* ts = cluster_->tablet_server(0);
+  auto setup = ASSERT_RESULT(ConnectToTs(*ts));
+
+  ASSERT_OK(setup.Execute("CREATE TABLE foo (a int)"));
+  ASSERT_OK(setup.Execute("INSERT INTO foo SELECT generate_series(1, 10)"));
+  ASSERT_OK(setup.Execute("ALTER TABLE foo ADD COLUMN d text DEFAULT 'default'"));
+  ASSERT_OK(setup.Execute("ALTER TABLE foo ADD COLUMN f float DEFAULT random()"));  // table rewrite
+
+  ASSERT_OK(setup.Execute("CREATE TABLE foo_unique(a int)"));
+  ASSERT_OK(setup.Execute("INSERT INTO foo_unique VALUES (1), (2), (3)"));
+  ASSERT_OK(setup.Execute("ALTER TABLE foo_unique ADD COLUMN b int UNIQUE"));
+  ASSERT_OK(setup.Execute(
+      "ALTER TABLE foo_unique ADD COLUMN c float UNIQUE NOT NULL DEFAULT random()"));
+  ASSERT_OK(setup.Execute("ALTER TABLE foo_unique ADD COLUMN dd float UNIQUE CHECK (dd >= 1)"));
+
+  // cascaded drop of a column via DROP TYPE ... CASCADE
+  ASSERT_OK(setup.Execute("CREATE TABLE test_dropcolumn(a int, b int, c int)"));
+  ASSERT_OK(setup.Execute("CREATE TYPE test_dropcolumn_type AS (a int, b int)"));
+  ASSERT_OK(setup.Execute("ALTER TABLE test_dropcolumn ADD COLUMN d test_dropcolumn_type"));
+  ASSERT_OK(setup.Execute("DROP TYPE test_dropcolumn_type CASCADE"));
+
+  // Fresh connections rebuild relcache for these tables via the cached scans.
+  for (int i = 0; i < 3; ++i) {
+    auto conn = ASSERT_RESULT(ConnectToTs(*ts));
+    ASSERT_RESULT(conn.Fetch("SELECT * FROM foo ORDER BY a"));
+    ASSERT_RESULT(conn.Fetch("SELECT a, b, dd FROM foo_unique ORDER BY a"));
+    ASSERT_RESULT(conn.Fetch("SELECT * FROM test_dropcolumn"));
+  }
+}
+
+// Temp objects' catalog rows are session-private and absent from the shared, version-keyed cached
+// scans (temp DDL also does not bump the catalog version). The response cache must be bypassed for
+// a backend that has a temp namespace, else its temp-object catalog lookups would miss the cached
+// scan ("relation does not exist"). Mirrors yb.orig.alter_table_rewrite's temp-table sequence.
+TEST_F_EX(PgLibPqTest, CatcacheResponseCacheTempTable, PgCatcacheResponseCacheTest) {
+  auto* ts = cluster_->tablet_server(0);
+  auto conn = ASSERT_RESULT(ConnectToTs(*ts));
+
+  ASSERT_OK(conn.Execute("CREATE TEMP TABLE temp_rc_test(a int)"));
+  ASSERT_OK(conn.Execute("INSERT INTO temp_rc_test VALUES (1), (2), (3)"));
+  ASSERT_OK(conn.Execute("CREATE INDEX ON temp_rc_test(a)"));
+  ASSERT_OK(conn.Execute("ALTER TABLE temp_rc_test ADD COLUMN c int DEFAULT 42"));
+  // The temp table and its new column must be visible (not served stale from the shared cache).
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM temp_rc_test")), 3);
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int32_t>(
+                "SELECT c FROM temp_rc_test WHERE a = 2")), 42);
+}
+
+// Investigation: does the BASIC temp-table flow (no ALTER) even consult the response cache? It
+// should not - CREATE TEMP TABLE builds the temp relation's catcache/relcache entries locally, so
+// the subsequent INSERT/SELECT are local hits with no miss. DEBUG1 + yb_debug_log_catcache_events
+// expose what actually happens.
+TEST_F_EX(PgLibPqTest, CatcacheResponseCacheTempTableBasic, PgCatcacheResponseCacheTest) {
+  auto* ts = cluster_->tablet_server(0);
+  auto conn = ASSERT_RESULT(ConnectToTs(*ts));
+  ASSERT_OK(conn.Execute("SET log_min_messages = DEBUG1"));
+  ASSERT_OK(conn.Execute("SET yb_debug_log_catcache_events = ON"));
+  ASSERT_OK(conn.Execute("CREATE TEMP TABLE t(id int PRIMARY KEY)"));
+  ASSERT_OK(conn.Execute("INSERT INTO t VALUES (1)"));
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int32_t>("SELECT id FROM t")), 1);
+}
+
+// The real temp-table hazard is CROSS-SESSION, not intra-session: temp DDL does not bump the
+// catalog version, so a temp object's session-private pg_attribute/pg_class rows live at the SAME
+// version as an already-cached full scan from another backend. Here conn1 caches a version-V
+// pg_attribute full scan (building relcache for a regular table); conn2 then creates and uses a
+// temp table - still at version V - and its relcache build would be served conn1's stale cached
+// scan, which lacks conn2's temp rows ("relation does not exist"). The temp gate must prevent this.
+TEST_F_EX(PgLibPqTest, CatcacheResponseCacheTempTableCrossSession, PgCatcacheResponseCacheTest) {
+  auto* ts = cluster_->tablet_server(0);
+
+  // Initial connection: create a regular table and build this backend's relcache init file. Not
+  // reused; the test exercises only succeeding connections.
+  {
+    auto init_conn = ASSERT_RESULT(ConnectToTs(*ts));
+    ASSERT_OK(init_conn.Execute("CREATE TABLE resp_cache_xsess_t (a int, b text, c bool)"));
+  }
+
+  // conn1: build relcache for the regular table, caching the version-V pg_attribute/pg_class full
+  // scans in the shared response cache. No DDL here, so the catalog version stays at V.
+  auto conn1 = ASSERT_RESULT(ConnectToTs(*ts));
+  ASSERT_OK(conn1.Execute("SET yb_debug_log_catcache_events = ON"));
+  ASSERT_RESULT(conn1.Fetch("SELECT * FROM resp_cache_xsess_t"));
+
+  // conn2: create a temp table (temp DDL does NOT bump the catalog version, so still version V) and
+  // immediately use it. Building its relcache scans pg_attribute keyless; without the temp gate that
+  // read is served conn1's stale cached scan and the temp table appears empty / nonexistent.
+  auto conn2 = ASSERT_RESULT(ConnectToTs(*ts));
+  ASSERT_OK(conn2.Execute("SET yb_debug_log_catcache_events = ON"));
+  ASSERT_OK(conn2.Execute("CREATE TEMP TABLE resp_cache_temp_xsess (x int PRIMARY KEY, y text)"));
+  ASSERT_OK(conn2.Execute("INSERT INTO resp_cache_temp_xsess VALUES (1, 'one'), (2, 'two')"));
+  ASSERT_EQ(ASSERT_RESULT(conn2.FetchRow<int64_t>(
+                "SELECT count(*) FROM resp_cache_temp_xsess")), 2);
+  ASSERT_EQ(ASSERT_RESULT(conn2.FetchRow<std::string>(
+                "SELECT y FROM resp_cache_temp_xsess WHERE x = 2")), "two");
+}
+
+// Faithful single-connection reproduction of the yb.orig.alter_table_rewrite temp-table failure.
+// Within ONE backend: first resolve a regular table by name so a keyless pg_class scan is cached in
+// the response cache at the current catalog version V (via a RELNAMENSP catcache miss). Then create
+// a temp table - temp DDL does NOT bump the catalog version, so we are still at V - and use it. The
+// temp table's own name resolution is a RELNAMENSP miss that, without the temp gate, is served the
+// stale cached pg_class scan (taken before the temp row existed) -> "relation does not exist".
+TEST_F_EX(PgLibPqTest, CatcacheResponseCacheTempTableSameSession, PgCatcacheResponseCacheTest) {
+  auto* ts = cluster_->tablet_server(0);
+
+  // Initial connection creates a regular table whose name this test's backend has never resolved.
+  {
+    auto init_conn = ASSERT_RESULT(ConnectToTs(*ts));
+    ASSERT_OK(init_conn.Execute("CREATE TABLE resp_cache_same_sess_t (a int, b text)"));
+  }
+
+  auto conn = ASSERT_RESULT(ConnectToTs(*ts));
+  ASSERT_OK(conn.Execute("SET yb_debug_log_catcache_events = ON"));
+  // (1) Name-resolve the regular table: RELNAMENSP miss -> keyless pg_class scan cached at version V.
+  ASSERT_RESULT(conn.Fetch("SELECT * FROM resp_cache_same_sess_t"));
+  // (2) Create + use a temp table in the SAME backend, still at version V (temp DDL does not bump).
+  ASSERT_OK(conn.Execute("CREATE TEMP TABLE resp_cache_temp_same (x int PRIMARY KEY, y text)"));
+  ASSERT_OK(conn.Execute("INSERT INTO resp_cache_temp_same VALUES (1, 'one'), (2, 'two')"));
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>(
+                "SELECT count(*) FROM resp_cache_temp_same")), 2);
+  // (3) A real table rewrite on the temp table (volatile default forces a new relfilenode).
+  ASSERT_OK(conn.Execute("ALTER TABLE resp_cache_temp_same ADD COLUMN z SERIAL"));
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>(
+                "SELECT count(*) FROM resp_cache_temp_same WHERE z > 0")), 2);
+}
+
+// Like PgCatcacheResponseCacheTest but with object locking enabled, so a SELECT blocks on a
+// concurrent uncommitted ALTER's table lock. Used to deterministically force a relcache rebuild
+// during invalidation-message processing (at lock-acquisition time).
+class PgCatcacheResponseCacheObjectLockTest : public PgCatcacheResponseCacheTest {
+ protected:
+  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
+    PgCatcacheResponseCacheTest::UpdateMiniClusterOptions(options);
+    // Enable object locking on the TSERVERS only, so session 2's SELECT blocks on session 1's
+    // uncommitted ALTER lock (the mechanism this test needs). Leave the MASTER in push mode
+    // (object-locking=false, inherited from the base): the synchronous DDL-commit push delivers the
+    // new catalog version + watermark to session 2's tserver so its rebuild-during-inval reads the
+    // new version. (Forcing master object-locking=true disables that push and the rebuild reads
+    // stale -> "column b does not exist".)
+    options->extra_tserver_flags.push_back("--enable_object_locking_for_table_locks=true");
+    options->extra_tserver_flags.push_back("--ysql_yb_ddl_transaction_block_enabled=true");
+  }
+};
+
+// Regression test for the catalog-version ordering hazard in YBRefreshCacheWrapperImpl
+// (postgres.c): YbApplyInvalidationMessages() runs BEFORE yb_catalog_cache_version is bumped to the
+// new version. PostgreSQL may rebuild a relcache entry DURING invalidation processing
+// (RelationBuildDesc -> the cached keyless scans), and such a rebuild reads at the OLD version. If
+// the rebuild's scan is served a STALE response-cache entry (cached at the old version, before the
+// concurrent DDL), the rebuilt relcache entry would miss a just-added column.
+//
+// Object locking makes this deterministic: session 2's SELECT blocks on session 1's uncommitted
+// ALTER, and processes the invalidation (and the rebuild) right when it acquires the lock after
+// session 1 commits. The SELECT must observe the new column.
+TEST_F_EX(PgLibPqTest, CatcacheResponseCacheRebuildDuringInvalSeesNewVersion,
+          PgCatcacheResponseCacheObjectLockTest) {
+  auto* ts = cluster_->tablet_server(0);
+  {
+    auto init = ASSERT_RESULT(ConnectToTs(*ts));
+    ASSERT_OK(init.Execute("CREATE TABLE rc_inval_t (a int)"));
+    ASSERT_OK(init.Execute("INSERT INTO rc_inval_t VALUES (1), (2), (3)"));
+  }
+
+  // Session 2: build rc_inval_t's relcache at version V, populating the response cache with the
+  // pg_attribute/pg_class scans keyed at V.
+  auto conn2 = ASSERT_RESULT(ConnectToTs(*ts));
+  ASSERT_OK(conn2.Execute("SET yb_debug_log_catcache_events = ON"));
+  ASSERT_EQ(ASSERT_RESULT(conn2.FetchRow<int64_t>("SELECT count(*) FROM rc_inval_t")), 3);
+
+  // Session 1: hold an AccessExclusive lock via an uncommitted ALTER that adds a column.
+  auto conn1 = ASSERT_RESULT(ConnectToTs(*ts));
+  ASSERT_OK(conn1.Execute("BEGIN"));
+  ASSERT_OK(conn1.Execute("ALTER TABLE rc_inval_t ADD COLUMN b int DEFAULT 7"));
+
+  // Session 2 (separate thread): a SELECT referencing the new column blocks on session 1's lock.
+  std::atomic<bool> sel_done{false};
+  Status sel_status;
+  int64_t sel_sum = -1;
+  std::thread t([&] {
+    auto res = conn2.FetchRow<int64_t>("SELECT sum(b) FROM rc_inval_t");
+    if (res.ok()) {
+      sel_sum = *res;
+    } else {
+      sel_status = res.status();
+    }
+    sel_done.store(true);
+  });
+
+  // Let session 2 block on the lock, then commit session 1 (version -> V+1, inval messages sent).
+  SleepFor(MonoDelta::FromSeconds(3));
+  ASSERT_FALSE(sel_done.load()) << "session 2's SELECT should be blocked on the object lock";
+  ASSERT_OK(conn1.Execute("COMMIT"));
+
+  t.join();
+  // On acquiring the lock, session 2 rebuilds rc_inval_t's relcache during inval processing; it MUST
+  // read at the NEW version and see column b (3 rows * 7 = 21). A stale cached scan would either
+  // error "column b does not exist" or return the wrong rows.
+  ASSERT_OK(sel_status);
+  ASSERT_EQ(sel_sum, 21);
+}
+
+// Perf probe for the response-cache "keyless full scan + HeapKeyTest filter" approach on a large
+// pg_attribute. Creates 50 tables x 200 cols (~10000 user pg_attribute rows), then on a FRESH
+// backend builds each table's relcache (each build does a keyless pg_attribute scan filtered to that
+// table's ~200 attrs). With yb_debug_log_catcache_events on, yb_scan.c logs per-scan
+// "yb_sys_scan perf: ... rows_scanned=... rows_matched=... elapsed_us=... pg_mem_delta_bytes=...".
+// Run with caching ON (this fixture) vs OFF (subclass below) and compare; measure on a release build.
+TEST_F_EX(PgLibPqTest, CatcacheResponseCachePgAttributePerf, PgCatcacheResponseCacheTest) {
+  auto* ts = cluster_->tablet_server(0);
+  {
+    auto init = ASSERT_RESULT(ConnectToTs(*ts));
+    for (int t = 0; t < 50; ++t) {
+      std::string cols;
+      for (int c = 0; c < 200; ++c) {
+        cols += Format("$0c$1 int", (c ? ", " : ""), c);
+      }
+      ASSERT_OK(init.Execute(Format("CREATE TABLE perf_attr_t$0 ($1)", t, cols)));
+      // Index on the LAST column so pg_get_indexdef -> get_attname -> SearchSysCache(ATTNUM) looks up
+      // a high attnum, filtering the keyless pg_attribute scan to 1 row deep in the table.
+      ASSERT_OK(init.Execute(Format("CREATE INDEX perf_idx_$0 ON perf_attr_t$0 (c199)", t)));
+    }
+  }
+
+  auto conn = ASSERT_RESULT(ConnectToTs(*ts));
+  ASSERT_OK(conn.Execute("SET yb_debug_log_catcache_events = ON"));
+  const auto start = MonoTime::Now();
+  for (int t = 0; t < 50; ++t) {
+    // (a) relcache build (pg_attribute scan filtered to the table's 200 attrs, rows_matched=200).
+    ASSERT_RESULT(conn.Fetch(Format("SELECT * FROM perf_attr_t$0", t)));
+    // (b) single-attr ATTNUM catcache lookup: pg_get_indexdef -> get_attname(relid, 200)
+    // -> SearchSysCache(ATTNUM) miss -> keyless pg_attribute scan filtered to 1 row.
+    ASSERT_RESULT(conn.Fetch(Format("SELECT pg_get_indexdef('perf_idx_$0'::regclass)", t)));
+  }
+  LOG(INFO) << "yb_perf: 50 wide-table relcache builds + ATTNUM lookups on a fresh backend took "
+            << (MonoTime::Now() - start).ToMilliseconds() << " ms";
+}
+
+// Same workload with the response cache OFF: relcache builds use per-key pg_attribute index reads
+// (read ~200 rows per table) instead of a ~10000-row keyless full scan + local filter.
+class PgCatcacheResponseCacheOffTest : public PgCatcacheResponseCacheTest {
+ protected:
+  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
+    PgCatcacheResponseCacheTest::UpdateMiniClusterOptions(options);
+    options->extra_tserver_flags.push_back("--ysql_enable_catcache_response_caching=false");
+  }
+};
+
+TEST_F_EX(PgLibPqTest, CatcacheResponseCachePgAttributePerfNoCache, PgCatcacheResponseCacheOffTest) {
+  auto* ts = cluster_->tablet_server(0);
+  {
+    auto init = ASSERT_RESULT(ConnectToTs(*ts));
+    for (int t = 0; t < 50; ++t) {
+      std::string cols;
+      for (int c = 0; c < 200; ++c) {
+        cols += Format("$0c$1 int", (c ? ", " : ""), c);
+      }
+      ASSERT_OK(init.Execute(Format("CREATE TABLE perf_attr_t$0 ($1)", t, cols)));
+      ASSERT_OK(init.Execute(Format("CREATE INDEX perf_idx_$0 ON perf_attr_t$0 (c199)", t)));
+    }
+  }
+
+  auto conn = ASSERT_RESULT(ConnectToTs(*ts));
+  ASSERT_OK(conn.Execute("SET yb_debug_log_catcache_events = ON"));
+  const auto start = MonoTime::Now();
+  for (int t = 0; t < 50; ++t) {
+    ASSERT_RESULT(conn.Fetch(Format("SELECT * FROM perf_attr_t$0", t)));
+    ASSERT_RESULT(conn.Fetch(Format("SELECT pg_get_indexdef('perf_idx_$0'::regclass)", t)));
+  }
+  LOG(INFO) << "yb_perf (no cache): 50 wide-table relcache builds + ATTNUM lookups on a fresh "
+            << "backend took " << (MonoTime::Now() - start).ToMilliseconds() << " ms";
+}
+
+// Third case: response cache ON + prefix-key optimization (yb_catalog_cache_key_columns=pg_attribute:1).
+// pg_attribute misses bind attrelid as a prefix scan + cache-key column, so each relcache build /
+// ATTNUM lookup scans only that table's ~200 rows (one cache entry per attrelid) instead of a keyless
+// full scan of the whole pg_attribute.
+TEST_F_EX(PgLibPqTest, CatcacheResponseCachePgAttributePerfPrefixKey, PgCatcacheResponseCacheTest) {
+  auto* ts = cluster_->tablet_server(0);
+  {
+    auto init = ASSERT_RESULT(ConnectToTs(*ts));
+    for (int t = 0; t < 50; ++t) {
+      std::string cols;
+      for (int c = 0; c < 200; ++c) {
+        cols += Format("$0c$1 int", (c ? ", " : ""), c);
+      }
+      ASSERT_OK(init.Execute(Format("CREATE TABLE perf_attr_t$0 ($1)", t, cols)));
+      ASSERT_OK(init.Execute(Format("CREATE INDEX perf_idx_$0 ON perf_attr_t$0 (c199)", t)));
+    }
+  }
+
+  auto conn = ASSERT_RESULT(ConnectToTs(*ts));
+  ASSERT_OK(conn.Execute("SET yb_debug_log_catcache_events = ON"));
+  ASSERT_OK(conn.Execute("SET yb_catalog_cache_key_columns = 'pg_attribute:1'"));
+  const auto start = MonoTime::Now();
+  for (int t = 0; t < 50; ++t) {
+    ASSERT_RESULT(conn.Fetch(Format("SELECT * FROM perf_attr_t$0", t)));
+    ASSERT_RESULT(conn.Fetch(Format("SELECT pg_get_indexdef('perf_idx_$0'::regclass)", t)));
+  }
+  LOG(INFO) << "yb_perf (prefix-key): 50 wide-table relcache builds + ATTNUM lookups on a fresh "
+            << "backend took " << (MonoTime::Now() - start).ToMilliseconds() << " ms";
 }
 
 } // namespace yb::pgwrapper

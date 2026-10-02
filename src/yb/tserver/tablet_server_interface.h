@@ -177,6 +177,17 @@ class TabletServerIf : public LocalTabletServer {
       const tserver::DBCatalogVersionDataPB& db_catalog_version_data,
       const tserver::DBCatalogInvalMessagesDataPB& db_catalog_inval_messages_data) = 0;
 
+  // Catalog version proof times (watermark), heartbeat-fed; see DBCatalogVersionProofDataPB.
+  // Default no-ops: only the real tablet server stores them (the master's MasterTabletServer
+  // does not serve response-cache-keyed catalog reads).
+  virtual void SetYsqlDBCatalogVersionProofs(
+      const tserver::DBCatalogVersionProofDataPB& proof_data) {}
+  // Returns the hybrid time (raw representation) at which `version` of `db_oid`'s catalog was
+  // provably still current, or nullopt if no proof is known. Used to choose the population read
+  // time for response-cache-keyed catalog scans.
+  virtual std::optional<uint64_t> GetYsqlCatalogVersionProofHt(
+      uint32_t db_oid, uint64_t version) const { return std::nullopt; }
+
   virtual void ResetCatalogVersionsFingerprint() = 0;
 
   virtual Result<YSQLLeaseInfo> GetYSQLLeaseInfo() const = 0;

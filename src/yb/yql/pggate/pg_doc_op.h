@@ -354,9 +354,18 @@ class PgDocOp {
 
   const PgTable& table() const { return table_; }
 
+  // True when the most recent Perform for this op was served from the tserver response cache
+  // (rather than read from master). Meaningful for response-cached reads (see SetResponseCacheKey).
+  [[nodiscard]] bool response_cache_hit() const { return response_cache_hit_; }
+
   static Result<PgDocResponse> DefaultSender(
       PgSession* session, std::span<const PgsqlOpPtr> ops, const PgTableDesc& table,
       const PgSession::RunOptions& options, IsForWritePgDoc is_write);
+
+  static Result<PgDocResponse> DefaultSenderWithCacheOptions(
+      PgSession* session, std::span<const PgsqlOpPtr> ops, const PgTableDesc& table,
+      const PgSession::RunOptions& options, IsForWritePgDoc is_write,
+      std::optional<PgSession::CacheOptions> cache_options);
 
  protected:
   PgDocOp(
@@ -429,6 +438,11 @@ class PgDocOp {
   // Output parameter of the execution.
   std::string out_param_backfill_spec_;
 
+  // Whether the last processed Perform response was served from the tserver response cache.
+  bool response_cache_hit_ = false;
+
+  void SetSender(Sender sender) { sender_ = std::move(sender); }
+
  private:
   Status SendRequest(ForceNonBufferable force_non_bufferable = ForceNonBufferable::kFalse);
 
@@ -478,6 +492,11 @@ class PgDocReadOp : public PgDocOp {
   PgDocReadOp(
       const PgSessionPtr& pg_session, PgTable* table,
       PgsqlReadOpPtr read_op, const Sender& sender);
+
+  // Enables tserver response caching for this read (catcache/relcache miss keyless full scan).
+  // `cache_key` is the key prefix; the sender appends the serialized read request to form the key.
+  void SetResponseCacheKey(
+      std::string cache_key, uint64_t catalog_version, uint32_t version_db_oid);
 
   Status ExecuteInit(const YbcPgExecParameters *exec_params) override;
 
@@ -648,6 +667,14 @@ class PgDocReadOp : public PgDocOp {
   // partition_column_values. PgGate makes one batch per tablet.
   std::optional<InPermutationGenerator> hash_permutations_;
   std::optional<bool> is_hash_batched_;
+
+  // Response cache key prefix for this read; non-empty once SetResponseCacheKey is called.
+  std::string response_cache_key_;
+  // Catalog version the key is keyed at (travels in caching_info for the watermark).
+  uint64_t response_cache_catalog_version_ = 0;
+  // The database (MyDatabaseId) whose counter response_cache_catalog_version_ belongs to; the
+  // watermark proof is looked up under this db (differs from the table's db for shared catalogs).
+  uint32_t response_cache_version_db_oid_ = 0;
 };
 
 //--------------------------------------------------------------------------------------------------

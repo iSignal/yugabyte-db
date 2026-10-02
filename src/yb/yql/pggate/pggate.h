@@ -622,6 +622,12 @@ class PgApiImpl {
 
   Status SetDistinctPrefixLength(PgStatement *handle, int distinct_prefix_length);
 
+  Status SetResponseCacheKey(
+      PgStatement *handle, const char *cache_key, uint64_t catalog_version,
+      uint32_t version_db_oid);
+
+  Status GetResponseCacheHit(PgStatement *handle, bool *response_cache_hit);
+
   Status ExecSelect(PgStatement *handle, const YbcPgExecParameters *exec_params);
   Result<bool> RetrieveYbctids(
       PgStatement *handle, const YbcPgExecParameters *exec_params, int natts,
@@ -706,6 +712,9 @@ class PgApiImpl {
   Status GetActiveTransactions(YbcPgSessionTxnInfo* infos, size_t num_infos);
   bool IsDdlMode() const;
   bool IsDdlModeWithRegularTransactionBlock() const;
+  // True once this session has written to a ysql catalog table outside DDL mode (no version bump);
+  // such sessions must not serve catalog reads from the version-keyed response cache.
+  bool HasNonDdlCatalogWrites() const;
   Result<bool> CurrentTransactionUsesFastPath() const;
 
   //------------------------------------------------------------------------------------------------

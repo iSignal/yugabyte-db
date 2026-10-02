@@ -117,6 +117,7 @@
 #include "utils/relcache.h"
 #include "utils/yb_inheritscache.h"
 #include "utils/yb_tuplecache.h"
+#include "pg_yb_utils.h"
 #include "yb/yql/pggate/util/ybc_guc.h"
 #include "yb/yql/pggate/ybc_gflags.h"
 #include "yb/yql/pggate/ybc_pg_typedefs.h"
@@ -561,10 +562,11 @@ ScanPgRelation(Oid targetRelId, bool indexOK, bool force_non_historic)
 	if (force_non_historic)
 		snapshot = GetNonHistoricCatalogSnapshot(RelationRelationId);
 
-	pg_class_scan = systable_beginscan(pg_class_desc, ClassOidIndexId,
-									   indexOK && criticalRelcachesBuilt,
-									   snapshot,
-									   1, key);
+	pg_class_scan = systable_beginscan_with_cache_key(pg_class_desc, ClassOidIndexId,
+													  indexOK && criticalRelcachesBuilt,
+													  snapshot,
+													  1, key,
+													  YbShouldResponseCacheCatalogRead());
 
 	pg_class_tuple = systable_getnext(pg_class_scan);
 
@@ -718,6 +720,7 @@ RelationBuildTupleDesc(Relation relation)
 	TupleConstr *constr;
 	AttrMissing *attrmiss = NULL;
 	int			ndef = 0;
+	bool		cache_response;
 
 	/* fill rd_att's type ID fields (compare heap.c's AddNewRelationTuple) */
 	relation->rd_att->tdtypeid =
@@ -749,11 +752,24 @@ RelationBuildTupleDesc(Relation relation)
 	 * without a pg_internal.init file).
 	 */
 	pg_attribute_desc = table_open(AttributeRelationId, AccessShareLock);
-	pg_attribute_scan = systable_beginscan(pg_attribute_desc,
-										   AttributeRelidNumIndexId,
-										   criticalRelcachesBuilt,
-										   NULL,
-										   2, skey);
+
+	/*
+	 * Response-cache the pg_attribute scan: issue a keyless full scan served
+	 * from the shared tserver cache and filter to this relation's attributes
+	 * locally (via skey). The cache key is built from the actual scan target in
+	 * ybc_systable_beginscan_with_cache_key, so this relcache build and an ATTNUM
+	 * catcache miss - both scanning pg_attribute's primary key - share one cached
+	 * artifact per catalog version. Disabled during initdb/bootstrap and before
+	 * the critical relcache (and hence the index) is available.
+	 */
+	cache_response = YbShouldResponseCacheCatalogRead();
+
+	pg_attribute_scan = systable_beginscan_with_cache_key(pg_attribute_desc,
+														  AttributeRelidNumIndexId,
+														  criticalRelcachesBuilt,
+														  NULL,
+														  2, skey,
+														  cache_response);
 
 	/*
 	 * add attribute data to relation->rd_att
@@ -1133,10 +1149,11 @@ RelationBuildRuleLock(Relation relation)
 	 */
 	rewrite_desc = table_open(RewriteRelationId, AccessShareLock);
 	rewrite_tupdesc = RelationGetDescr(rewrite_desc);
-	rewrite_scan = systable_beginscan(rewrite_desc,
-									  RewriteRelRulenameIndexId,
-									  true, NULL,
-									  1, &key);
+	rewrite_scan = systable_beginscan_with_cache_key(rewrite_desc,
+													 RewriteRelRulenameIndexId,
+													 true, NULL,
+													 1, &key,
+													 YbShouldResponseCacheCatalogRead());
 
 	while (HeapTupleIsValid(rewrite_tuple = systable_getnext(rewrite_scan)))
 	{
@@ -3947,8 +3964,9 @@ LookupOpclassInfo(Oid operatorClassOid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(operatorClassOid));
 	rel = table_open(OperatorClassRelationId, AccessShareLock);
-	scan = systable_beginscan(rel, OpclassOidIndexId, indexOK,
-							  NULL, 1, skey);
+	scan = systable_beginscan_with_cache_key(rel, OpclassOidIndexId, indexOK,
+											 NULL, 1, skey,
+											 YbShouldResponseCacheCatalogRead());
 
 	if (HeapTupleIsValid(htup = systable_getnext(scan)))
 	{
@@ -3982,8 +4000,9 @@ LookupOpclassInfo(Oid operatorClassOid,
 					BTEqualStrategyNumber, F_OIDEQ,
 					ObjectIdGetDatum(opcentry->opcintype));
 		rel = table_open(AccessMethodProcedureRelationId, AccessShareLock);
-		scan = systable_beginscan(rel, AccessMethodProcedureIndexId, indexOK,
-								  NULL, 3, skey);
+		scan = systable_beginscan_with_cache_key(rel, AccessMethodProcedureIndexId, indexOK,
+												 NULL, 3, skey,
+												 YbShouldResponseCacheCatalogRead());
 
 		while (HeapTupleIsValid(htup = systable_getnext(scan)))
 		{
@@ -7155,8 +7174,9 @@ AttrDefaultFetch(Relation relation, int ndef)
 				ObjectIdGetDatum(RelationGetRelid(relation)));
 
 	adrel = table_open(AttrDefaultRelationId, AccessShareLock);
-	adscan = systable_beginscan(adrel, AttrDefaultIndexId, true,
-								NULL, 1, &skey);
+	adscan = systable_beginscan_with_cache_key(adrel, AttrDefaultIndexId, true,
+											   NULL, 1, &skey,
+											   YbShouldResponseCacheCatalogRead());
 
 	while (HeapTupleIsValid(htup = systable_getnext(adscan)))
 	{
@@ -7251,8 +7271,9 @@ CheckConstraintFetch(Relation relation)
 				ObjectIdGetDatum(RelationGetRelid(relation)));
 
 	conrel = table_open(ConstraintRelationId, AccessShareLock);
-	conscan = systable_beginscan(conrel, ConstraintRelidTypidNameIndexId, true,
-								 NULL, 1, skey);
+	conscan = systable_beginscan_with_cache_key(conrel, ConstraintRelidTypidNameIndexId, true,
+												NULL, 1, skey,
+												YbShouldResponseCacheCatalogRead());
 
 	while (HeapTupleIsValid(htup = systable_getnext(conscan)))
 	{
@@ -7387,8 +7408,9 @@ RelationGetFKeyList(Relation relation)
 					BTEqualStrategyNumber, F_OIDEQ,
 					ObjectIdGetDatum(RelationGetRelid(relation)));
 		conrel = table_open(ConstraintRelationId, AccessShareLock);
-		conscan = systable_beginscan(conrel, ConstraintRelidTypidNameIndexId, true,
-									 NULL, 1, &skey);
+		conscan = systable_beginscan_with_cache_key(conrel, ConstraintRelidTypidNameIndexId, true,
+													NULL, 1, &skey,
+													YbShouldResponseCacheCatalogRead());
 	}
 	while (HeapTupleIsValid(htup = use_catcache ? YbCatCListIteratorGetNext(&iterator) : systable_getnext(conscan)))
 	{
@@ -7565,8 +7587,9 @@ RelationGetIndexList(Relation relation)
 				ObjectIdGetDatum(RelationGetRelid(relation)));
 
 	indrel = table_open(IndexRelationId, AccessShareLock);
-	indscan = systable_beginscan(indrel, IndexIndrelidIndexId, true,
-								 NULL, 1, &skey);
+	indscan = systable_beginscan_with_cache_key(indrel, IndexIndrelidIndexId, true,
+												NULL, 1, &skey,
+												YbShouldResponseCacheCatalogRead());
 
 	while (HeapTupleIsValid(htup = systable_getnext(indscan)))
 	{
@@ -7686,8 +7709,9 @@ RelationGetStatExtList(Relation relation)
 				ObjectIdGetDatum(RelationGetRelid(relation)));
 
 	indrel = table_open(StatisticExtRelationId, AccessShareLock);
-	indscan = systable_beginscan(indrel, StatisticExtRelidIndexId, true,
-								 NULL, 1, &skey);
+	indscan = systable_beginscan_with_cache_key(indrel, StatisticExtRelidIndexId, true,
+												NULL, 1, &skey,
+												YbShouldResponseCacheCatalogRead());
 
 	while (HeapTupleIsValid(htup = systable_getnext(indscan)))
 	{
@@ -8442,8 +8466,9 @@ RelationGetExclusionInfo(Relation indexRelation,
 				ObjectIdGetDatum(indexRelation->rd_index->indrelid));
 
 	conrel = table_open(ConstraintRelationId, AccessShareLock);
-	conscan = systable_beginscan(conrel, ConstraintRelidTypidNameIndexId, true,
-								 NULL, 1, skey);
+	conscan = systable_beginscan_with_cache_key(conrel, ConstraintRelidTypidNameIndexId, true,
+												NULL, 1, skey,
+												YbShouldResponseCacheCatalogRead());
 	found = false;
 
 	while (HeapTupleIsValid(htup = systable_getnext(conscan)))

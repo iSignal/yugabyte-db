@@ -22,7 +22,10 @@
 #include "yb/master/xcluster/xcluster_manager_if.h"
 #include "yb/master/ysql_ddl_verification_task.h"
 
+#include "yb/rpc/rpc_context.h"
 #include "yb/rpc/scheduler.h"
+
+#include "yb/server/server_common_flags.h"
 
 #include "yb/util/string_util.h"
 #include "yb/util/sync_point.h"
@@ -63,6 +66,19 @@ DEFINE_test_flag(int32, ysql_ddl_atomicity_alter_table_request_delay_ms, 0,
 
 DECLARE_bool(ysql_yb_enable_ddl_savepoint_support);
 DECLARE_bool(enable_heartbeat_pg_catalog_versions_cache);
+DECLARE_bool(enable_object_locking_for_table_locks);
+DECLARE_bool(ysql_enable_catalog_version_push_on_all_ddl);
+
+DEFINE_RUNTIME_bool(ysql_enable_catalog_version_push_to_tservers_on_ddl, true,
+    "When object locking is disabled, after a DDL commits, synchronously push the new YSQL catalog "
+    "version (and invalidation messages) to all live tservers instead of waiting for the next "
+    "heartbeat. This keeps the tserver catcache response cache consistent across nodes immediately "
+    "after a DDL. No effect when object locking is enabled (the lock release already carries it).");
+
+DEFINE_RUNTIME_uint32(ysql_catalog_version_push_to_tservers_timeout_ms, 10000,
+    "Deadline for the post-DDL catalog version push to all tservers "
+    "(ysql_enable_catalog_version_push_to_tservers_on_ddl). Best-effort: a tserver not updated "
+    "within this deadline is caught up by its next heartbeat.");
 
 using namespace std::placeholders;
 using std::shared_ptr;
@@ -372,10 +388,41 @@ Status CatalogManager::ReportYsqlDdlTxnStatus(
   const auto& req_txn = req->transaction_id();
   SCHECK(!req_txn.empty(), IllegalState,
       "Received ReportYsqlDdlTxnStatus request without transaction id");
-  // When req->is_committed() is known (i.e., not kNoChange), the first argument table is not
-  // needed.
-  RETURN_NOT_OK(YsqlDdlTxnCompleteCallback(
-      nullptr /* table */, req_txn, req->is_committed(), epoch, __FUNCTION__));
+  // PG awaits this RPC at DDL commit, so it is the synchronous point at which we can guarantee a
+  // version-bumping DDL is visible cluster-wide before the statement returns. When object locking
+  // is enabled the lock-release path already pushes the new catalog version to every tserver; when
+  // it is disabled, do that push here (reusing the ReleaseObjectLock RPC with an empty lock set, so
+  // none of the object-lock/DDL-atomicity machinery runs). Without it a backend on another node
+  // could serve a pre-DDL catalog snapshot from its catcache response cache until the next
+  // heartbeat. Done before (and independent of) the DDL-atomicity callback so a no-op/late
+  // verification result cannot skip it.
+  // Skip the push during a YSQL major version upgrade: the cluster may still have tservers on the
+  // old version whose ReleaseObjectLocks handler does not support this empty-lock catalog-version
+  // payload (and double-responds on it), and pushing mixed-version catalog data across them is not
+  // valid anyway. Heartbeats still propagate versions to those nodes until the upgrade finalizes.
+  if (FLAGS_ysql_enable_catalog_version_push_on_all_ddl &&
+      !FLAGS_enable_object_locking_for_table_locks &&
+      FLAGS_ysql_enable_catalog_version_push_to_tservers_on_ddl &&
+      !IsYsqlMajorVersionUpgradeInProgress()) {
+    // Bound the push so one slow/unreachable tserver can't consume the whole DDL client deadline;
+    // any tserver not updated in time is caught up by its next heartbeat.
+    const auto deadline = std::min(
+        rpc->GetClientDeadline(),
+        CoarseMonoClock::Now() +
+            MonoDelta::FromMilliseconds(FLAGS_ysql_catalog_version_push_to_tservers_timeout_ms));
+    WARN_NOT_OK(
+        object_lock_info_manager_->UpdateTServersWithLatestCatalogVersion(deadline),
+        Format("Failed to push catalog version to tservers after DDL txn $0", req_txn));
+  }
+
+  // Run the DDL-atomicity verification only when the txn had DocDB schema changes; for purely
+  // shared-catalog DDLs (e.g. CREATE ROLE) there is nothing to verify and the callback would error.
+  if (req->has_docdb_schema_changes()) {
+    // When req->is_committed() is known (i.e., not kNoChange), the first argument table is not
+    // needed.
+    RETURN_NOT_OK(YsqlDdlTxnCompleteCallback(
+        nullptr /* table */, req_txn, req->is_committed(), epoch, __FUNCTION__));
+  }
 
   if (FLAGS_enable_heartbeat_pg_catalog_versions_cache) {
     // Best effort refresh of catalog version cache. Bg task

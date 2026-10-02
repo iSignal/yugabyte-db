@@ -34,6 +34,7 @@
 #include "access/relation.h"
 #include "access/relscan.h"
 #include "access/sysattr.h"
+#include "access/valid.h"
 #include "access/xact.h"
 #include "access/yb_pg_inherits_scan.h"
 #include "access/yb_scan.h"
@@ -42,6 +43,7 @@
 #include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_database.h"
+#include "common/hashfn.h"		/* for hash_bytes (bound-key serialization) */
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_opfamily.h"
@@ -64,11 +66,16 @@
 #include "utils/elog.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/resowner_private.h"
 #include "utils/selfuncs.h"
 #include "utils/snapmgr.h"
 #include "utils/spccache.h"
+#include "utils/timestamp.h"
+
+/* GUC (defined in catcache.c) that also gates response-cache perf instrumentation below. */
+extern bool yb_debug_log_catcache_events;
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 #include "yb/yql/pggate/util/ybc_guc.h"
@@ -173,6 +180,37 @@ typedef struct YbDefaultSysScanData
 {
 	YbSysScanBaseData base;
 	YbScanDesc	ybscan;
+
+	/*
+	 * Local filtering for response-cache-backed scans. When filter_nkeys > 0,
+	 * the underlying YB scan is KEYLESS (full table/index scan, response-cached
+	 * at the tserver) and getnext applies HeapKeyTest(filter_keys) to each
+	 * returned tuple, yielding only the matching rows. This reproduces the
+	 * index scan's semantics (opclass/collation/NULL) in PG without pushing the
+	 * key to DocDB, so the cached full scan is shared across lookups and
+	 * backends. filter_keys hold HEAP attribute numbers (not index-converted).
+	 */
+	int			filter_nkeys;
+	ScanKey		filter_keys;
+
+	/*
+	 * Backing storage for the response cache key (pointed to by
+	 * ybscan->response_cache_key). Lives as long as the scan.
+	 */
+	char		response_cache_key[NAMEDATALEN + 64];
+
+	/*
+	 * Perf instrumentation, populated only when yb_debug_log_catcache_events is on. Lets us measure
+	 * the cost of serving a catcache/relcache miss from the cached full scan (transfer + deserialize
+	 * + HeapKeyTest filtering): elapsed wall time, rows scanned vs. matched, and the growth of the PG
+	 * memory context across the scan (a proxy; the full-scan row buffer itself lives in pggate/C++).
+	 */
+	bool		yb_instrument;
+	TimestampTz yb_scan_start_us;
+	int64		yb_rows_scanned;
+	int64		yb_rows_matched;
+	MemoryContext yb_mem_ctx;
+	Size		yb_mem_baseline;
 } YbDefaultSysScanData;
 
 typedef struct YbDefaultSysScanData *YbDefaultSysScan;
@@ -571,6 +609,12 @@ ybcFetchNextHeapTuple(YbScanDesc ybScan, ScanDirection dir)
 			else if (ScanDirectionIsBackward(dir))
 				HandleYBStatus(YBCPgSetForwardScan(ybScan->handle, false));
 
+			if (ybScan->response_cache_key)
+				HandleYBStatus(YBCPgSetResponseCacheKey(ybScan->handle,
+														ybScan->response_cache_key,
+														ybScan->response_cache_catalog_version,
+														MyDatabaseId));
+
 			HandleYBStatus(YBCPgExecSelect(ybScan->handle,
 										   ybScan->exec_params));
 			ybScan->is_exec_done = true;
@@ -706,6 +750,12 @@ ybcFetchNextIndexTuple(YbScanDesc ybScan, ScanDirection dir)
 				HandleYBStatus(YBCPgSetForwardScan(ybScan->handle, true));
 			else if (ScanDirectionIsBackward(dir))
 				HandleYBStatus(YBCPgSetForwardScan(ybScan->handle, false));
+
+			if (ybScan->response_cache_key)
+				HandleYBStatus(YBCPgSetResponseCacheKey(ybScan->handle,
+														ybScan->response_cache_key,
+														ybScan->response_cache_catalog_version,
+														MyDatabaseId));
 
 			HandleYBStatus(YBCPgExecSelect(ybScan->handle,
 										   ybScan->exec_params));
@@ -4237,6 +4287,21 @@ ybc_systable_beginscan(Relation relation,
 											snapshot, nkeys, key));
 }
 
+/*
+ * Start perf instrumentation for a default sys scan when yb_debug_log_catcache_events is on. No-op
+ * otherwise (the fields were zeroed by palloc0). Call once the scan is fully set up.
+ */
+static void
+yb_systable_scan_instrument_begin(YbDefaultSysScan scan)
+{
+	if (!yb_debug_log_catcache_events)
+		return;
+	scan->yb_instrument = true;
+	scan->yb_scan_start_us = GetCurrentTimestamp();
+	scan->yb_mem_ctx = CurrentMemoryContext;
+	scan->yb_mem_baseline = MemoryContextMemAllocated(CurrentMemoryContext, true);
+}
+
 static HeapTuple
 ybc_systable_getnext(YbSysScanBase default_scan)
 {
@@ -4244,16 +4309,67 @@ ybc_systable_getnext(YbSysScanBase default_scan)
 
 	Assert(PointerIsValid(scan->ybscan));
 
-	HeapTuple	tuple = ybc_getnext_heaptuple(scan->ybscan,
-											  true);	/* is_forward_scan */
+	HeapTuple	tuple;
 
-	return tuple;
+	while (HeapTupleIsValid(tuple = ybc_getnext_heaptuple(scan->ybscan,
+														  true /* is_forward_scan */ )))
+	{
+		bool		matches;
+
+		if (scan->yb_instrument)
+			scan->yb_rows_scanned++;
+
+		/*
+		 * Non-filtered scans yield every tuple. For response-cache-backed
+		 * keyless scans, apply the original scan key locally and skip
+		 * non-matching tuples so callers see the same rows an index scan would.
+		 */
+		if (scan->filter_nkeys == 0)
+		{
+			if (scan->yb_instrument)
+				scan->yb_rows_matched++;
+			return tuple;
+		}
+
+		HeapKeyTest(tuple,
+					scan->ybscan->target_desc,
+					scan->filter_nkeys,
+					scan->filter_keys,
+					matches);
+		if (matches)
+		{
+			if (scan->yb_instrument)
+				scan->yb_rows_matched++;
+			return tuple;
+		}
+	}
+
+	return NULL;
 }
 
 static void
 ybc_systable_endscan(YbSysScanBaseData *default_scan)
 {
 	YbDefaultSysScan scan = (void *) default_scan;
+
+	if (scan->yb_instrument)
+	{
+		long		elapsed_us = (long) (GetCurrentTimestamp() - scan->yb_scan_start_us);
+		Size		mem_now = MemoryContextMemAllocated(scan->yb_mem_ctx, true /* recurse */ );
+		Size		mem_delta = mem_now > scan->yb_mem_baseline ?
+			mem_now - scan->yb_mem_baseline : 0;
+
+		elog(LOG,
+			 "yb_sys_scan perf: reloid=%u cached=%d key=%s rows_scanned=%ld rows_matched=%ld "
+			 "elapsed_us=%ld pg_mem_delta_bytes=%zu",
+			 (scan->ybscan && scan->ybscan->table) ?
+			 RelationGetRelid(scan->ybscan->table) : InvalidOid,
+			 (scan->ybscan && scan->ybscan->response_cache_key) ? 1 : 0,
+			 (scan->ybscan && scan->ybscan->response_cache_key) ?
+			 scan->ybscan->response_cache_key : "(uncached)",
+			 (long) scan->yb_rows_scanned, (long) scan->yb_rows_matched,
+			 elapsed_us, mem_delta);
+	}
 
 	ybc_free_ybscan(scan->ybscan);
 	pfree(scan);
@@ -4263,6 +4379,28 @@ static YbSysScanVirtualTable yb_default_scan = {
 	.next = &ybc_systable_getnext,
 	.end = &ybc_systable_endscan
 };
+
+/*
+ * Returns true if this scan's most recent read was served from the tserver response cache rather
+ * than read from master. Only meaningful for response-cache-backed default scans (those created
+ * with cache_response=true); returns false otherwise. Call before systable_endscan.
+ */
+bool
+ybc_systable_scan_response_cache_hit(SysScanDesc scan)
+{
+	if (!scan->ybscan || scan->ybscan->vtable != &yb_default_scan)
+		return false;
+
+	YbDefaultSysScan dscan = (YbDefaultSysScan) scan->ybscan;
+
+	if (!dscan->ybscan || !dscan->ybscan->response_cache_key || !dscan->ybscan->handle)
+		return false;
+
+	bool		hit = false;
+
+	HandleYBStatus(YBCPgGetResponseCacheHit(dscan->ybscan->handle, &hit));
+	return hit;
+}
 
 SysScanDesc
 ybc_systable_begin_default_scan(Relation relation,
@@ -4329,6 +4467,251 @@ ybc_systable_begin_default_scan(Relation relation,
 	if (index)
 		RelationClose(index);
 
+	yb_systable_scan_instrument_begin(scan);
+	return YbBuildSysScanDesc(relation, snapshot, &scan->base);
+}
+
+/*
+ * Returns N (number of leading index key columns to bind as a prefix scan and add to the response
+ * cache key) for `relation`, per the yb_catalog_cache_key_columns GUC ("table:N,..."). 0 if the
+ * relation is not listed or the GUC is empty. Clamped to [0, 1] for now.
+ */
+static int
+yb_catalog_cache_key_columns_for(Relation relation)
+{
+	const char *spec_orig = yb_catalog_cache_key_columns;
+	const char *relname;
+	char	   *spec;
+	char	   *saveptr = NULL;
+	int			result = 0;
+
+	if (spec_orig == NULL || spec_orig[0] == '\0')
+		return 0;
+
+	relname = RelationGetRelationName(relation);
+	spec = pstrdup(spec_orig);
+
+	for (char *tok = strtok_r(spec, ",", &saveptr); tok != NULL;
+		 tok = strtok_r(NULL, ",", &saveptr))
+	{
+		char	   *colon = strchr(tok, ':');
+
+		if (colon == NULL)
+			continue;
+		*colon = '\0';
+		if (strcmp(tok, relname) == 0)
+		{
+			result = atoi(colon + 1);
+			break;
+		}
+	}
+	pfree(spec);
+
+	if (result < 0)
+		result = 0;
+	if (result > 1)
+		result = 1;
+	return result;
+}
+
+/*
+ * Append one bound prefix-key value to a response cache key buffer.
+ *
+ * Bound keys are NOT necessarily integers: key[i].sk_argument is a Datum whose meaning depends on
+ * the catalog column's type. For the common prefix columns (OIDs / ints, e.g. pg_attribute.attrelid)
+ * the Datum holds the value by-value and serializes directly. A pass-by-reference column (e.g. a
+ * "name"/text leading index column) instead holds a POINTER whose address is backend-local and
+ * meaningless as a shared key - it must serialize its CONTENT.
+ *
+ * This deliberately reads typbyval/typlen/atttypid from the relation's already-loaded, in-memory
+ * tuple descriptor and serializes the raw datum bytes itself. It does NOT use the type's output
+ * function (YBDatumToString / getTypeOutputInfo): that does a pg_type (TYPEOID) catcache lookup,
+ * which on a miss issues a pg_type scan that re-reads pg_attribute and re-enters THIS prefix-key
+ * path - unbounded re-entrancy that overflows the stack (observed as a SIGSEGV in
+ * CatcacheResponseCacheSharing). Catalog access is not allowed in this scan-setup hot path.
+ *
+ * The fixed key buffer cannot grow, so a value whose literal form would overflow (or that contains
+ * the ':' separator) is keyed by a stable content hash instead of being truncated - silent
+ * truncation could alias two distinct values onto one cache entry, which would be a correctness bug.
+ */
+static void
+YbAppendBoundKeyValue(char *key, size_t keysize, Relation relation,
+					  AttrNumber heap_attno, Datum value)
+{
+	Form_pg_attribute att = TupleDescAttr(RelationGetDescr(relation), heap_attno - 1);
+	size_t		off = strlen(key);
+	char	   *out = key + off;
+	size_t		avail = keysize - off;
+	const char *bytes;
+	int			len;
+
+	if (att->attbyval)
+	{
+		/* Integer-like (oid, int2/4/8, bool, char, ...): the Datum IS the value. */
+		snprintf(out, avail, ":%llu", (unsigned long long) value);
+		return;
+	}
+
+	if (att->attlen == -1)		/* varlena (text, bytea, ...) */
+	{
+		struct varlena *v = pg_detoast_datum_packed((struct varlena *) DatumGetPointer(value));
+
+		bytes = VARDATA_ANY(v);
+		len = VARSIZE_ANY_EXHDR(v);
+	}
+	else if (att->attlen == -2) /* cstring */
+	{
+		bytes = DatumGetCString(value);
+		len = strlen(bytes);
+	}
+	else						/* fixed-length by-ref, e.g. "name" */
+	{
+		bytes = (const char *) DatumGetPointer(value);
+		len = (att->atttypid == NAMEOID) ? (int) strnlen(bytes, NAMEDATALEN) : att->attlen;
+	}
+
+	/* +2 leaves room for the ':' separator and the terminating NUL. */
+	if ((size_t) len + 2 <= avail && memchr(bytes, ':', len) == NULL)
+		snprintf(out, avail, ":%.*s", len, bytes);
+	else
+		snprintf(out, avail, ":h%08x", hash_bytes((const unsigned char *) bytes, len));
+}
+
+SysScanDesc
+ybc_systable_beginscan_with_cache_key(Relation relation,
+									  Oid indexId,
+									  bool indexOK,
+									  Snapshot snapshot,
+									  int nkeys,
+									  ScanKey key,
+									  bool cache_response)
+{
+	/*
+	 * Fall back to the standard scan when caching is not requested or during
+	 * bootstrap. When caching IS requested we use the keyless+filter path even
+	 * for relations that have an optimized scan (e.g. pg_inherits), so their
+	 * full scan is response-cached too.
+	 */
+	if (!cache_response || IsBootstrapProcessingMode())
+		return ybc_systable_beginscan(relation, indexId, indexOK, snapshot,
+									  nkeys, key);
+
+	Relation	index = NULL;
+
+	/*
+	 * Resolve the index only for ordering/determinism of the cached request.
+	 * A primary-key index means we scan the (PK-ordered) base table directly.
+	 * Note: we intentionally do NOT convert the scan key attnums to index
+	 * attnums (as the default scan does), because the key is used for local
+	 * HeapKeyTest filtering against the HEAP tuple, not for index binding.
+	 */
+	if (indexOK && !IgnoreSystemIndexes && !ReindexIsProcessingIndex(indexId))
+	{
+		index = RelationIdGetRelation(indexId);
+		if (index->rd_index->indisprimary)
+		{
+			RelationClose(index);
+			index = NULL;
+		}
+	}
+
+	YbDefaultSysScan scan = palloc0(sizeof(YbDefaultSysScanData));
+
+	/*
+	 * Build the response cache key here, where the ACTUAL scan target is known:
+	 * a secondary-index scan and a base-table (or primary-key) scan return rows
+	 * in different orders, so they must be cached separately. scan_target is the
+	 * secondary index OID, or InvalidOid (0) for a base-table/PK scan. Lookups that
+	 * resolve to the SAME physical scan (e.g. an ATTNUM catcache miss and a relcache
+	 * build, both over pg_attribute's PK) share one cached artifact; different index
+	 * orders (e.g. ATTNAME) get their own. The version is the primary cross-version
+	 * correctness mechanism (Disable bucket-version backs it).
+	 *
+	 * ALL catalogs - shared (pg_database, pg_authid, ...) and per-database alike - are keyed by
+	 * (db_oid, BACKEND-LOCAL per-db catalog version): "<reloid>:<scan_target>:<db_oid>:<version>".
+	 *  - db_oid scopes the entry: per-db catalogs share reloids across databases, and per-db
+	 *    catalog VERSIONS are independent counters, so two databases at the same numeric version
+	 *    must not alias to one entry (historically: a backend connecting to a just-created database
+	 *    was served another database's stale pg_database scan -> NULL db name -> startup crash).
+	 *    Shared catalogs pay a small dedup cost (one cached copy per database instead of one
+	 *    global) for this scoping; they are small tables.
+	 *  - The version MUST be the backend's LOCAL version, never the tserver-shared-memory version:
+	 *    shm lags master by up to a heartbeat, so a session that just committed a shared-catalog
+	 *    DDL (e.g. CREATE ROLE) would key its next lookup at the stale pre-DDL shm version and be
+	 *    served the pre-DDL scan ("role does not exist" right after CREATE ROLE -
+	 *    yb.port.misc_functions). The local version is synchronously advanced by the session's own
+	 *    DDL commit, and every shared-catalog DDL bumps ALL databases' versions, so shared-catalog
+	 *    changes always move this key forward for the issuer; other backends advance when they
+	 *    apply the bump, until which their old-version snapshot is the correct one for them.
+	 */
+	int			bound_nkeys = Min(yb_catalog_cache_key_columns_for(relation), nkeys);
+	ScanKeyData bound_keys[2];
+
+	const uint64_t cache_key_version = YbGetCatalogCacheVersion();
+
+	snprintf(scan->response_cache_key, sizeof(scan->response_cache_key),
+			 "%u:%u:%u:%llu",
+			 RelationGetRelid(relation),
+			 index ? RelationGetRelid(index) : InvalidOid,
+			 MyDatabaseId,
+			 (unsigned long long) cache_key_version);
+
+	/*
+	 * Prefix-key optimization (yb_catalog_cache_key_columns): bind the first bound_nkeys scan keys
+	 * (pushed to DocDB) and append their values to the cache key, so the cached scan covers only the
+	 * matching prefix (e.g. pg_attribute for ONE attrelid) instead of the whole table. The remaining
+	 * keys are still filtered locally via HeapKeyTest. bound_nkeys == 0 keeps the keyless full scan.
+	 * The bound keys are converted to index attnums for binding (as the default scan does); their
+	 * VALUES (sk_argument, attnum-independent) go in the cache key.
+	 */
+	for (int i = 0; i < bound_nkeys; i++)
+	{
+		/* key[i].sk_attno is still the HEAP attnum here (converted to index attnum below). */
+		YbAppendBoundKeyValue(scan->response_cache_key, sizeof(scan->response_cache_key),
+							  relation, key[i].sk_attno, key[i].sk_argument);
+		bound_keys[i] = key[i];
+		if (index)
+			bound_keys[i].sk_attno = YbGetIndexAttnum(index, bound_keys[i].sk_attno);
+	}
+
+	/*
+	 * Issue the scan: keyless full scan (bound_nkeys == 0), or a prefix scan binding the first
+	 * bound_nkeys keys. The response is cached at the tserver under response_cache_key and shared
+	 * across backends and lookups producing the same scan; remaining keys are filtered in
+	 * ybc_systable_getnext via HeapKeyTest.
+	 */
+	scan->ybscan = YbBeginScan(relation,
+							   index,
+							   false,	/* xs_want_itup */
+							   bound_nkeys,
+							   bound_nkeys > 0 ? bound_keys : NULL,
+							   NULL,	/* pg_scan_plan */
+							   NULL,	/* rel_pushdown */
+							   NULL,	/* idx_pushdown */
+							   NULL,	/* aggrefs */
+							   0,	/* distinct_prefixlen */
+							   NULL,	/* exec_params */
+							   true,	/* is_internal_scan */
+							   false);	/* fetch_ybctids_only */
+	scan->ybscan->response_cache_key = scan->response_cache_key;
+	scan->ybscan->response_cache_catalog_version = cache_key_version;
+	Assert(!YbNeedsPgRecheck(scan->ybscan));
+
+	/* Save the remaining (heap-attnum) keys for local HeapKeyTest filtering. */
+	if (nkeys > bound_nkeys)
+	{
+		scan->filter_nkeys = nkeys - bound_nkeys;
+		scan->filter_keys = (ScanKey) palloc(scan->filter_nkeys * sizeof(ScanKeyData));
+		memcpy(scan->filter_keys, key + bound_nkeys,
+			   scan->filter_nkeys * sizeof(ScanKeyData));
+	}
+
+	scan->base.vtable = &yb_default_scan;
+
+	if (index)
+		RelationClose(index);
+
+	yb_systable_scan_instrument_begin(scan);
 	return YbBuildSysScanDesc(relation, snapshot, &scan->base);
 }
 

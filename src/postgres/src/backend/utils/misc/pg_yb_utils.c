@@ -208,6 +208,113 @@ YbGetCatalogCacheVersion()
 	return yb_catalog_cache_version;
 }
 
+/*
+ * True while YbGetDdlMode is classifying a (potential) DDL statement. Classification inspects the
+ * statement's target objects (e.g. T_DropStmt resolves each object via RangeVarGetRelidExtended to
+ * test for temp relations) BEFORE the DDL nesting level rises, so the DDL gates below don't cover
+ * those lookups. They must not be served from the response cache: a cache-served NEGATIVE lookup
+ * (object created by another node at a version this backend hasn't applied yet) is inserted into
+ * the local catcache and then answers the DDL's own name resolution without any storage read -
+ * "table does not exist" for a table that exists (TestPgCacheConsistency cross-node DROP). The
+ * fresh uncached read sees the committed object, matching master semantics where DDLs linearize.
+ */
+static bool yb_ddl_classification_in_progress = false;
+
+bool
+YbShouldResponseCacheCatalogRead()
+{
+	/*
+	 * Serve catcache/relcache misses from the tserver response cache when the feature is on. Skip:
+	 *  - during initdb (catalog version not meaningful);
+	 *  - while sys-table prefetching is active (preload PRODUCES the cached full scans, the miss
+	 *    path CONSUMES them - never engage the miss-path caching during a preload scan);
+	 *  - while a DDL is in progress, OR anywhere inside a transaction that has run a transactional
+	 *    DDL. Such reads must see the transaction's own (uncommitted) catalog writes, not a cached
+	 *    full scan from an earlier version. Two checks cover both DDL flavors for the WHOLE
+	 *    transaction (YBTxnDdlProcessUtility sets both BEFORE the DDL body executes, so they are
+	 *    active for every catalog read that could observe uncommitted writes):
+	 *      * a regular (autonomous) DDL raises the DDL nesting level (YBGetDdlNestingLevel() > 0);
+	 *      * a transactional DDL (DDL in a txn block) sets use_regular_txn_block, which stays set
+	 *        for the entire transaction (cleared only at commit/abort) - so even a later NON-DDL
+	 *        read in the same block is gated off.
+	 *    (The per-statement YBIsCurrentStmtDdl() is intentionally NOT checked: it is set slightly
+	 *    earlier, in YbGetDdlMode, but by the time the DDL writes anything one of the two checks
+	 *    above is already set; the only window it uniquely covers is before any write, where serving
+	 *    from the cache at the unchanged catalog version is correct.)
+	 *  - when this backend has a temporary namespace. Temp objects' catalog rows (pg_class,
+	 *    pg_attribute, ...) are session-private and are NOT part of the shared, catalog-version-keyed
+	 *    full scans the response cache serves, so a cached scan would miss them ("relation does not
+	 *    exist"). Read such catalogs directly so temp objects are visible.
+	 *  - when additional-table preloading is configured. Eager preload pre-builds the relcache/
+	 *    catcache from its own batched full scans at connection startup; this feature instead serves
+	 *    LAZY misses from per-(table,index) full scans. The two solve the same problem in different,
+	 *    mutually redundant ways and must not be mixed - if an operator opted into expanded preload,
+	 *    defer to it and keep the miss path off.
+	 *  - during a time-travel read (yb_read_time != 0). The response cache is keyed only by catalog
+	 *    version, NOT by read time, so it cannot represent a historical catalog snapshot: a cached
+	 *    full scan populated by a normal read at the current time would be served to (or aliased with)
+	 *    a reader asking for an older instant, yielding the wrong rows. AS-OF clone/backup/restore and
+	 *    CDC replication-slot initial-snapshot reads all set yb_read_time and must go straight to
+	 *    storage at the explicit read time. (See clone ysql_dump "relation does not exist" failures.)
+	 *  - during a binary upgrade (pg_upgrade restore). The major-version upgrade migrates the catalog
+	 *    in bulk and does NOT advance the catalog version per restored object (the master logs
+	 *    "Ignoring alter table ... during a major YSQL upgrade" / "returning early from CreateTable").
+	 *    A version-keyed cache therefore keeps serving the pre-restore (empty) full scan, so a freshly
+	 *    restored relation is invisible to the very next statement that reads its catalog row (e.g.
+	 *    pg_restore_relation_stats => "relation public.<tbl> does not exist"). Read directly so the
+	 *    restore sees its own just-written catalog rows.
+	 *  - once this session has performed any NON-DDL write to a catalog table
+	 *    (YBCPgHasNonDdlCatalogWrites - latched for the session's lifetime in pggate at op-apply
+	 *    time). Non-DDL catalog writes (yb_non_ddl_txn_for_sys_tables_allowed scripts poking
+	 *    pg_class, clone schema application, large-object metadata writes, ...) do NOT bump the
+	 *    catalog version, so a version-keyed cached scan can never reflect them; the writer's own
+	 *    re-reads (typically AFTER it resets the GUC - hence a latch, not a live GUC check) must go
+	 *    to storage to see its writes. The latch deliberately fires on the WRITE, not the GUC:
+	 *    enabling the GUC without writing leaves the catalog content unchanged, so cached reads
+	 *    remain correct until the first write. It also resolves the co-batching protocol hazard: a
+	 *    cacheable read flushed together with buffered catalog writes (the pg_session.cc buffer.Take
+	 *    path) would get a single cached response for a multi-op Perform ("Wrong number of
+	 *    responses"); since the buffered writes latch before the read is issued, such reads are
+	 *    never cache-keyed. DDL-mode writes intentionally do NOT latch: a committed DDL bumps the
+	 *    version (cached reads at the new version are fresh) and an aborted DDL rolls its writes
+	 *    back (old-version entries stay correct); the DDL gates above cover the in-DDL window.
+	 */
+	Oid			temp_namespace_id;
+	Oid			temp_toast_namespace_id;
+
+	GetTempNamespaceState(&temp_namespace_id, &temp_toast_namespace_id);
+
+	return IsYugaByteEnabled() &&
+		!YBIsInitDbModeEnvVarSet() &&
+		!YBCIsSysTablePrefetchingStarted() &&
+		YBGetDdlNestingLevel() == 0 &&
+		!YBGetDdlUseRegularTransactionBlock() &&
+		!yb_ddl_classification_in_progress &&
+		!OidIsValid(temp_namespace_id) &&
+		!YbNeedAdditionalCatalogTables() &&
+		yb_read_time == 0 &&
+		!IsBinaryUpgrade &&
+		!YBCPgHasNonDdlCatalogWrites() &&
+		/*
+		 * The catcache-miss response cache (and its catalog-version watermark / synchronous
+		 * push) is the cross-node catalog-consistency mechanism for clusters WITHOUT object
+		 * locking. When object locking is enabled it propagates catalog versions itself (the
+		 * lock-release path) and refreshes a backend's catalog on lock acquisition, so this
+		 * version-keyed miss path is both redundant and could serve a backend its
+		 * transaction-pinned (stale) catalog. Gate the whole miss path off in that case. Note
+		 * YBGetDdlUseRegularTransactionBlock() above only reflects the current DDL's mode, not
+		 * the global setting, so a non-DDL catcache miss still needs this explicit check.
+		 */
+		!*YBCGetGFlags()->enable_object_locking_for_table_locks &&
+		/*
+		 * The version-keyed miss path is served at a per-version "guaranteed read time" watermark
+		 * that the master derives solely from pg_yb_invalidation_messages. With invalidation
+		 * messages disabled there is no watermark, so the whole feature is disabled.
+		 */
+		YbIsInvalidationMessageEnabled() &&
+		*YBCGetGFlags()->ysql_enable_catcache_response_caching;
+}
+
 uint64_t
 YbGetNewCatalogVersion()
 {
@@ -2210,6 +2317,7 @@ YbWholeRowAttrRequired(Relation relation, CmdType operation)
  *------------------------------------------------------------------------------
  */
 
+char	   *yb_catalog_cache_key_columns = NULL;
 bool		yb_enable_create_with_table_oid = false;
 int			yb_index_state_flags_update_delay = 1000;
 bool		yb_enable_expression_pushdown = true;
@@ -3616,6 +3724,14 @@ YbGetDdlMode(PlannedStmt *pstmt, ProcessUtilityContext context,
 		is_breaking_change = false;
 	}
 
+	/*
+	 * Classification below may resolve the statement's target objects (catalog lookups) before the
+	 * DDL nesting level rises; those lookups must bypass the response cache (see the flag's
+	 * comment near YbShouldResponseCacheCatalogRead). Cleared after the switch; a leak via elog
+	 * ERROR mid-classification only disables caching until the next utility statement (safe).
+	 */
+	yb_ddl_classification_in_progress = true;
+
 	switch (node_tag)
 	{
 			/*
@@ -3706,6 +3822,11 @@ YbGetDdlMode(PlannedStmt *pstmt, ProcessUtilityContext context,
 		case T_CreateTransformStmt:
 		case T_CreateTrigStmt:
 		case T_CreateUserMappingStmt:
+		case T_ImportForeignSchemaStmt: /* a batch of CREATE FOREIGN TABLEs: must bump the version
+										 * like a single CREATE FOREIGN TABLE does (the stashed
+										 * subcommands are non-top-level and do not bump); without
+										 * a bump even the importing session's own re-reads can be
+										 * served pre-import catalog state. */
 			/*
 			 * Add objects that may reference/alter other objects so we need to increment the
 			 * catalog version to ensure the other objects' metadata is refreshed.
@@ -4246,6 +4367,8 @@ YbGetDdlMode(PlannedStmt *pstmt, ProcessUtilityContext context,
 			is_ddl = false;
 			break;
 	}
+
+	yb_ddl_classification_in_progress = false;
 
 	if (YbIsTopLevelOrAtomicStatement(context))
 		ddl_transaction_state.is_top_level_ddl_active = is_ddl;

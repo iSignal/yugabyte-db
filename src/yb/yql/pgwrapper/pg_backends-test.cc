@@ -935,6 +935,12 @@ class PgBackendsTestRf3TableLocksDisabled : public PgBackendsTestRf3 {
     PgBackendsTestRf3::UpdateMiniClusterOptions(options);
     options->extra_tserver_flags.push_back("--enable_object_locking_for_table_locks=false");
     options->extra_master_flags.push_back("--enable_object_locking_for_table_locks=false");
+    // LostHeartbeats disables a tserver's heartbeat and asserts that tserver's catalog version
+    // stays behind. The synchronous catalog-version push at DDL commit would bypass the disabled
+    // heartbeat and catch that tserver up, defeating the test; disable it so the test exercises
+    // the heartbeat-lag detection it targets.
+    options->extra_master_flags.push_back(
+        "--ysql_enable_catalog_version_push_to_tservers_on_ddl=false");
   }
 };
 

@@ -782,6 +782,11 @@ message ReportYsqlDdlTxnStatusRequestPB {
 
   // Whether the above transaction is committed or aborted.
   optional bool is_committed = 2;
+
+  // Whether the DDL transaction made DocDB schema changes (e.g. table create/alter/drop). When
+  // false, the report is sent purely to trigger a synchronous catalog-version push to tservers and
+  // the master skips the DDL-atomicity verification callback.
+  optional bool has_docdb_schema_changes = 3;
 }
 
 message ReportYsqlDdlTxnStatusResponsePB {

@@ -489,6 +489,28 @@ message DBCatalogVersionDataPB {
   optional bool ignore_catalog_version_staleness_check = 2 [ default = false ];
 }
 
+// Catalog version "proof times" (the catalog version watermark) for one database: a flat map of
+// catalog version -> a hybrid time at which that version was provably still current. Consumed by
+// the tserver response cache to pick provably-version-consistent read times when populating
+// version-keyed catalog scan entries (see pg_client_session.cc). The tserver looks up purely by
+// version - no latest/superseded distinction is needed: for the current version the master keeps
+// sending an advancing guarantee time (so it never goes stale -> no "Snapshot too old"); for older
+// versions it sends a fixed time within [commit(version), commit(version+1)). The tserver merges
+// by max per version, so an entry's time only ever moves forward (heartbeats can arrive out of
+// order) and a superseded version retains the freshest time it was ever seen current.
+message YsqlCatalogVersionProofPB {
+  optional uint32 db_oid = 1;
+  message VersionGuaranteePB {
+    optional uint64 version = 1;
+    optional fixed64 guarantee_ht = 2;
+  }
+  repeated VersionGuaranteePB versions = 2;
+}
+
+message DBCatalogVersionProofDataPB {
+  repeated YsqlCatalogVersionProofPB db_proofs = 1;
+}
+
 // This matches a row in pg_yb_invalidation_messages table, which has a composite primary
 // key of (db_oid, current_version). For each pair of (db_oid, current_version), there is
 // a list of invalidation messages. The table pg_yb_invalidation_messages also has a message
@@ -542,6 +564,12 @@ message ReleaseObjectLockRequestPB {
   optional uint64 recipient_lease_epoch = 12;
 
   repeated docdb.ObjectLockPB object_locks = 13;
+  // Catalog version watermark (per-(db, version) guaranteed read times) as of when this request is
+  // created, carried alongside db_catalog_version_data so a DDL release that bumps the catalog
+  // version lets the recipient TServer serve version-keyed catcache reads at the new version
+  // immediately, instead of waiting for the next heartbeat. Transient like db_catalog_version_data
+  // (not persisted).
+  optional DBCatalogVersionProofDataPB db_catalog_version_proof_data = 14;
   // If any new field is added here. Do not forget to update
   // ReleaseRequestToPersist accordingly.
 }
