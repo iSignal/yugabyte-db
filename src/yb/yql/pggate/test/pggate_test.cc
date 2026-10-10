@@ -99,6 +99,10 @@ bool IsInParallelModeNoOp() {
   return false;
 }
 
+YbcPgLocalCatalogVersion GetLocalCatalogVersionStub() {
+  return {.db_oid = kPgInvalidOid, .version = 0};
+}
+
 } // namespace
 
 PggateTest::PggateTest() = default;
@@ -196,6 +200,7 @@ Status PggateTest::Init(
   callbacks.HasProcessableAbortInterrupt =
       &HasProcessableAbortInterruptNoOp;
   callbacks.IsInParallelMode = &IsInParallelModeNoOp;
+  callbacks.GetLocalCatalogVersion = &GetLocalCatalogVersionStub;
 
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_pggate_tserver_shared_memory_uuid) =
       cluster_->tablet_server(0)->instance_id().permanent_uuid();
