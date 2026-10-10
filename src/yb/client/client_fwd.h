@@ -134,6 +134,7 @@ class PermissionsCache;
 class ReadRpc;
 class TabletInvoker;
 class TxnBatcherIf;
+class WaitForAsyncWriteRpc;
 class WriteRpc;
 
 struct InFlightOp;
