@@ -100,9 +100,10 @@ class PgMiniTestBase : public MiniClusterTestWithClient<MiniCluster> {
 
   Status SetupPGCallbacksAndStartPG(uint16_t pg_port, size_t pg_ts_idx);
 
-  // Waits until every tablet server that has a local copy of the master system catalog serves
-  // catalog reads from it. A tablet server whose flags do not allow the copy has none, and is
-  // skipped.
+  // Waits until the local copy of the master system catalog serves catalog reads on the tablet
+  // server running PG and on every other tablet server that holds a YSQL lease. Master pushes only
+  // to lease holders, so a copy on a tablet server without a lease never serves. A tablet server
+  // whose flags do not allow the copy has none, and is skipped.
   Status WaitForLocalCatalogCopiesToServe();
 
   Status RestartPostgres();

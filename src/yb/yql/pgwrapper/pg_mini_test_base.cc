@@ -163,9 +163,14 @@ Status PgMiniTestBase::SetupPGCallbacksAndStartPG(uint16_t pg_port, size_t pg_ts
 }
 
 Status PgMiniTestBase::WaitForLocalCatalogCopiesToServe() {
-  for (const auto& mini_ts : cluster_->mini_tablet_servers()) {
+  const auto& mini_tservers = cluster_->mini_tablet_servers();
+  for (size_t i = 0; i != mini_tservers.size(); ++i) {
+    const auto& mini_ts = mini_tservers[i];
     auto* replica = mini_ts->server()->local_catalog_replica();
     if (!replica) {
+      continue;
+    }
+    if (i != kPgTsIndex && !VERIFY_RESULT(mini_ts->server()->GetYSQLLeaseInfo()).is_live) {
       continue;
     }
     RETURN_NOT_OK(WaitFor(
