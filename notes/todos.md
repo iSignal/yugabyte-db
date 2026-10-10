@@ -7,6 +7,14 @@ Every open and closed item for the feature, in one place. The design is
 `docdb_local_catalog` at `8cd70bea5b4` (worktree `repo6`) and drift; symbol
 names are the stable pointers.
 
+Since 2026-10-07 master pushes the system catalog WAL to the copies
+([push-plan.md](push-plan.md)); the tserver no longer polls master. The tserver
+class `LocalCatalogPoller` (`local_catalog_poller.cc`) became
+`LocalCatalogApplier` (`local_catalog_applier.cc`), and its thread applies
+pushed pages and sends floor requests. Closed items, history paragraphs and
+observations dated before 2026-10-07 still say "poll" and "poller" and describe
+the pull path as it was.
+
 Severity: **High** = silent wrong results, corruption, outage or a hang in a
 plausible scenario; **Medium** = bounded staleness, latency or availability
 cost, or cost at scale; **Low** = minor. Status: **open**, **decided** (the
@@ -18,39 +26,38 @@ approach is fixed, not coded), **closed** (in the code and tested, or dropped).
 
 | Id | Item | plan2 | Details |
 |---|---|---|---|
-| T1 | Freshness guarantee on applied versions on both the release and the heartbeat path | [§4.3](plan2.md#43-freshness-guarantee) | [2.1](#21-t1-freshness-guarantee-on-applied-versions) |
-| T2 | Serving condition on entering serving: lease bound and versions published while not serving | [§7.1](plan2.md#71-lease-loss-lease-regain-and-tserver-restart) | [2.2](#22-t2-serving-condition-on-entering-serving) |
 | T3 | Remote bootstrap copies state the copy must not trust: uncommitted WAL tail and open transactions' intents | [§11.2 item 1](plan2.md#112-master-side) | [2.3](#23-t3-remote-bootstrap-copies-untrusted-state) |
-| T4 | Login profile catalogs read from master (decided) | [§11.1 item 1](plan2.md#111-pg-side) | [2.4](#24-t4-login-profile-catalogs) |
-| T5 | Large objects: catalog writes outside DDL invisible to other sessions | [§11.1 item 2](plan2.md#111-pg-side) | [2.5](#25-t5-large-objects) |
-| T6 | Sessions that write catalogs under `yb_non_ddl_txn_for_sys_tables_allowed`; own-write wait for every catalog-writing commit | [§11.1 item 3](plan2.md#111-pg-side), [§5.3 rule 3](plan2.md#53-picking-the-local-read-time) | [2.6](#26-t6-direct-catalog-updates-and-the-own-write-wait) |
-| T7 | Checkpoint file durable before the WAL it covers | [§4.2](plan2.md#42-poller) | [2.7](#27-t7-checkpoint-durable-before-the-wal) |
+| T7 | Checkpoint file durable before the WAL it covers | [§4.2](plan2.md#42-applier) | [2.7](#27-t7-checkpoint-durable-before-the-wal) |
 | T8 | User catalog reads: the standalone-statement guard (step 1) | [§14.2](plan2.md#142-proposal) | [2.8](#28-t8-user-catalog-reads-guard) |
 | T9 | A failed read from the copy becomes a query error, no fallback, no trace | [§8](plan2.md#8-observability) | [2.9](#29-t9-failed-local-read-fallback) |
-| T10 | Every waiter makes the poller poll back-to-back | [§11.3 item 1](plan2.md#113-tserver-side) | [2.10](#210-t10-waiter-driven-polls) |
+| T38 | Schema-change records: re-apply after a restart from an older checkpoint, ordering with the checkpoint, the xCluster forced-checkpoint rule (design review 2026-10, Hari, Mark) | [§4.2](plan2.md#42-applier) | [2.38](#238-t38-schema-change-records-re-apply-and-ordering) |
 
 ### 1.2 Open, Medium
 
 | Id | Item | plan2 | Details |
 |---|---|---|---|
-| T11 | Serving withdrawal after repeated poll or apply failures; wait computed once per statement; timed-out read falls back to master | [§7.2](plan2.md#72-poller-failures), [§11.3 item 1](plan2.md#113-tserver-side) | [2.11](#211-t11-serving-withdrawal-and-wait-fallbacks) |
+| T1 | Performance: the release gate and the heartbeat hold compare the copy's safe time with master's version read time; compare applied versions instead, so that a report is not held for commits it does not depend on (correct today; reclassified from High 2026-10-10) | [§4.3](plan2.md#43-freshness-guarantee) | [2.1](#21-t1-publish-gate-on-applied-versions) |
+| T4 | Login profiles disabled while the copy is enabled (decided 2026-10-09) | [§11.1 item 1](plan2.md#111-pg-side) | [2.4](#24-t4-login-profile-catalogs) |
+| T5 | Large objects disabled while the copy is enabled (decided 2026-10-09) | [§11.1 item 2](plan2.md#111-pg-side) | [2.5](#25-t5-large-objects) |
+| T6 | Direct catalog writes under `yb_non_ddl_txn_for_sys_tables_allowed` disabled while the copy is enabled, except upgrade and initdb (decided 2026-10-09) | [§11.1 item 3](plan2.md#111-pg-side), [§5.3 rule 3](plan2.md#53-picking-the-local-read-time) | [2.6](#26-t6-direct-catalog-updates-and-the-own-write-wait) |
+| T39 | Re-seed storms: no bound on concurrent copy fetches from master; seeding from a peer tserver's copy (design review 2026-10, Hari, Kannan) | [§6.2](plan2.md#62-re-seed) | [2.39](#239-t39-re-seed-storms-and-peer-seeding) |
+| T40 | Database clone may re-seed every tserver's copy (design review 2026-10, Hari) | [§6.2](plan2.md#62-re-seed) | [2.40](#240-t40-database-clone-and-re-seed) |
+| T11 | Serving withdrawal after repeated push or apply failures; wait computed once per statement; timed-out read falls back to master | [§7.2](plan2.md#72-push-and-apply-failures), [§11.3 item 1](plan2.md#113-tserver-side) | [2.11](#211-t11-serving-withdrawal-and-wait-fallbacks) |
 | T12 | Own-write check skipped on a stale version record | [§5.3 rule 3](plan2.md#53-picking-the-local-read-time) | [2.12](#212-t12-own-write-check-version-record) |
-| T13 | A session sees a change and then loses it after a master fallback | [§11.1 item 6](plan2.md#111-pg-side) | [2.13](#213-t13-session-wait-after-a-master-fallback) |
-| T14 | Heartbeat report held and published on catch-up instead of skipped and re-sent (part of T1) | [§11.3 item 2](plan2.md#113-tserver-side) | [2.1](#21-t1-freshness-guarantee-on-applied-versions) |
+| T13 | A session sees a change and then loses it after a master fallback (implemented 2026-10-07, see 2.13; `MasterSnapshotTimeIsFloorForNextLocalRead` passes in release and fails when the session wait is disabled (checked 2026-10-09); not yet run in CI) | [§11.1 item 6](plan2.md#111-pg-side) | [2.13](#213-t13-session-wait-after-a-master-fallback) |
+| T14 | Heartbeat report held and published on catch-up instead of skipped and re-sent (part of T1); held report implemented 2026-10-07, published at the next heartbeat after catch-up, not at once | [§11.3 item 2](plan2.md#113-tserver-side) | [2.1](#21-t1-publish-gate-on-applied-versions) |
 | T15 | Re-seed on corruption detected while running | [§6.2](plan2.md#62-re-seed) | [2.14](#214-t15-re-seed-on-runtime-corruption) |
-| T16 | Release push cost items, then push on by default | [§4.4](plan2.md#44-change-records-carried-in-the-lock-release) | [2.15](#215-t16-release-push-cost-and-default) |
 | T17 | Changed-table list in the lock release for the tserver table cache | [§12](plan2.md#12-follow-up-items), [§9](plan2.md#9-performance-model) | [2.16](#216-t17-changed-table-list-in-the-release) |
 | T18 | PG backend flow: remove preloading, cache reset instead of full refresh, invalidation messages from the copy | [§13](plan2.md#13-how-the-pg-backend-flow-changes) | [2.17](#217-t18-pg-backend-flow) |
 | T19 | User catalog reads step 2: serve a flagged scan from the copy when its read time is at or below C | [§14.2](plan2.md#142-proposal) | [2.8](#28-t8-user-catalog-reads-guard) |
 | T20 | Safe time certified before a restarted master has loaded its transactions (existing xCluster issue) | [§11.2 item 3](plan2.md#112-master-side) | [2.18](#218-t20-resolveintents-before-transaction-loading) |
-| T21 | Per-tserver load on master: batch and S once per cycle; status-RPC fan-out; load study | [§11.2 item 4](plan2.md#112-master-side) | [2.19](#219-t21-master-load-per-tserver) |
 | T22 | A stale checkpoint file outlives its tablet | [§6.2](plan2.md#62-re-seed) | [2.20](#220-t22-stale-checkpoint-file) |
 | T23 | The copy's memtables are outside the global memstore flusher | — | [2.21](#221-t23-memstore-flusher) |
 | T24 | Master WAL retention policy per stream and automatic re-seed | [§7.3](plan2.md#73-master-wal-retention) | [2.22](#222-t24-master-wal-retention) |
 | T25 | Major version upgrade support | [§10](plan2.md#10-modes-in-which-the-local-tablet-is-not-used) | [2.23](#223-t25-major-version-upgrade) |
 | T26 | Observability holes and additions | [§8](plan2.md#8-observability) | [2.24](#224-t26-observability) |
 | T27 | Java regress schedules with the feature on; two CI items not yet explained | — | [2.25](#225-t27-test-coverage-and-open-ci-items) |
-| T36 | Wait latency: tserver-triggered polls do not force a new S; the poll carries no target time; the own-write wait applies to every read of the session | [§4.1](plan2.md#41-master-poll-service) | [2.34](#234-t36-wait-latency) |
+| T36 | Wait latency: the own-write wait applies to every read of the session; wait timeouts counted as "not serving" (items 1-2 closed by floor requests) | [§4.1](plan2.md#41-master-push-service) | [2.34](#234-t36-wait-latency) |
 
 ### 1.3 Open, Low
 
@@ -61,9 +68,9 @@ approach is fixed, not coded), **closed** (in the code and tested, or dropped).
 | T30 | Explicit read times below master's compacted history | [§4.3](plan2.md#43-freshness-guarantee) | [2.28](#228-t30-explicit-read-time-below-the-cutoff) |
 | T31 | A restore inside the WAL tail copied by remote bootstrap | [§6.2](plan2.md#62-re-seed) | [2.29](#229-t31-restore-inside-the-copied-wal-tail) |
 | T32 | Tablet-wide flags and assertions reach the copy | — | [2.30](#230-t32-tablet-wide-flags) |
-| T33 | Poller spins when master's log reader returns Busy; master scans every stream per poll; hot-path formatting; double lag sample; stale S on the shared push stream | — | [2.31](#231-t33-small-poller-and-service-items) |
-| T34 | Lease rejoin test | [§12](plan2.md#12-follow-up-items) | [2.32](#232-t34-lease-rejoin-test) |
+| T33 | Hot-path formatting; applied-version mutex on the read path (the poll and stream items went with the pull path) | — | [2.31](#231-t33-small-poller-and-service-items) |
 | T35 | Filter non-PG rows of the system catalog out of the stream and the snapshot | [§12](plan2.md#12-follow-up-items) | [2.33](#233-t35-non-pg-rows) |
+| T42 | Memory accounting of the copy on the tserver (design review 2026-10, Mark) | — | [2.42](#242-t42-memory-accounting-of-the-copy) |
 
 ### 1.4 Accepted (no change planned)
 
@@ -96,11 +103,53 @@ approach is fixed, not coded), **closed** (in the code and tested, or dropped).
 | C18 | plan2 and implementation2 said the startup preload and parallel workers read master (review L9) | documents corrected 2026-09-28 |
 | C19 | Master does not update its clock from the release request's propagated hybrid time, so the release's version read time reaching the commit time depended on the clock skew bound | moot once T1 replaces the read time by the version comparison |
 | C20 | Coexistence with xCluster and logical replication | checked, no interaction: no `cdc_state` row, no WAL retention hook, the copy is outside `tablet_map_` so the tserver's CDC service, xCluster consumer and virtual WAL cannot reach it |
+| C22 | T2: serving condition on entering serving (lease bound re-applied while serving; versions published while not serving) | `NotePublishedVersions`, `OnSafeTimePublished`, `OnLeaseGained`; push-plan §3.3; `ReleaseDuringCatchupGatesTheFlip` |
+| C23 | T10: every waiter made the poller poll back-to-back | no polls; waiters raise one pending floor, one floor request in flight per tserver (push-plan §3.2); `notify_all` only on change |
+| C24 | T16: release push cost items and default | replaced by pages built once per cycle and carried inline up to 4 MB (push-plan §2.5); always on |
+| C25 | T21: per-tserver load on master | page cache, one S per cycle, bounded in-flight pushes (push-plan §2); load measurements pending (push-plan §10) |
+| C26 | T34: lease rejoin test | `PgLocalCatalogRejoinTest` (push-plan §9.4) |
+| C27 | T41: lease-loss guarantee when a new backend takes its version from the copy; propagate calls instead of killing backends | plan2 §7.1 states the dependency (2026-10-10); lease loss keeps killing backends, as without the copy; see 2.41 |
 | C21 | The notes under `repo6/notes/` had diverged from this directory (T37) | repo6 notes commit of 2026-09-30 copies `plan2.md`, `implementation2.md`, `todos.md` and `worklog2.md` from here |
 
 ## 2. Details
 
-### 2.1 T1. Freshness guarantee on applied versions
+### 2.1 T1. Publish gate on applied versions
+
+Reclassified 2026-10-10 from High (correctness) to Medium (performance).
+The time comparison in the code is correct. Master reads the versions of a
+report at time R, so every version in the report committed at or below R.
+When the copy's safe time C is at or above R, the copy holds every one of
+those commits, and with them the rows of every version in the report. The
+time comparison is stricter than the version comparison: it also waits for
+commits between the newest version's commit and R, which the report does not
+depend on. On the heartbeat path R is a periodic cache refresh time, up to
+`heartbeat_interval_ms/2` above the newest commit, so a held report waits for
+a push that covers R instead of for the version it carries. The remaining
+work is that latency reduction.
+
+Version comparisons already in the code (checked 2026-10-10):
+
+- Read path: `LocalCatalogCompleteTime` (`pg_client_session.cc:3584-3605`)
+  waits, before a local read, until the copy's applied version for the
+  backend's database is at or above the version the backend sends with the
+  request (`backend_catalog_version`, from `YbGetLocalCatalogVersion` in
+  `pg_yb_utils.c`). This does not replace the publish gate: a backend updates
+  its own version only after its cache refresh completes
+  (`postgres.c:4829`, `relcache.c:3185`), so the reads of that refresh carry
+  the previous version.
+- Entry into serving: `OnSafeTimePublished` (`local_catalog_replica.cc:534-551`)
+  requires the applied version of every database to be at or above each
+  version published while the copy was not serving (C22).
+
+Status 2026-10-07 (master push, [push-plan.md](push-plan.md) §3.2): the
+heartbeat starvation described below is answered: a heartbeat report the
+gate blocks is held (`held_version_report_` in `heartbeater.cc`) and sends a
+floor request at its read time; master runs cycles until its own clock passes
+that time (a floor never moves master's clock), and the copy reaches it in
+one push round trip; the held report is published at the next heartbeat
+after the copy holds its read time (T14). The
+release and heartbeat paths still compare times, not versions; the version
+comparison remains open and is independent of the push.
 
 Design: [plan2 §4.3](plan2.md#43-freshness-guarantee). Both paths publish a
 version report only when, for every database in it, the copy's applied
@@ -115,7 +164,7 @@ Today's code compares times, not versions:
   (`:618-623`).
 - Heartbeat: `heartbeater.cc:137-145` (`LocalCatalogCopyHoldsHeartbeatVersions`
   → `HoldsCatalogStateAt(db_catalog_versions_read_time)`), used at `:560-573`
-  to skip the whole report and request an immediate poll.
+  to hold the report and send a floor request.
 - Master fills the read time at `master_heartbeat_service.cc:358-360` from
   `GetYsqlAllDBCatalogVersions(use_cache=true)` (`catalog_manager.cc:11140-11167`,
   cache read time at `:14389`), and for the release at
@@ -126,7 +175,7 @@ Why the change: the heartbeat read time is the periodic cache refresh time
 `ysql_ddl_handler.cc:384-386`), which is above the newest commit by up to that
 interval and moves on every re-read, so a lagging copy chases a moving
 target. A[db] is exact: it is read from the copy's own version table at C
-(`local_catalog_poller.cc` `ReadLocalCatalogVersions`), so A[db] ≥ V proves
+(`local_catalog_applier.cc` `ReadLocalCatalogVersions`), so A[db] ≥ V proves
 the copy holds V's rows.
 
 Change:
@@ -135,19 +184,19 @@ Change:
    `WaitForAppliedVersion(db, version)` for every entry of
    `req.db_catalog_version_data()`.
 2. Heartbeat: replace `HoldsCatalogStateAt` by the same per-database check;
-   when it fails, keep the report, request an immediate poll, and publish it
-   from the poller's publish path (or a short heartbeat-thread wait) as soon
-   as the copy catches up, so that the cost is one poll and not one
-   heartbeat interval on top (T14).
+   when it fails, keep the report, send a floor request, and publish it
+   from the applier's publish path (or a short heartbeat-thread wait) as soon
+   as the copy catches up, so that the cost is one push round trip and not
+   one heartbeat interval on top (T14).
 3. Master: `db_catalog_versions_read_time` on both protos becomes unused;
    remove after the tserver side has landed.
 
-Test: pause the poller with `TEST_local_catalog_pause_poller`, run a DDL
+Test: pause the applier with `TEST_local_catalog_pause_applier`, run a DDL
 elsewhere, assert the heartbeat report is held and no version below the DDL's
-is published, resume, assert publication within one poll interval;
-`GateHoldsDdlWhilePollerIsPaused` covers the release side.
+is published, resume, assert publication within one push round trip;
+`GateHoldsDdlWhileApplierIsPaused` covers the release side.
 
-Observed 2026-09-29: the moving target starves the heartbeat path
+Observed 2026-09-29, with the pull path: the moving target starves the heartbeat path
 indefinitely, not for one poll. `PgBackendsTest.CachedVersion` with
 `--local_catalog_poll_interval_ms=1500` fails like CI launch 173734 (version 2
 not in shared memory after 10 s). The gate skipped all 10 heartbeats. Each
@@ -159,6 +208,10 @@ attempts in launch 169670). Details: worklog2 "Fifth default-on CI run",
 row H.
 
 ### 2.2 T2. Serving condition on entering serving
+
+Status 2026-10-07: CLOSED (C22). Implemented as described under "Change",
+with the PG start held after a new lease until the copy serves
+(push-plan §3.3).
 
 Design: [plan2 §7.1](plan2.md#71-lease-loss-lease-regain-and-tserver-restart).
 A copy enters serving only when C ≥ the lease bound and A[db] ≥ every version
@@ -285,9 +338,22 @@ bootstrapped its copy while `CREATE SEQUENCE` was open. There the early writes
 arrived through replay of the copied WAL tail, not the copied intents DB.
 Details: worklog2 "Fifth default-on CI run", row D.
 
+Plan for (b), 2026-10-09: [rbs-intents-plan.md](rbs-intents-plan.md). After open and WAL
+replay, before the first pushed page, rewrite every locally uncommitted transaction's regular
+intents into the applier's external-intent blobs and remove the regular intents; the copy's
+participant does no status resolution.
+
 ### 2.4 T4. Login profile catalogs
 
-Design: [plan2 §11.1 item 1](plan2.md#111-pg-side). Decided: every read of
+Decision 2026-10-09 (design review): login profiles are disabled while the
+copy is enabled. The profile feature is gated by `ysql_enable_profile`
+(non-runtime, default `false`, `ybc_gflags.cc:42`). Change: the copy refuses
+to start when that flag is set (`LocalCatalogPrerequisitesMet`, with a
+warning), or the tserver refuses the flag combination at start. Support is a
+follow-up; the earlier plan below (profile reads always to master) is the
+candidate for it.
+
+Design: [plan2 §11.1 item 1](plan2.md#111-pg-side). Earlier plan: every read of
 `pg_yb_profile` and `pg_yb_role_profile` goes to master.
 
 Mechanism (review S5, VERIFIED by CI): `YbMaybeIncFailedAttemptsAndDisableProfile`
@@ -315,7 +381,16 @@ Covers CI items: `TestYbRoleProfile` ×5 and
 
 ### 2.5 T5. Large objects
 
-Design: [plan2 §11.1 item 2](plan2.md#111-pg-side). Open.
+Decision 2026-10-09 (design review): large objects are disabled while the copy
+is enabled. Change: the large-object functions (`lo_create`, `lo_import`,
+`lo_from_bytea`, `lowrite`, `lo_put`, `lo_unlink`, `lo_open` for write)
+raise "not supported with the tserver-local catalog". Refuse the functions
+themselves; do not rely on the `yb_non_ddl_txn_for_sys_tables_allowed` check
+alone, because the object-locking path may let these catalog writes through
+without the setting (to be rechecked against 2b14b044f36). Support is a
+follow-up; the fix candidates below remain the options.
+
+Design: [plan2 §11.1 item 2](plan2.md#111-pg-side).
 
 Mechanism (review S4, INFERRED): `lo_create`, `lowrite`, `lo_unlink`,
 `lo_from_bytea` write `pg_largeobject` and `pg_largeobject_metadata` from the
@@ -346,6 +421,19 @@ T4; or T6's own-write wait for the writer plus a cross-session wait keyed on
 a time carried with the user data.
 
 ### 2.6 T6. Direct catalog updates and the own-write wait
+
+Decision 2026-10-09 (design review): direct catalog writes are disabled while
+the copy is enabled. Change: setting `yb_non_ddl_txn_for_sys_tables_allowed`
+fails outside YSQL upgrade mode and initdb. Upgrade migrations keep the
+setting and keep reading master (plan2 §10). Open sub-items:
+
+- `yb_reset_analyze_statistics` raises the version row by hand
+  (`yb_system_functions.sql:84`) and needs a DDL-mode path or must be
+  refused too.
+- Tests that use `BasePgSQLTest.executeSystemTableDml` and
+  `yb.orig.planner_base_scans_cost_model.sql` run with the copy off.
+- The own-write wait for non-DDL catalog commits (below) is no longer needed
+  for this case; it stays a candidate for T5 support later.
 
 Design: [plan2 §11.1 item 3](plan2.md#111-pg-side) and
 [§5.3 rule 3](plan2.md#53-picking-the-local-read-time).
@@ -382,11 +470,11 @@ Covers CI items: `TestYsqlUpgrade` ×5, `TestPgUpdatePrimaryKey#basicSystemTable
 
 ### 2.7 T7. Checkpoint durable before the WAL
 
-Design: [plan2 §4.2](plan2.md#42-poller) ("the checkpoint must
+Design: [plan2 §4.2](plan2.md#42-applier) ("the checkpoint must
 never claim a position whose records are not durable on the copy").
 
-Mechanism (review S1, VERIFIED): `PersistCheckpoint`
-(`local_catalog_poller.cc:213-236`) waits `log()->WaitUntilAllFlushed()`
+Mechanism (review S1, VERIFIED): `LocalCatalogApplier::PersistCheckpoint`
+(`local_catalog_applier.cc`) waits `log()->WaitUntilAllFlushed()`
 (`log.cc:1668-1674`), which drains the append queue but does not fsync, then
 writes the file with `pb_util::SYNC`. With the defaults
 (`durable_wal_write=false`, `interval_durable_wal_write_ms=1000`,
@@ -476,6 +564,10 @@ throttled warning.
 
 ### 2.10 T10. Waiter-driven polls
 
+Status 2026-10-07: CLOSED (C23). There are no polls; a waiter raises the
+pending floor and the apply thread sends at most one floor request at a
+time, repeated once a second while the floor is not reached.
+
 Mechanism (review S6, mechanism VERIFIED, rates INFERRED). Three code paths
 block until the copy reaches a target: the release handler's gate wait
 (`ts_local_lock_manager.cc:577`, `WaitForSafeTime`), a read's version check
@@ -502,11 +594,12 @@ Fix: `notify_all` only when C or an applied version changed; set
 
 ### 2.11 T11. Serving withdrawal and wait fallbacks
 
-Design: [plan2 §7.2](plan2.md#72-poller-failures) and
+Design: [plan2 §7.2](plan2.md#72-push-and-apply-failures) and
 [§11.3 item 1](plan2.md#113-tserver-side).
 
 Mechanism (review M3 and worklog2 "How a stalled poller becomes a
-cluster-wide DDL problem"): nothing moves the state out of `kServing` on poll
+cluster-wide DDL problem"; with push the same holds for refused or failed
+pushes): nothing moves the state out of `kServing` on push
 or apply failures (`local_catalog_replica.cc`: only `OnLeaseLost`, a re-seed
 request and the major upgrade flag do). While C is frozen and the copy stays
 serving: the heartbeat gate withholds every version report (a new database
@@ -520,12 +613,12 @@ twice on a snapshot's first request (`SetFreshCatalogSnapshotReadTime` at
 fresh deadline at `:236-241`), before going to master; nothing remembers
 that a wait timed out.
 
-Change: after N consecutive poll failures or when C lags the tserver clock
+Change: after N consecutive apply failures or when C lags the tserver clock
 by more than a bound, move to a not-serving state (reads to master, gate
 skipped, heartbeat reports published), resume under T2's condition on the
-next successful poll; compute the wait once per request; skip the wait after
+next successful apply; compute the wait once per request; skip the wait after
 a recent timeout; route a timed-out read to master rather than failing it.
-Test: block the change RPC with `TEST_local_catalog_fail_poll`, run a DDL
+Test: fail every push with `TEST_local_catalog_fail_push`, run a DDL
 elsewhere, assert the copy stops serving and the DDL completes; unblock and
 assert serving resumes.
 
@@ -550,6 +643,16 @@ recorded.
 
 ### 2.13 T13. Session wait after a master fallback
 
+Status 2026-10-07: implemented with the push change. When a catalog read that
+the copy could answer in principle goes to master instead (not serving, a
+wait ran out, SERIALIZABLE, a read time above C), the session sets
+`catalog_read_from_master_`; its next read from the copy waits, through a
+floor request, until C reaches the tserver's clock reading taken at that
+read. The master response has moved the tserver's clock past master's read
+time, so the copy then holds everything the session saw. Reads in DDL mode
+do not set it: the DDL's own commit is covered by the version gate and the
+own-write check. Test: `MasterSnapshotTimeIsFloorForNextLocalRead`.
+
 Design: [plan2 §11.1 item 6](plan2.md#111-pg-side). Mechanism (review L1,
 INFERRED): a catalog snapshot that fell back to master takes its time t1
 from the clock (`SetFreshCatalogSnapshotReadTime`, `pg_client_session.cc:3692`);
@@ -571,6 +674,9 @@ RocksDB error while applying fails every poll forever (`IncApplyFailures`,
 apply or read error as `RequestReseed()`.
 
 ### 2.15 T16. Release push cost and default
+
+Status 2026-10-07: CLOSED (C24). The sliced release push is gone; pages are
+built once per cycle and carried inline (push-plan §2.5).
 
 Design: [plan2 §4.4](plan2.md#44-change-records-carried-in-the-lock-release).
 The push is behind `enable_local_catalog_release_push`, default `false`
@@ -657,6 +763,11 @@ GetChanges on a new leader until loading completes. Fix:
 in `SysCatalogChangeServiceImpl` before asking for S.
 
 ### 2.19 T21. Master load per tserver
+
+Status 2026-10-07: CLOSED (C25) in code. Master builds each page once and
+certifies one S per cycle for every copy (push-plan §2). The load study is
+the push scenarios of `pg_local_catalog_load-test` (push-plan §9.7); the
+numbers are pending (push-plan §10).
 
 Design: [plan2 §11.2 item 4](plan2.md#112-master-side). Review M8, M10.
 Each tserver has its own stream (`sys_catalog_change_service.cc:74-83`), and
@@ -883,6 +994,9 @@ copy. A general sweep is preferable to a second point fix.
 
 ### 2.31 T33. Small poller and service items
 
+Status 2026-10-07: L5, L6 and L8 went with the pull path. L7 and the
+read-path mutex remain.
+
 - L5: a memory-limit Busy with no messages comes back as "more to send" with
   no records, and the poller polls again at 0 ms (`consensus_queue.cc:802-808`,
   `local_catalog_poller.cc:155-157`).
@@ -902,6 +1016,11 @@ copy. A general sweep is preferable to a second point fix.
 
 ### 2.32 T34. Lease rejoin test
 
+Status 2026-10-07: CLOSED (C26). `PgLocalCatalogRejoinTest` keeps a tserver
+from refreshing its lease (`TEST_tserver_enable_ysql_lease_refresh=false`,
+lease TTL 5 s), runs DDLs, re-enables the refresh and asserts that PG
+starts only after the copy serves and that the first query reads the copy.
+
 The test that existed, `LeaseLossTakesTheCopyOutOfTheReadPath`, was removed
 (commit 668c499641f): lease expiry kills that tserver's PG sessions
 (`YSQLLeaseManager::Impl::CheckLeaseStatusInner` → `OnLeaseLost()` →
@@ -920,13 +1039,17 @@ of the stream and the snapshot if space matters. Not measured.
 
 ### 2.34 T36. Wait latency
 
+Status 2026-10-07: items 1 and 2 CLOSED by floor requests: the request
+carries the waited-for time, master moves its clock to it and runs a cycle
+for it. Items 3 and 4 remain.
+
 From the 2026-09-26 discussion. The own-write wait (5.3 rule 3) and the
 version wait trigger their own immediate poll, so a slow idle cadence does
 not lengthen them, but:
 
 1. A tserver-triggered poll does not force a new S, so while another catalog
    transaction runs on master the wait pays up to the 250 ms throttle
-   ([plan2 §4.1](plan2.md#41-master-poll-service)); the release path already
+   ([plan2 §4.1](plan2.md#41-master-push-service)); the release path already
    forces (`force_apply_safe_time`, `sys_catalog_change_service.cc:93-100`).
 2. The poll RPC carries no hybrid time (`GetSysCatalogChangesRequestPB`), so
    a wait also pays for master's clock being behind this tserver's clock.
@@ -978,3 +1101,137 @@ can be served below the DDL for one poll, caught by the version check of
 [plan2 §5.3 rule 2](plan2.md#53-picking-the-local-read-time) once the
 version arrives by heartbeat. Accepted.
 
+
+### 2.38 T38. Schema-change records: re-apply and ordering
+
+Source: design review 2026-10 (Hari, Mark). Design: [plan2 §4.2](plan2.md#42-applier).
+
+What exists:
+
+- Master seals a page after every schema-change (`CHANGE_METADATA`) record,
+  the producer's rule that such a record is the last of a batch
+  (`xcluster_producer.cc:412-416`, push-plan §2.2). Each page therefore holds
+  at most one schema-change record, at its end.
+- The applier writes out the row batch it has accumulated before it applies
+  the schema-change record as a `ChangeMetadataOperation` retargeted at the
+  copy's tablet id (worklog2 Phase 3 step 3).
+
+What is not shown:
+
+1. Re-apply after a restart. The checkpoint file is written once per second
+   and can be older than what the copy applied, so master pushes some records
+   again. The argument that a re-apply is harmless (plan2 §4.2, worklog2
+   Phase 2) covers row records and apply records only. Unverified: a re-pushed
+   schema-change record that adds tables already present in the copy's
+   metadata, or that sets a schema version the copy already has. A failed
+   check on a `kChangeMetadata` operation is a glog FATAL
+   (`operation_driver.cc:425`, the T32 instance), so a record that cannot be
+   applied twice puts the tserver into a crash loop.
+2. Ordering of durability. The copy's superblock (where the schema change
+   lands) and the checkpoint file are written independently. Not written
+   down: which states a crash can leave (superblock ahead of the checkpoint,
+   or behind it) and that each one converges.
+3. The xCluster rule. In xCluster, two schema-change records in one batch
+   caused ordering problems and a checkpoint is forced between them (Mark).
+   Hari to confirm that the page-seal rule above is the same guarantee.
+4. Catalog version bumps must not be skipped (Hari). Holds by construction:
+   A[db] is read from the copy's version table at C and compared with `≥`,
+   so several bumps inside one page are safe. Record this in plan2 §4.2.
+
+Test: restart a tserver with its checkpoint older than the copy's metadata
+(`TEST_` flag that skips `PersistCheckpoint`), in the middle of `CREATE
+DATABASE` (about 90 new cotables, `NewDatabaseCotablesReachTheCopy` shape)
+and in the middle of `ALTER TABLE ... ADD COLUMN`; expect the copy to serve
+and to match master.
+
+### 2.39 T39. Re-seed storms and peer seeding
+
+Source: design review 2026-10 (Hari, Kannan); post-perf-design §3 item 5;
+push-plan §4 "Optional later". Design: [plan2 §6.2](plan2.md#62-re-seed).
+
+Cases where many tservers fetch the copy from master at once:
+
+- An AZ that returns after master's WAL retention (15 min default, plan2
+  §7.3): each tserver is told to re-seed.
+- A PITR restore of the system catalog: every tserver re-seeds its whole
+  copy (plan2 §6.2).
+- Cluster start: three tservers already serialize on master's RocksDB
+  checkpoint lock, one to two seconds each (T33).
+
+Master bounds the WAL pushes (64 RPCs, 64 MB in flight) but not the snapshot
+transfers. Change:
+
+1. Bound concurrent copy fetches on master; queue the rest (Kannan: serve,
+   for example, 10 at a time).
+2. Let a tserver seed its copy from a peer tserver's copy in the same region.
+   A peer's copy holds only certified state (regular rows up to its C, open
+   transactions as external intents, no uncommitted WAL tail), so this path
+   also avoids T3(a) and T3(b). Master names the peer and the position the
+   seed starts from.
+
+### 2.40 T40. Database clone and re-seed
+
+Source: design review 2026-10 (Hari: clone can produce a very large
+payload). Design: [plan2 §6.2](plan2.md#62-re-seed).
+
+Clone finishes with a snapshot restore of the target namespace
+(`CloneStateManager`, `clone_state_manager.cc:870`,
+`snapshot_coordinator().Restore`). The snapshot coordinator restores the
+system catalog only in the initial phase of a snapshot that belongs to a
+schedule (`master_snapshot_coordinator.cc:2199`). Not checked: whether the
+clone's target snapshot carries a schedule id, so whether a clone writes a
+`RESTORE_SYS_CATALOG` operation. If it does, every clone sends every tserver
+a restore page and re-seeds every copy (T39 at its worst). Then either give
+clone a restore record limited to the cloned database's rows, or carry the
+restored rows as pages.
+
+Test: clone a database with the copy on; count re-seeds
+(`local_catalog_reseeds`) on every tserver; query the clone from a tserver
+that did not run the clone.
+
+### 2.41 T41. Lease-loss guarantee and the backend's version source
+
+Closed 2026-10-10 (C27).
+
+- Item 1: plan2 §7.1 now states the dependency in the paragraph "What a new
+  backend's catalog version rests on".
+- Item 2: no change. Lease loss keeps killing the tserver's PG backends, as
+  it does without the copy. The copy adds no reason to replace that with
+  propagate calls. The notes do not record the problem Mark raised with the
+  kill behavior beyond the line in this item.
+
+Source: design review 2026-10 (Mark). Design:
+[plan2 §7.1](plan2.md#71-lease-loss-lease-regain-and-tserver-restart),
+[§13](plan2.md#13-how-the-pg-backend-flow-changes).
+
+Today a tserver that loses its lease kills its PG backends, and a new
+backend reads the latest catalog version from master. With the copy, a new
+backend reads the version row from the copy at C (plan2 §13,
+implementation2 §9). That is safe only because PG's start is held until the
+copy serves at the lease bound B, and because the copy enters serving only
+when A[db] covers every version published while it was not serving (plan2
+§7.1). Change:
+
+1. State this dependency in plan2 §7.1: the lease guarantee now rests on the
+   serving condition, not on master reads, and the hold timeout
+   (`local_catalog_serve_wait_timeout_ms`) falls back to master reads, which
+   keeps the old guarantee.
+2. Mark to evaluate delivering the latest version to running backends
+   through propagate calls instead of killing them, and whether that needs
+   anything from the copy beyond the gate.
+
+### 2.42 T42. Memory accounting of the copy
+
+Source: design review 2026-10 (Mark: the copy must count toward the memory
+tracker). Master's page cache is charged to the `SysCatalogPusher` tracker
+(implementation2 §2); T23 covers only the memstore flusher on the tserver.
+List each tserver-side consumer and the tracker it is charged to, and add a
+`local_catalog` tracker under the tserver root where none is:
+
+- the copy's memtables (shared `tablet_options_`, counted in the global
+  memstore limit, T23);
+- the applier's pending pushes (`pending_pushes_`, release pages up to 4 MB
+  each plus separate pushes);
+- parsed pages during apply and the external-intent batches;
+- read-path buffers of locally served reads;
+- the copy's share of the block cache.

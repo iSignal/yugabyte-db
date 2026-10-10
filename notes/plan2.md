@@ -1,6 +1,6 @@
 # Tserver-local DocDB copy of the PG catalog — design
 
-Date: 2026-09-03, revised 2026-09-29. Scope: object locking and concurrent
+Date: 2026-09-03, revised 2026-09-29; sync rewritten for master push 2026-10-07 ([push-plan.md](push-plan.md)). Scope: object locking and concurrent
 (transactional) DDL enabled, per-database catalog versions, invalidation
 messages on. This document is the design and records no implementation
 status. The current code is described in [implementation2.md](implementation2.md);
@@ -13,8 +13,8 @@ reading is under [learnings/](learnings/).
 
 Serve catalog reads issued by DML statements from a copy of the PG catalog that  
 lives on the tserver, so that a catalog cache miss costs a local read instead  
-of a round trip to master. Master stays the only writer. The copy is kept  
-current by pulling the master system catalog tablet's WAL. Correctness contract:  
+of a round trip to master. Master stays the only writer. Master keeps the copy  
+current by pushing the master system catalog tablet's WAL to it. Correctness contract:  
 a backend that has been told catalog version V reads a copy that contains every  
 catalog change up to V, and every read under one catalog snapshot sees one  
 consistent state.
@@ -28,11 +28,14 @@ consistent state.
 | shared version         | Latest version the tserver has published to backends through shared memory.                                                                                                                                                                                                                                                                                    |
 | commit HT              | Hybrid time at which a DDL transaction committed.                                                                                                                                                                                                                                                                                                              |
 | local tablet, the copy | Single-replica DocDB tablet on the tserver holding a copy of the master system catalog tablet: same table ids, same schemas, same row keys.                                                                                                                                                                                                                    |
-| poller                 | Per-tserver loop that pulls the master system catalog WAL through the change-stream RPC, applies the records to the local tablet, and publishes C.                                                                                                                                                                                                             |
+| applier                | Per-tserver thread that applies the pages master pushes to the local tablet and publishes C.                                                                                                                                                                                                                                                                  |
+| page                   | The change records of a contiguous range of master's system catalog WAL operations, serialized once on master and sent unchanged to every tserver below that range.                                                                                                                                                                                           |
+| push cycle             | One certification on master: resolve the open catalog transactions at the tablet's leader safe time S, capture the majority-replicated index I_S, build the pages up to I_S.                                                                                                                                                                                  |
+| floor request          | A tserver's request that master push its copy up to a hybrid time some caller on it waits for.                                                                                                                                                                                                                                                              |
 | apply record           | WAL record written on master when a committed transaction's intents are applied; carries the commit HT. On the local tablet it turns staged intents into regular rows at that HT.                                                                                                                                                                              |
-| poll safe time, S      | Hybrid time master returns with a poll response. Guarantee: every transaction that touched the system catalog and committed at or below S has been applied on master, and its apply record is in the WAL shipped up to and including this response. Master certifies it by resolving every running catalog transaction against its coordinator before capture. |
-| C                      | The S of the last poll response whose records, apply records included, have all been applied to the local tablet. The local tablet's regular store is complete for every writer up to C.                                                                                                                                                                       |
-| applied version, A[db] | Highest catalog version of database db whose transaction has been applied locally, as tracked by the poller.                                                                                                                                                                                                                                                   |
+| safe time, S           | Hybrid time a push cycle certifies and attaches to the page that ends at I_S. Guarantee: every transaction that touched the system catalog and committed at or below S has been applied on master, and its apply record is at or before I_S. Master certifies it by resolving every running catalog transaction against its coordinator before capturing I_S. |
+| C                      | The S of the last page carrying one that the local tablet has applied, every earlier page included. The local tablet's regular store is complete for every writer up to C.                                                                                                                                                                                      |
+| applied version, A[db] | Highest catalog version of database db whose transaction has been applied locally, read from the copy's version table at C.                                                                                                                                                                                                                                    |
 | exposure gate          | The tserver publishes version V for database db to shared memory only once A[db] ≥ V, on both the release and the heartbeat path (4.3). |
 | serving                | The copy is in the read path. Reads are routed to the copy only while it is serving; otherwise they go to master and the gate is skipped.                                                                                                                                                                                                                      |
 | cache miss reads       | Catalog scans that fill the catcache or build a relcache entry.                                                                                                                                                                                                                                                                                                |
@@ -46,10 +49,13 @@ consistent state.
 ```
  DDL backend (tserver T1)      master                                tserver T2
  ------------------------      ------                                ----------
- catalog writes ─────────────► sys_catalog tablet: intents in WAL ─ ─ ─► poller: stage as external intents
- commit at HT_V ─────────────► apply record (HT_V) in WAL ─────────────► poller: apply at HT_V, regular store
-                               poll response carries S ≥ HT_V ─────────► poller: all records applied → C := S
-                               lock release (V) ────────────────────────► gate: wait A[db] ≥ V
+ catalog writes ─────────────► sys_catalog tablet: intents in WAL
+ commit at HT_V ─────────────► apply record (HT_V) in WAL
+                               push cycle: resolve intents, S ≥ HT_V,
+                               pages up to I_S (built once)
+                               lock release (V, pages) ─────────────────► applier: stage intents, apply at HT_V,
+                                                                          all pages applied → C := S
+                                                                          gate: wait A[db] ≥ V
                                                                           shared version := V
                                ◄──────────────────────── ack ────────────
  "success" to client
@@ -65,66 +71,46 @@ Components:
 tablet (Section 6). Regular RocksDB plus intents RocksDB. No transaction  
 participant of its own; no status tablet; not a member of any multi-node  
 Raft group.
-- Poller: one per tserver, one change stream per tserver on the master system  
-catalog tablet, raw WAL format. Applies write records as staged external  
-intents, apply records as batch applies at the producer's commit HT, and  
-schema-change records into the local tablet's metadata. Publishes C and  
-A[db] after each fully applied response.
+- Master pusher: one per master, on the system catalog tablet's leader. Keeps
+  a cache of pages and each tserver's applied position, runs push cycles,
+  and pushes each tserver the pages it lacks, a bounded number of RPCs and
+  bytes at a time.
+- Applier: one per tserver. Applies write records as staged external
+  intents, apply records as batch applies at the producer's commit HT, and
+  schema-change records into the local tablet's metadata. Publishes C and
+  A[db] after each page that carries S.
 - Exposure gate: in the lock-release handler and in the heartbeat handler.
 - Read redirect: in the tserver's request path for catalog reads, keyed on  
 the read op's database and version.
 
 ## 4. Sync
 
-### 4.1 Master poll service
+### 4.1 Master push service
 
-The tserver's poller fetches the master system catalog tablet's WAL through
-a request to master that carries the requester's identity and the WAL
-position it has applied. Master answers with the WAL records after that
-position, the position they end at, and, when it can certify one, a safe
-time S. Master keeps a small in-memory record per requester (the last safe
-time it computed and the WAL position that safe time is tied to); nothing
-about requesters is persisted, and a new master leader starts each
-requester afresh.
+Master pushes the system catalog tablet's WAL to the copies; no tserver pulls.
+One component on master does it: it keeps a cache of pages, keeps each
+tserver's applied position, certifies safe times in push cycles, and sends
+pages under fixed in-flight bounds.
 
-Master serves the request through the same routine xCluster's producer
-uses for a transactional stream. The routine, as pseudo code (`state` is the
-per-requester record):
+A page is the change records of a contiguous range of WAL operations,
+`(from, end]`. Master converts the range once, with the record conversion
+xCluster's producer uses, and keeps the serialized bytes. Every tserver
+below the range receives the same bytes; no record is built per tserver.
+A page covers every operation in its range, including operations that
+produce no record (a transaction status record that is not an apply, an
+election's no-op), so a copy at or above `from` holds everything up to `end`
+once it has applied the page.
+
+A push cycle certifies one safe time for the whole cluster:
 
 ```
-handle_poll(from_position):
-    T := current leader term; if the term changed since state was written, clear state
-    leader_safe_time := this tablet's current safe time
-        (every write with a hybrid time at or below it is in the WAL)
-
-    if state.pending_safe_time is unset:
-        may_compute := no catalog transaction is running on this tablet
-                       or at least 250 ms passed since state.last_compute_time
-                       or the caller asked to force it
-        if may_compute:
-            resolve_intents(leader_safe_time)          -- see below
-            state.pending_safe_time     := leader_safe_time
-            state.pending_safe_position := the highest WAL position that is
-                                           majority-replicated right now
-            state.last_compute_time     := now
-        -- if not may_compute: no safe time will be certified by this poll
-
-    records := read the WAL from from_position forward, up to a size cap
-    end_position := position of the last record read
-    convert each WAL entry into records:
-        a write         -> one record per row written, tagged with the
-                           transaction id when the write was transactional
-        a transaction's -> an apply record carrying the commit hybrid time
-          commit/apply     and the set of its aborted subtransactions
-        a schema change -> a change-metadata record; the batch ends here
-        a restore of the system catalog -> the batch is discarded and the
-                           answer is "re-seed" (6.2)
-
-    if state.pending_safe_time is set and
-       (end_position >= state.pending_safe_position, or nothing was left to read):
-        response.safe_time := state.pending_safe_time
-        clear state.pending_safe_time and state.pending_safe_position
-    return records, end_position, response.safe_time (if set)
+cycle():
+    S   := the tablet's leader safe time
+           (every write with a hybrid time at or below S is in the WAL)
+    resolve_intents(S)                         -- once, for every copy
+    I_S := the majority-replicated WAL index now
+    build pages for (end of cache, I_S]; the page that ends at I_S carries S
+    (no new WAL: the last page takes the new S, its end is I_S already)
 
 resolve_intents(t):
     wait until this server's clock is past t
@@ -138,34 +124,70 @@ resolve_intents(t):
         stop when nothing is left to re-check
 ```
 
-What this gives the poller, and why:
+What this gives the copy, and why:
 
-- Every transaction that committed at or below S has its apply record in
-  the WAL at or before `pending_safe_position`. `resolve_intents` ran
-  before that position was captured: it waited for every transaction
-  committed at or below S to be applied on master, and a transaction still
-  running at that moment can no longer commit at or below S, because S is
-  already below master's clock. So once the response whose end position
-  reaches `pending_safe_position` has been shipped, the requester holds
-  every record up to S.
-- S is emitted only in that response. Earlier responses in the same cycle
-  carry records and no safe time; the poller applies them and does not move
-  C.
+- Every transaction that committed at or below S has its apply record at
+  or before I_S. `resolve_intents` ran before I_S was captured: it waited
+  for every transaction committed at or below S to be applied on master, and
+  a transaction still running at that moment can no longer commit at or
+  below S, because S is already below master's clock. So once a copy has
+  applied every page through the one that ends at I_S, it holds every
+  record up to S.
+- Writes after I_S have hybrid times above S, so a copy that has applied
+  more than I_S may still publish S.
+- A page sealed at a size cap carries no S; the copy applies it and does
+  not move C.
 - Records arrive in WAL order, so a transaction's row records always
   precede its apply record.
-- The 250 ms throttle: while catalog transactions are open on master, a
-  new S is computed at most once per 250 ms per requester, because each
-  computation costs a status round trip to the coordinators of every open
-  transaction. With no catalog transaction open, every poll gets a fresh S
-  and C tracks master's clock at the poll interval. The release path asks
-  master to force the computation (4.4), since a safe time from before the
-  DDL's commit is of no use to it.
-- A batch cut short (size cap, a schema change, master's own limits) says
-  so; the poller polls again at once instead of waiting out its interval.
 
-### 4.2 Poller
+When master runs a cycle:
 
-The poller is one thread per tserver. It keeps the copy current and
+| Trigger | Cycle |
+|---|---|
+| A lock release that publishes catalog versions | at once, on the release's thread, so that S is after the DDL's commit |
+| A floor request (a tserver waits for its copy to reach a hybrid time h) | at most one cycle per `local_catalog_push_min_cycle_interval_ms` (50 ms) for all requests together, repeated until S ≥ h. Master's clock is not moved to h: h can be a tserver's clock plus the maximum skew (the lease bound), and moving master's clock there would let successive floors ratchet the cluster's hybrid time ahead of physical time until a server crashes on the skew check. A floor ahead of master's clock therefore costs up to that skew (500 ms) |
+| Timer, every `local_catalog_push_interval_ms` (5 min) | only if the WAL moved past the cache; otherwise the tick costs nothing |
+
+Concurrent requests share cycles: a caller waits for the first cycle that
+started after it asked. Status round trips to coordinators are therefore at
+most one round per cycle for the whole cluster, not one per tserver.
+
+Which tserver gets which pages:
+
+- Master keeps each tserver's applied position, from the tserver's own
+  answers (push and release responses, floor requests) and from its
+  heartbeat. Nothing is persisted; a new master leader starts empty and
+  learns positions within one heartbeat interval or from the first answer.
+- A tserver with a live YSQL lease whose position is below the cache's end
+  is pushed the next pages from its position. One push RPC is in flight per
+  tserver, so pages reach a copy in order.
+- A tserver below the cache's first page gets pages built from the WAL on
+  demand (from the log cache, or from disk), shared by tservers at the same
+  position. A position below the retained WAL gets "re-seed" (6.2).
+- At most `local_catalog_push_max_in_flight_rpcs` (64) RPCs and
+  `local_catalog_push_max_in_flight_bytes` (64 MB) are outstanding at once;
+  tservers a release or a floor request waits on go first, and 16 slots are
+  reserved for them.
+- A restore of the system catalog is a page of its own with no records; a
+  copy below it is told to re-seed.
+- A term change of the system catalog tablet empties the cache and every
+  position, because entries past a deposed leader's committed index may
+  have been replaced.
+
+```
+ master                                      tserver A (at p1)      tserver B (at p0 < p1)
+ ------                                      -----------------      ----------------------
+ cycle: S, I_S; pages P1=(p0,p1], P2=(p1,I_S]
+ push P2 ──────────────────────────────────► apply, C := S
+ push P1 ─────────────────────────────────────────────────────────► apply
+ ◄── ack (p1 → I_S) ─────────────────────────
+ ◄── ack (p0 → p1) ────────────────────────────────────────────────
+ push P2 (same bytes) ────────────────────────────────────────────► apply, C := S
+```
+
+### 4.2 Applier
+
+The applier is one thread per tserver. It applies the pages master pushes and
 publishes the two values reads depend on: C, the time up to which the copy
 is complete, and A[db], the catalog version of each database that the copy
 has applied.
@@ -178,20 +200,20 @@ pointing at the transaction, until the transaction commits and master
 applies it, which moves the rows into the regular store at the commit time.
 
 The copy does not replay that. It has no transaction participant and no
-way to ask a coordinator what became of a transaction. Instead the poller
+way to ask a coordinator what became of a transaction. Instead the applier
 stores a transaction's row records as external intents: a blob keyed by the
 transaction id alone, in the intents store. No reverse mapping from a row
 to its transaction exists, so a read that meets a row never finds these
 writes and never asks any transaction's status. External intents exist for
-one purpose: when the transaction's apply record arrives, the poller takes
+one purpose: when the transaction's apply record arrives, the applier takes
 the blob and writes every row in it into the regular store at the commit
 time the apply record carries, then deletes the blob. A row record with no
 transaction (master's own non-transactional writes) goes straight into the
 regular store at its own hybrid time.
 
 ```
- master WAL                      poller                          copy
- ----------                      ------                          ----
+ master WAL                      applier                         copy
+ ----------                      -------                         ----
  row r1 of txn T ─────────────►  stage under key T ────────────► intents store: T -> {r1}
  row r2 of txn T ─────────────►  stage under key T ────────────► intents store: T -> {r1, r2}
  apply T, commit time c ──────►  move T's rows to regular ────► regular store: r1@c, r2@c
@@ -199,66 +221,69 @@ regular store at its own hybrid time.
  row r3, no transaction ──────►  write at its own time ────────► regular store: r3@t
 ```
 
-What C means. After the poller has applied every record of a response that
+What C means. After the applier has applied every page through one that
 carried a safe time S, every transaction committed at or below S has had
 its apply record applied here (4.1), so its rows are in the regular store.
-The poller then publishes C := S. Reads are never served above C (5.3), so
+The applier then publishes C := S. Reads are never served above C (5.3), so
 no read ever depends on the intents store: any external intents present
 belong to transactions that commit above C, and a read at or below C does
 not look at them. That is what makes a read from the copy a plain read of
 the regular store with no transaction status lookup.
 
-What A[db] means. After publishing C, the poller reads the copy's own
+What A[db] means. After publishing C, the applier reads the copy's own
 catalog version table at C and records, per database, the version it
 finds. A version row is written inside the DDL transaction that increments
 it, in the same apply as the DDL's catalog rows, so A[db] ≥ V means the
 copy holds every row of every transaction up to V for that database. A[db]
 is what the freshness guarantee compares against (4.3).
 
-The poller's loop:
+The applier's work:
 
 1. Make sure the copy exists: open it from disk, or fetch it from master
-   (Section 6). Take the requester position from the checkpoint recorded
-   on disk, if any.
-2. Poll master from that position (4.1). Master's answer may say "re-seed"
-   or "the position is no longer retained"; both go to Section 6.
-3. Apply the records in order: stage transactional rows as external
-   intents; apply each apply record as one batch at its commit time, so a
-   DDL's rows and its version-row update become visible together and a
-   subtransaction the DDL rolled back is left out; write non-transactional
-   rows at their own time; replay a schema change into the copy's metadata
-   verbatim, since table ids and schema versions are the same as master's.
-4. If the response carried S: read the version table at S, publish C := S
-   and the new A[db] values together, wake anyone waiting on them. If it
-   did not: keep C and A[db], advance only the position.
-5. Record the new position on disk on a cadence (about once a second) and
-   at shutdown.
-6. Sleep until the next poll: a short idle interval (100 ms), cut short
-   whenever master said more is waiting, or a release handler, a heartbeat
-   or a read asks for an immediate poll because it is waiting for a version
-   or a time the copy does not hold yet.
+   (Section 6). Take the applied position from the checkpoint recorded on
+   disk, if any. Ask master for a push up to the tserver's clock, so that
+   master learns the position and the copy gets its first S.
+2. Apply pages as they arrive, from a push RPC or inside a lock release,
+   lowest starting position first: a page that starts above the applied
+   position is answered "gap" with the position and not applied, and
+   master re-sends from there; a page that ends at or below the position is
+   acknowledged without a write; otherwise the records above the position
+   are applied: transactional rows as external intents, each apply record
+   as one batch at its commit time (a DDL's rows and its version-row update
+   become visible together, a rolled-back subtransaction is left out),
+   non-transactional rows at their own time, a schema change into the
+   copy's metadata verbatim.
+3. When the last applied page carried S: read the version table at S,
+   publish C := S and the new A[db] values together, wake anyone waiting on
+   them. Otherwise keep C and A[db] and advance only the position.
+4. Answer the push with the applied position and C, so that master knows
+   which page to send next.
+5. A caller that waits for C or A[db] to reach a value asks master for a
+   push (a floor request); while the wait is open the request is repeated
+   once a second, which repairs a lost request and reaches a new master
+   leader.
+6. Record the position on disk on a cadence (about once a second) and at
+   shutdown.
 
-Rules the loop keeps:
+Rules the applier keeps:
 
-- Apply everything before publishing. A response's S is published only
-  after every one of its records is in the copy; publishing first would let
-  a read at C miss rows master certified.
+- Apply everything before publishing. A page's S is published only after
+  every one of its records, and every earlier page, is in the copy;
+  publishing first would let a read at C miss rows master certified.
 - Publish only forward. A safe time or a position not above the current
-  one is ignored; a response with no safe time leaves C where it was. A new
-  master leader may re-send an older position or withhold a safe time for a
-  while; neither moves the copy backwards, and reads continue at the last
-  C, which stays a complete point.
-- Re-apply is harmless. The recorded position can lag what was applied, so
-  a restart re-applies a suffix of the WAL. Staging the same rows under the
-  same transaction key again writes the same values; an apply record whose
-  blob is already gone applies nothing; a non-transactional row re-written
-  at the same time is the same row. Re-delivery is a contiguous suffix in
-  WAL order, so a row record is never re-applied without the apply record
-  that follows it.
+  one is ignored; a page with no safe time leaves C where it was. Pages
+  from a master term below the highest one applied are refused.
+- Re-apply is avoided: records at or below the applied position are dropped
+  from a page that straddles it. A restart that resumes from an older
+  recorded position re-applies a contiguous suffix of the WAL, which is
+  harmless: staging the same rows under the same transaction key writes the
+  same values, an apply record whose blob is already gone applies nothing,
+  and a non-transactional row re-written at the same time is the same row.
 - The recorded position must never claim records the copy has not made
   durable ([todos T7](todos.md#27-t7-checkpoint-durable-before-the-wal)).
-- A pushed batch (4.4) is applied by the same loop on the same thread, so a
-  push and a poll never interleave.
+- Pages from a release and pages from a separate push go through one queue
+  ordered by their starting position, on one thread, so they never
+  interleave.
 
 
 ### 4.3 Freshness guarantee
@@ -273,6 +298,12 @@ committed at or below C and its catalog rows were applied in the same batch
 as its version row: the copy holds everything V describes. The floor is the
 DDL's own apply on the copy; no time from master is involved.
 
+Comparing C with the time R at which master read the report's versions also
+gives the guarantee: every version in the report committed at or below R,
+so C ≥ R implies A[db] ≥ V. That rule is stricter than needed, because it
+also waits for commits between the newest version and R. The version
+comparison is chosen for its lower wait, not for correctness.
+
 Release path (every DDL that increments a version):
 
 - Master reads the versions after the DDL committed and sends them in the
@@ -281,9 +312,10 @@ Release path (every DDL that increments a version):
   database carried; publish the versions to shared memory; release the
   local locks; acknowledge. The DDL's client is told success only after
   every target has acknowledged.
-- The wait completes by contract: the release carries the DDL's own change
-  records (4.4), so applying them satisfies the check without a poll; when
-  the records cannot be used, an immediate poll brings them.
+- The wait completes by contract: the release carries the DDL's own pages
+  (4.4), so applying them satisfies the check without another round trip;
+  when they cannot be used or did not fit, master pushes them separately
+  and the waiting tserver's floor request asks for them.
 - The DDL's own tserver is a target too: the synchronous release runs there
   before the commit returns to the DDL backend, and only then does that
   backend write V into its tserver's shared memory for the other backends
@@ -295,10 +327,9 @@ versions that change outside a lock release):
 - Master sends a version report only when some version changed since this
   tserver's last acknowledged report.
 - The tserver publishes the report only when A[db] ≥ the carried version
-  for every database in it. Otherwise it holds the report, requests an
-  immediate poll, and publishes as soon as the copy has caught up; the
-  versions arrive either with the release that is still in flight or with
-  the poll. Single versions are never clamped, because the tserver's
+  for every database in it. Otherwise it holds the report, asks master for
+  a push, and publishes as soon as the copy has caught up; the versions
+  arrive either with the release that is still in flight or with the push. Single versions are never clamped, because the tserver's
   version table treats a version below the published one as a stale master
   report.
 
@@ -332,55 +363,55 @@ freshness guarantee:
    copy holds every DDL master completed while this tserver had no lease
    (7.1).
 5. Enabling serving. After bootstrap or re-seed the copy serves only once it
-   has a certified C from an applied poll, never the snapshot's own time
+   has a certified C from an applied page, never the snapshot's own time
    (6.1 step 5).
 
-### 4.4 Change records carried in the lock release
+### 4.4 Pages carried in the lock release
 
-The stall this removes: without it, the release handler on every tserver waits  
-for that tserver's next poll round trip before it can publish the DDL's  
-version, so every DDL pays the slowest tserver's poll latency, and so does  
-everything queued behind the locks the DDL holds.
+The stall this removes: without it, the release handler on every tserver
+waits for a separate push before it can publish the DDL's version, so every
+DDL pays an extra round trip to the slowest tserver, and so does everything
+queued behind the locks the DDL holds.
 
-- Tservers report the applied op id of their copy in each heartbeat.
-- At release time master fetches one change batch from the lowest reported  
-op id among the targets, certifies S once for the whole release, and slices  
-the batch per target so that each tserver receives only records above its  
-own reported op id. A report is stale by up to one heartbeat interval, so  
-slices overlap what the tserver already holds; the tserver drops records  
-at or below its applied op id.
-- The tserver applies the pushed slice through the poller's own apply path,  
-on the poller's thread, so push and pull never interleave. C becomes S and  
-the gate passes without a poll. S is published only once the whole slice  
-through its end op id has been applied.
-- A push is refused, and replaced by an immediate pull, when its slice does  
-not start at or below the copy's applied position, when a re-seed is in  
-progress, or when the tserver has no copy. Master sends no records to a  
-target whose report is missing or too old (new master leader before the  
-first heartbeat), whose slice would exceed the payload cap, or which lags  
-the freshest target by more than a bound; those tservers pull.
-- Correctness never depends on the push: the gate is unchanged, and a  
-lost, reordered or truncated push is repaired by the next pull from the  
-tserver's own position. Two concurrent releases both start at or below the  
-target's position; whichever applies second is filtered to nothing.
+- At release time master runs a push cycle (4.1), which certifies an S
+  after the DDL's commit and builds the DDL's pages into the cache once.
+- For each target, master takes the pages from the target's position to
+  the cache's end. When they are all in the cache and total at most
+  `local_catalog_release_inline_max_bytes` (4 MB), the release RPC carries
+  them; each target costs one copy of each page's bytes.
+- A target whose pages are not in the cache (it is behind) or do not fit
+  (`CREATE DATABASE` is 11.6 MB) gets none inline; master pushes it the pages
+  in the background, first among the queued targets, and its release
+  handler waits at the gate meanwhile.
+- The tserver applies the carried pages through the applier (4.2) before the
+  gate. C becomes S and the gate passes without another round trip. A copy
+  that is not serving queues the pages and acknowledges without waiting
+  (7.1).
+- The release's answer carries the copy's applied position and C, so master
+  knows what that copy needs next without waiting for a heartbeat.
+- Correctness never depends on the carried pages: the gate is unchanged. A
+  lost, refused or gapped page leaves the gate waiting; the waiting tserver
+  sends a floor request with its position, and master pushes from there.
+  Two releases racing to one copy go through the applier's one queue; the
+  second is filtered to nothing.
 
 ```
   master                         tserver (release handler)
   ------                         -------------------------
   DDL commits at HT_V
   read versions (V)
-  from = min(reported op ids)
-  one GetChanges(from) → batch, S
-  per target: slice(batch, op id_t)
-       ── release(V, records, S) ─────►  apply records (drop ≤ applied)
-                                          C := S  (S ≥ HT_V), A[db] := V
-                                          gate: A[db] ≥ V passes at once
-       ◄──────── ack ─────────────────    publish V
+  push cycle: S ≥ HT_V, pages up to I_S (built once)
+  per target: pages from its position
+       ── release(V, pages) ─────────►  apply pages (drop ≤ applied)
+                                         C := S, A[db] := V
+                                         gate: A[db] ≥ V passes at once
+       ◄──────── ack (position, C) ──    publish V
 ```
 
-The poller stays, at its own cadence, for catalog writes that happen outside  
-PG DDL (master's own system catalog updates, catalog writes made outside DDL  
-mode) and as the catch-up path. Cost items of the push are in implementation2.md.
+Catalog writes outside PG DDL (master's own system catalog updates, catalog
+writes made outside DDL mode) reach the copies on the next cycle any trigger
+starts: a later release, a floor request from a tserver that waits for them
+(a temporary relation's own-write wait, 5.3 rule 3), or the timer.
 
 ## 5. Reads
 
@@ -397,7 +428,7 @@ All three read kinds, when the backend is not in DDL:
 
 Why a read is never served at a time later than C: the local tablet is  
 complete only up to C. A read at a later time could observe rows appearing  
-between two scans of one snapshot as the poller applies records, and return  
+between two scans of one snapshot as the applier applies records, and return  
 pg_class and pg_attribute from different states. Why a read is never clamped  
 down to C either: a snapshot whose time is above C got that time elsewhere  
 (master, or an explicit request) and may already have read at it; serving it  
@@ -435,8 +466,10 @@ Rule, evaluated on the tserver for each catalog read request:
   serial; the session's read point for that serial holds a time h (a clock  
    time on the first read of a fresh catalog snapshot, or the time fixed by  
    an earlier read).
-2. Version check, a safety net: if A[db] < V, wait for the poller, at most
-   one poll (bounded by a timeout, after which the read goes to master). In
+2. Version check, a safety net: if A[db] < V, ask master for a push up to
+   the tserver's clock and wait for it (bounded by
+   `local_catalog_serve_wait_timeout_ms`, after which the read goes to
+   master). In
    steady state it always passes, because every version a backend can hold
    was either read from the copy or published through the gate (4.3), and a
    copy enters serving only once it holds every version published while it
@@ -447,22 +480,24 @@ Rule, evaluated on the tserver for each catalog read request:
    system relations. A request from a backend that has not attached to a
    database yet carries no database, so this check does not apply to it.
 3. Own-write check: if the session's last catalog-writing transaction (a DDL
-  commit) has a commit time above C, wait until C passes it, at most one  
-   poll, so that a session reads its own writes.
+  commit) has a commit time above C, ask master for a push up to it and wait
+   until C passes it, so that a session reads its own writes.
 4. First local read of a fresh catalog snapshot: h is the clock time and is
   above C. Replace it with C on the session's read point. Every later read  
    under that snapshot finds h = that C.
 5. Otherwise compare h with C. h ≤ C: serve locally at exactly h (C only
   moves forward, so any time set by step 4 stays at or below C). h > C: the  
-   time came from master or from an explicit request; route this request to  
-   master. Never serve at C in that case.
+   time came from master or from an explicit request, and is at or below the
+   clock, so master can certify it: ask master for a push up to h, wait (the
+   same bound as rule 2), and serve at exactly h; on timeout route this
+   request to master. Never serve at C in that case.
 6. A local read below the copy's history retention is routed to master.
 7. Never use the tserver clock as the local read time.
 
 Consequences:
 
 - Within one catalog snapshot all local reads see one state, even if the  
-poller advances meanwhile; a DDL committing during the statement becomes  
+copy advances meanwhile; a DDL committing during the statement becomes  
 visible at the next invalidation, as in PG.
 - A snapshot that started on master (tserver not serving, backend in DDL)  
 stays on master until it is dropped; no mixing of sources within a  
@@ -484,8 +519,9 @@ One more residual path: a release acknowledged after the synchronous
 timeout (11.2 item 2).
 
 A DDL that does not increment the version (temporary relations) leaves the  
-backend's version unchanged; its rows arrive at C within a poll. The  
-own-write check (rule 3) covers the writing session. Other sessions cannot  
+backend's version unchanged; its rows reach the copy on the next push cycle,
+which the session's own-write check (rule 3) requests. The own-write check
+covers the writing session. Other sessions cannot  
 name a temporary relation, so no cross-session read depends on it.
 
 ## 6. Bootstrap
@@ -498,32 +534,33 @@ name a temporary relation, so no cross-session read depends on it.
    WAL position.
 2. Rewrite the tablet's consensus metadata to a single-peer configuration
   (this tserver only) and open it.
-3. A[db] and C are not initialized from the snapshot. The first poll
-  response that carries a safe time fills A[db] for every database by  
+3. A[db] and C are not initialized from the snapshot. The first pushed page
+  that carries a safe time fills A[db] for every database by  
    reading the local catalog version table at that time, and publishes it  
    together with C. Nothing about versions is persisted; a restart repeats  
    this step.
-4. Start the poller at the snapshot's WAL position.
-5. Enable local serving only once the poller has completed its first poll and
-  applied it, so that C is a certified value, not the snapshot time.
+4. Ask master for a push from the snapshot's WAL position up to the
+  tserver's clock.
+5. Enable local serving only once a page carrying a safe time has been
+  applied, so that C is a certified value, not the snapshot time.
 
 A tserver restart with a copy on disk reopens it from local metadata without  
 contacting master and resumes from the persisted checkpoint; serving is  
-enabled after the first applied poll as above.
+enabled after the first applied page with a safe time as above.
 
 ### 6.2 Re-seed
 
 Same steps, replacing the existing local tablet (tombstone, then create).  
 Triggers:
 
-- The poll returns "checkpoint too old": master has garbage-collected WAL the  
-poller had not consumed (retention is bounded on master; a tserver that lags  
-beyond it cannot catch up incrementally).
-- The tserver's YSQL lease lapsed and was regained (Section 7.1) and the poll  
-cannot resume from its checkpoint.
+- Master pushes "re-seed": it has garbage-collected WAL the copy had not
+  applied (retention is bounded on master; a tserver that lags beyond it
+  cannot catch up incrementally).
+- The tserver's YSQL lease lapsed and was regained (Section 7.1) and master
+  cannot push from its checkpoint.
 - Master restored its system catalog from a snapshot (PITR). The restored  
-rows are written on master outside the WAL, so no stream can carry them;  
-master's change service stops at the restore marker and answers "re-seed",  
+rows are written on master outside the WAL, so no page can carry them;  
+the restore operation is a page of its own that tells a copy below it to re-seed,  
 and no safe time can pass the restore before that answer is seen. A  
 restore of one database re-seeds every tserver's whole copy.
 - Local tablet failure, at open or detected while running (corruption, disk
@@ -540,7 +577,7 @@ version gate publishes versions without waiting (the copy is not consulted).
 
 //C: What about a restarted tserver or a new lease joining tserver? A new lease joining tserver is always RBS-ing in our approach, which is reasonable but an alternate method is that it holds up local reads until a poll at now completes (is there a race here with a release that just completed). The poll decides if incremental catch up works or if a new RBS is needed. A restarted tserver - do we need a special case or does it also know if it lost a lease and is regaining it?
 //C: Alternately, we can have lease carry the latest catalog version but that is some complexity to the light lease rpc.
-//R: A new-lease tserver does not re-seed in the implemented approach; the alternate method you describe is what is implemented: serving is held until a poll whose S passes the tserver's clock reading at the moment the new lease was observed, and that poll decides between incremental catch-up and re-seed ("checkpoint too old"). The race with a release that just completed does not exist: a release that did not target this tserver completed before the lease was granted, so its DDL committed before the grant, and the bound is at or above the grant; a release that computed its targets after the grant targets this tserver and runs the gate here. A restarted tserver needs no special case: the first lease of the new process is a new lease epoch and sets the same bound, and the copy reopened from disk resumes from its checkpoint. Carrying versions in the lease is not needed: the copy must poll for the rows anyway, and the time bound already forces that poll.
+//R: A new-lease tserver does not re-seed. The copy is held out of the read path until it holds everything up to the tserver's clock reading at the moment the new lease was observed (the bound B), and with push (2026-10-07) PG itself is not started until then: the tserver asks master for a push up to B, master certifies an S at or above B and pushes the missing pages, and only then is the postmaster started. Master decides between incremental pages and "re-seed" (WAL no longer retained). The race with a release that just completed does not exist: a release that did not target this tserver completed before the lease was granted, so its DDL committed before the grant, and B is at or above the grant; a release that computed its targets after the grant targets this tserver. A restarted tserver needs no special case: its first lease is a new epoch with the same bound, and the copy reopened from disk resumes from its checkpoint. Carrying versions in the lease is not needed: the copy needs the rows anyway, and the time bound already forces the push that brings them.
 
 A tserver without a live YSQL lease is not a target of lock releases, so
 master completes DDLs without this tserver running the freshness guarantee.
@@ -551,67 +588,117 @@ The rule:
   reach, so the copy stays out of the read path for as long as no new lease
   is granted. Lease loss also ends this tserver's PG sessions.
 - On every new lease epoch, including the first lease of a freshly started
-  process, the bound becomes the tserver's clock reading at the moment the
+  process, the bound B becomes the tserver's clock reading at the moment the
   lease is observed, which is at or above every DDL master could have
-  completed without this tserver. An immediate poll is requested. Serving
-  resumes on the first poll whose S passes the bound; C then covers every
-  such DDL.
-- The poll decides how the copy catches up: incrementally from its
-  checkpoint in the normal case, or by re-seed when master answers
-  "checkpoint too old" (6.2). A regain therefore does not imply a re-seed.
+  completed without this tserver. A copy that is serving with C below B
+  leaves serving (an epoch can arrive before the tserver noticed the old
+  lease run out). The tserver asks master for a push up to B.
+- PG's start is held until the copy serves at B, for at most
+  `local_catalog_serve_wait_timeout_ms` (5 min; 0 starts PG at once, -1 holds
+  until the copy serves). With PG not running there are no backends that
+  could read a stale copy; after the timeout PG starts and reads master
+  while the copy catches up, which is the behavior without the hold. The
+  wait runs off the lease refresher thread, which must keep refreshing the
+  lease.
+- Master decides how the copy catches up: pages from its checkpoint in the
+  normal case, or "re-seed" when the WAL after the checkpoint is no longer
+  retained (6.2). A regain does not imply a re-seed.
 - A restarted tserver is the same case: its copy is reopened from disk and
-  resumes from the persisted checkpoint; its first lease sets the bound;
-  serving needs no master contact beyond that poll.
+  resumes from the persisted checkpoint; its first lease sets the bound.
+
+```
+lease refresher (new epoch e)          applier                         master
+  B := MaxGlobalNow()
+  OnLeaseGained(B): not serving,
+    floor request (position, B) ─────────────────────────────────────► cycle with S ≥ B
+  hold PG's start (other thread)                                        pages from position
+                                       ◄─────────────────────────────── push ...  page with S
+                                       C := S ≥ B, A[db] read at C
+                                       serving if A[db] ≥ every version
+                                       published while not serving
+  copy serves (or timeout): start PG
+```
 
 Why there is no race with a release that completed just before the grant:
 that release did not target this tserver, so it completed, and its DDL
 committed, before master granted the lease; the bound is at or above the
 grant. A release that computed its targets after the grant includes this
-tserver and runs the freshness guarantee here; if the copy is not serving
-yet at that moment, the versions are published without waiting and the
-reads that follow are covered by the version check of 5.3 rule 2 and by the
-rule below.
+tserver; if the copy is not serving yet at that moment, the tserver queues
+the release's pages, publishes the versions without waiting, and
+acknowledges.
 
-Planned addition, closing the flip window (implementation2.md, "Login
-preload in the not-serving-to-serving flip window"): a copy moves to serving
-only when both hold: C is at or above the lease bound, and A[db] is at or
-above every version published to shared memory while the copy was not
-serving. With that, no read, including the startup preload that carries no
-database, can be served from a copy that lacks a version the tserver has
-already published.
+Entering serving requires both: C at or above the lease bound, and A[db] at
+or above every version published to shared memory while the copy was not
+serving (each report is the full version map, so a database missing from a
+later report was dropped and its record goes too). With that, no read,
+including the startup preload that carries no database, can be served from
+a copy that lacks a version the tserver has already published.
 
-Carrying the latest catalog versions in the lease response is not needed:
-the copy has to poll for the rows in any case, and the time bound already
-forces that poll and bounds it.
+What a new backend's catalog version rests on. Without the copy, lease loss
+kills the tserver's PG backends, and a backend started after the next grant
+reads the latest catalog version from master. With the copy, a new backend
+reads the version row from the copy at C, in the same preload as its other
+catalog rows (13). The guarantee that this backend does not miss a DDL that
+master completed while this tserver had no lease therefore rests on the
+serving condition above, not on a master read:
 
-### 7.2 Poller failures
+- PG does not start until the copy serves, so no backend exists before C is
+  at or above B, and every such DDL committed at or below B.
+- When the hold times out, PG starts while the copy is not serving, every
+  catalog read goes to master, and the backend reads its version from master
+  as it does without the copy.
 
-- Master leader change: the poller re-resolves the leader and continues from  
-its checkpoint. Local serving stays enabled at the last C; the gate simply  
-waits longer; heartbeat reports wait until the copy catches up.
-- Tserver restart: the tablet and its checkpoint persist; the poller resumes;  
-C is recomputed from the first applied response before serving is enabled.
-- Repeated poll or apply failures: after N consecutive failures, or when C
-  lags the tserver clock by more than a bound, the copy leaves the read
-  path: reads go to master, the gate is skipped, heartbeat reports publish
-  without waiting. Serving resumes under the rule of 7.1 on the next
-  successful poll. Without this rule a stalled poller freezes C while the
-  copy stays in the read path (11.3 item 1).
+Lease loss keeps killing the tserver's backends, as it does without the
+copy. Backends that survived a lease loss and learned the latest version by
+propagation instead would need nothing further from the copy: their reads go
+to master until the copy serves at B. This design does not change the kill
+behavior.
+
+A joiner wave (many tservers regaining their leases at once, each needing
+minutes of WAL) does not hold DDLs back: a copy that is not serving has no
+backends to protect, so its release handler acknowledges without waiting,
+and master's in-flight bounds keep the catch-up pushes from crowding out the
+releases' own pages. Delaying the lease grant until the copy is current was
+rejected: the lease decides when a tserver's locks are released and its
+sessions killed, and a grant that waits on a WAL transfer couples
+availability to catch-up time.
+
+### 7.2 Push and apply failures
+
+- Master leader change: the new leader starts with an empty page cache and
+  no positions. Positions arrive with heartbeats within a second and with
+  the first floor request or push answer; a copy whose position is unknown
+  is pushed the start of the new leader's cache and drops what it holds.
+  Local serving stays enabled at the last C; a waiting tserver repeats its
+  floor request, which reaches the new leader.
+- A push that fails (RPC error, timeout, apply error) is retried by master
+  with backoff (100 ms doubling to 5 s). A push the copy cannot use because
+  it starts above the copy's position is answered "gap" with the position,
+  and master re-sends from there at once.
+- Tserver restart: the tablet and its checkpoint persist; the copy asks
+  master for a push from its checkpoint; C is recomputed from the first
+  applied page with S before serving is enabled.
+- Repeated apply failures: after N consecutive failures, or when C lags the
+  tserver clock by more than a bound, the copy should leave the read path
+  (reads go to master, the gate is skipped, heartbeat reports publish
+  without waiting) and resume under the rule of 7.1. Not implemented
+  ([todos T11](todos.md#211-t11-serving-withdrawal-and-wait-fallbacks)).
 
 ### 7.3 Master WAL retention
 
-Retention on master is bounded by its ordinary log retention (15 minutes by  
-default), which at the default poll cadence is ample headroom. A tserver  
-whose checkpoint falls outside it re-seeds. Copies never anchor master's WAL.  
-Automating a per-stream retention window is a follow-up item.
+Retention on master is bounded by its ordinary log retention (15 minutes by
+default). Master builds pages for a copy below its page cache from the WAL;
+a copy whose position falls below the retained WAL is told to re-seed.
+Copies never anchor master's WAL. Automating a per-copy retention window is
+a follow-up item.
 
 ## 8. Observability
 
 Counters and histograms on the tserver, all per tserver:
 
-- poll latency histogram (request sent to response received);
-- apply latency histogram (response received to C published);
-- poll failures, apply failures, re-seeds, lease-triggered serving disables;
+- apply latency histogram (pages received to C published);
+- apply failures, re-seeds, lease-triggered serving disables, floor requests
+  sent;
 - lag histogram: C behind the tserver clock at each publish;
 - gate wait histogram: time the lock-release handler waited for C;
 - local catalog reads served, local reads that waited for A[db], reads routed  
@@ -626,24 +713,28 @@ gauge, lag is sampled only when C moves); a failed local read leaves no
 counter and no fallback; EXPLAIN and pg_stat_statements count copy reads as  
 master reads; the waits of 5.3 rules 2 and 3 are invisible to ASH. Planned  
 additions: applied op id and applied version per database, continuously  
-sampled lag and last-poll age, wait-time histograms and ASH wait codes, a  
+sampled lag and last-push age, wait-time histograms and ASH wait codes, a  
 per-reason breakdown of reads routed to master, a served-by-copy count in  
 EXPLAIN, and debug pages on tserver and master listing the copy's state and  
-master's view of every tserver's position.
+master's view of every tserver's position. Master: push cycles and cycle
+time, push RPCs and bytes, pages built (cached and transient), in-flight
+maxima, floor requests received, pages carried inline by releases and
+releases that could not carry them.
 
 ## 9. Performance model
 
-- DDL, push off (default): one extra poll round trip per tserver (release  
-arrives, tserver polls), in parallel across tservers, plus master's status  
-resolution when other catalog transactions are open. Push on: the records  
-arrive with the release; the residue is the apply time.
-- Readers: no master round trip, including connection startup. Visibility of  
-a DDL to a backend lags its commit by at most one poll plus the release  
-fan-out.
-- Master: tservers × poll rate change-stream requests, each cheap when idle;  
-status resolution round trips while catalog transactions are open, per  
-stream per refresh window. Scaling of the latter with tserver count is a  
-follow-up study (Section 12).
+- DDL: one push cycle on the release path (status resolution when other
+  catalog transactions are open, then building the DDL's pages once); the
+  pages arrive with the release, so the residue on each tserver is the
+  apply time. A DDL whose pages exceed the inline cap (`CREATE DATABASE`)
+  waits for separate pushes, bounded by master's in-flight limits.
+- Readers: no master round trip, including connection startup. Visibility of
+  a DDL to a backend lags its commit by the release fan-out.
+- Master: nothing when nothing changes. Per DDL: one cycle and one copy of
+  each page's bytes per tserver. Status resolution: at most one round per
+  cycle for the cluster, cycles at most every 50 ms when requested by
+  tservers. Measurements: [loadtest-summary.md](loadtest-summary.md) (pull,
+  before) and the push scenarios of the load harness (push-plan §9.7).
 - Post-DDL cost that is not the copy's: a DDL empties the tserver's whole
   per-database table cache, and a new connection in a far region then pays
   one master round trip per table it touches (9 s for a first query at
@@ -669,7 +760,7 @@ single-version gate does not describe the cluster. Support is a follow-up.
 Ranked High or Medium only. Status: **open** (nothing in the code),  
 **partial** (part of the mechanism exists), **addressed** (in the code and  
 tested), **accepted** (a behavior we keep). Implementation-level gaps  
-(checkpoint durability and ordering, poller wake-ups, read failure fallback,  
+(checkpoint durability and ordering, waiter wake-ups, read failure fallback,  
 memstore flushing, compaction of staged intents, tablet-wide flags, explicit  
 read times below the compacted history, release push cost, a restore inside  
 the copied WAL tail) are in `implementation2.md`, "Implementation-level gaps".
@@ -681,16 +772,19 @@ the copied WAL tail) are in `implementation2.md`, "Implementation-level gaps".
 The version check and the own-write check (5.3 rules 2 and 3) are driven by  
 DDL commits only. A catalog write committed any other way is invisible to  
 the next catalog read, of the writing session and of every other session, for  
-up to one poll. Items 1 to 3 are the writers of that kind.
+until the next push. Items 1 to 3 are the writers of that kind.
 
-1. **Login profiles (High, decided, open; [todos T4](todos.md#24-t4-login-profile-catalogs)).** A failed login reads the role's
+Decision 2026-10-09: the features of items 1 to 3 are disabled while the copy
+is enabled; support is a follow-up and the plans below are its candidates.
+
+1. **Login profiles (Medium, decided: disabled, open; [todos T4](todos.md#24-t4-login-profile-catalogs)).** A failed login reads the role's
   failed-attempt counter, adds one and writes it back outside DDL. With the  
-   copy, attempts spaced closer than one poll read the same counter, so the  
+   copy, attempts spaced closer than one push read the same counter, so the  
    lockout after N failures arrives late, and `ALTER ROLE ... ACCOUNT LOCK`  
    is seen late on other tservers. Plan: reads of `pg_yb_profile` and  
    `pg_yb_role_profile` always go to master. Rejected: a version bump per  
    failed login (a global bump, the catalog is shared).
-2. **Large objects (High, open; [todos T5](todos.md#25-t5-large-objects)).** `lo_create`, `lowrite`, `lo_unlink`
+2. **Large objects (Medium, decided: disabled, open; [todos T5](todos.md#25-t5-large-objects)).** `lo_create`, `lowrite`, `lo_unlink`
   write `pg_largeobject` and `pg_largeobject_metadata` from the user's  
    transaction outside DDL. Another session reads them from the copy at C,  
    so an object written just before is missing or torn against the user row  
@@ -698,7 +792,7 @@ up to one poll. Items 1 to 3 are the writers of that kind.
    master; or the own-write check extended to non-DDL catalog commits plus a  
    cross-session wait.
 3. **Direct catalog updates under `yb_non_ddl_txn_for_sys_tables_allowed` ([todos T6](todos.md#26-t6-direct-catalog-updates-and-the-own-write-wait))
-  (High, partial, TODO).** A request that carries the setting goes to  
+  (Medium, decided: disabled outside upgrade and initdb, open).** A request that carries the setting goes to  
    master, but the exclusion ends with the statement, so the session's next  
    read is served from the copy below its own write. A manual increment of  
    the version row covers other sessions (the gate publishes the new version  
@@ -737,14 +831,14 @@ up to one poll. Items 1 to 3 are the writers of that kind.
 ### 11.2 Master side
 
 1. **Remote bootstrap copies state the copy must not trust (High, open; [todos T3](todos.md#23-t3-remote-bootstrap-copies-untrusted-state)).**
-  A poll response certifies its state: every record up to S is committed and  
+  A page with a safe time certifies its state: every record up to S is committed and  
    applied, and open transactions are staged in a form only their apply  
    record can materialize. Remote bootstrap certifies nothing: it copies the  
    tablet as it is, with (a) WAL entries master's leader appended but had not  
    committed, which the single-voter copy commits itself on open and which a  
    later master leader may truncate and replace, and (b) the row-keyed  
    intents of catalog transactions still open at that moment, whose write  
-   records the poller never receives again and whose apply record then finds  
+   records the copy never receives again and whose apply record then finds  
    nothing to apply; once master's coordinator forgets the transaction the  
    copy reads those rows as aborted. Either way the copy diverges from master  
    silently until the next re-seed. xCluster avoids (b) by aborting active  
@@ -752,8 +846,8 @@ up to one poll. Items 1 to 3 are the writers of that kind.
    tserver can bootstrap at any time and that would abort in-flight DDLs  
    cluster-wide. Plan: for (a), resume from the copied log's committed  
    position and refuse to commit entries past it, and let master check the  
-   term at the poller's position and answer "re-seed" on a mismatch; for  
-   (b), rewrite the copied intents into the staged form before the poller  
+   term at the copy's position and answer "re-seed" on a mismatch; for  
+   (b), rewrite the copied intents into the staged form before the applier  
    starts, or apply such transactions through the copy's own participant at  
    the apply record's commit time. Detail in implementation2.md.
 2. **A DDL that fails or dies after commit (Medium, addressed; the two skips are [todos A2](todos.md#237-a2-releases-that-skip-the-gate)).** A DDL that
@@ -766,61 +860,58 @@ up to one poll. Items 1 to 3 are the writers of that kind.
    dies, master releases that lease epoch's locks on expiry without a version  
    read time; the version then reaches the other tservers through the  
    heartbeat, where the gate also runs. Two paths skip the gate on purpose  
-   and are tolerated as one-poll lag covered by the version check of 5.3:  
+   and are tolerated as a short lag covered by the version check of 5.3:  
    master's version read at release fails (the release carries no read time),  
    and the synchronous release exceeds its timeout (master completes it  
    asynchronously and the client is told success first).
 3. **Safe time certified before a restarted master has loaded its ([todos T20](todos.md#218-t20-resolveintents-before-transaction-loading))
   transactions (Medium, open, existing issue).** After master opens its  
    system catalog tablet, the transaction participant loads existing  
-   transactions in the background. A poll that arrives before that finishes  
+   transactions in the background. A push cycle that runs before that finishes  
    resolves only the loaded set, so a committed but not yet applied  
    transaction can be missed and S emitted before its apply record. This is  
    stock code shared by every transactional xCluster stream today. Plan: the  
-   change service waits for loading before certifying S.
-4. **Per-tserver load on master (Medium, open; [todos T21](todos.md#219-t21-master-load-per-tserver)).** Each tserver's poll reads
-  its own window of master's WAL and rebuilds records, and certifies S by  
-   resolving every open catalog transaction against its coordinator; both  
-   scale with the number of tservers, so a catalog-heavy burst or a  
-   long-open DDL costs master N × the work. Plan: compute the batch and S  
-   once per cycle on master and serve every pull from that cache, sliced at  
-   the caller's position. Optional further step: replace the polls with a  
-   regular push from master, which is the release push of 4.4 run on a  
-   timer.
+   pusher waits for loading before certifying S.
+4. **Per-tserver load on master (resolved by push, 2026-10-07; [todos T21](todos.md#219-t21-master-load-per-tserver)).** Each
+   tserver's poll used to read its own window of master's WAL, rebuild the
+   records and certify S by resolving every open catalog transaction, so a
+   catalog-heavy burst cost master N × the work. Master now builds each page
+   once and certifies S once per cycle for every copy (4.1), and bounds the
+   pushes in flight. What remains is N copies of the bytes on master's NIC
+   ([post-perf-design.md](post-perf-design.md) §4).
 
 
 ### 11.3 Tserver side
 
-1. **Statements that wait on an ad hoc poll (Medium, partial; [todos T11](todos.md#211-t11-serving-withdrawal-and-wait-fallbacks), [T36](todos.md#234-t36-wait-latency)).** In the
-  common case no statement waits on the poller. A few narrow cases make a  
-   statement wait until an immediate poll completes: the statement after a  
+1. **Statements that wait on a push (Medium, partial; [todos T11](todos.md#211-t11-serving-withdrawal-and-wait-fallbacks), [T36](todos.md#234-t36-wait-latency)).** In the
+  common case no statement waits on the copy. A few narrow cases make a  
+   statement wait until a requested push arrives: the statement after a  
    `CREATE TEMP TABLE` (own-write check), a read that carries a version the  
    heartbeat announced before the copy had it (item 2), and a login in the  
    flip window (implementation2.md). If master is unreachable, that wait runs to  
-   its timeout (5 s) and the read then goes to master, which fails as well;  
+   its timeout and the read then goes to master, which fails as well;  
    the tserver is about to lose its lease in that state anyway. Fallback  
    needed: bound the wait once per statement, not once per request, and take  
-   the copy out of the read path after repeated poll failures so that the  
+   the copy out of the read path after repeated apply failures so that the  
    gate is skipped, heartbeat publication resumes and reads go to master  
    (7.2). Measured consequence without it: one tserver whose  
-   poller is stuck holds every DDL in the cluster at its gate for the  
+   applier is stuck holds every DDL in the cluster at its gate for the  
    release deadline.
-2. **A heartbeat announces a version ahead of the DDL's release (Medium, [todos T1](todos.md#21-t1-freshness-guarantee-on-applied-versions);
+2. **A heartbeat announces a version ahead of the DDL's release (Medium, [todos T1](todos.md#21-t1-publish-gate-on-applied-versions);
    open).** A tserver that the release has not reached yet, or whose copy is
    behind, can learn a new version from the heartbeat first. The report is
    held until the copy's applied versions reach it and is published then
-   (4.3); the wait ends when the release's records or the immediate poll
-   arrive, so it costs at most one poll. It must not cost a heartbeat
+   (4.3); the wait ends when the release's pages or the requested push
+   arrive. It must not cost a heartbeat
    interval on top: a held report is published as soon as the copy catches
    up, not at the next heartbeat. Backends without a database are covered by
    the serving condition of 7.1.
 
 ## 12. Follow-up items
 
-- Load study: a standalone poll client, independent of the tserver, running  
-as many instances as a large cluster would have tservers against a real  
-master, to measure change-stream and status-resolution load. First step  
-with most of the saving: 11.2 item 4.
+- Load study of push: N push receivers in the test process standing in for N
+  tservers (`pg_local_catalog_load-test`, push scenarios); results to be
+  added to loadtest-summary.md and post-perf-design.md §4.
 - Send a DDL's changed table list in the lock release, so a tserver evicts  
 only those entries from its table cache instead of the whole database's.  
 Master already holds that set for DDL verification and already fills  

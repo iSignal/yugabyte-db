@@ -3020,3 +3020,342 @@ looked up (`LookupTabletDone`, `src/yb/client/transaction.cc:1898-1940`), withou
 tablet's leader. The test passed 11 of 11 local runs (release, routing log on); three of those runs
 also logged a leaderless lookup during the query. The cause of the CI stall is not established, and
 nothing in the log ties it to the copy.
+
+## Sixth default-on CI run (D57801 diff 318478, launch 174343): 63 release failures
+
+**The launch.** Diff 318478 differs from diff 318234 (launch 173734) only by the startup wait
+(`207f7c7be4b`), the disabled repro test and notes; same base `53aae8dc4efb`. alma8/clang21/release,
+2026-09-30 05:23-08:38Z, 13298 executions, 63 failed. All three lanes ran again although the test
+plan says `Jenkins: release`; the fastdebug lane (174344) has 2 failures.
+
+**Against launch 173734.** 48 failures recur, 11 are gone, 15 are new. The 48 map onto the rows of
+the previous triage: A 4, C 18, D 7, E 4, F 1, G 6, H 1, I 1, J 3, K 3.
+
+The 15 new ones, triaged from ReportPortal logs only (no local run):
+
+| Group | Tests | N | Cause | Confidence |
+|---|---|---|---|---|
+| The startup wait times out: a copy never bootstraps under MiniCluster address emulation | `YBBackupDuringAlterTable.DropColumnWithDefaultValueDuringCreateSnapshot/1`, `PgCloneTestWithColocatedDBParam.CloneWithSequencesAndDdl/1` | 2 | ts-2 is in master's emulated address group, so the harness blocks master's broadcast address (127.0.0.3) for it; ts-2's copy fetched from that address and logged "TEST: Connectivity is broken with 127.0.0.3" on every attempt, while ts-1 (private address) and ts-3 (other group) served. Why the copy's fetch used the broadcast address while ts-2's heartbeats worked is not established | block verified from log; address choice not established |
+| The startup wait times out: a copy's remote bootstrap stalls with `--read_buffer_memory_limit=4000000` | `PgAnalyzeReadBufferLimitTest.AnalyzeWithBigRequest`, `AnalyzeWithBigResponse` | 2 | the copy downloaded its small files and then made no progress for 60 s, still in `EnsureLocalTablet`; the fixture sets the 4 MB read buffer limit (`pg_auto_analyze-test.cc:2111`) and the copy's SST block file is about 8 MB | stall verified; link to the limit is a hypothesis |
+| Row H, artificial version bump | `PgBackendsTest` x4 (`AlreadySatisfiedVersion`, `CachedJob`, `WaitAllBackends`, `WaitOnlySameDatabase`), `PgBackendsTestRf3Block.LeaderChangeInFlightLater`, `PgLibPqTest.CatalogCacheMemoryLeak` | 6 | "wait for catalog version N to propagate" after `BumpCatalogVersion`, 10 s; same family as launch 173734's `CachedVersion` (which passed this time) | timeline verified, gate not visible without vlog |
+| Row I | `PgGlobalViewsTest.TestTserverDownBetweenPrepareAndExecute` | 1 | same signature as `TestOneTServerDown`: after a tserver stops, a relcache-init backend on another tserver stalls from 31.426 to 33.876 while that tserver logs "Unable to find the leader" for a status tablet | symptom verified, cause unknown |
+| Row D family (spawned tserver, DDL during bootstrap) | `TestPgConfiguration.flagfileWithRelativePath` | 1 | ts4's copy started serving at 02.646, 32 ms after `CREATE TABLE` at 02.614; the next statement did not find the table. No version increment is logged, so `todos.md` T12 (own-write floor recorded as 0) is as likely as T3(b) | timeline verified, mechanism a hypothesis |
+| Row C, possibly | `TestPgRegressMergeScan` (`yb.orig.merge_scan_range`) | 1 | a plan choice changed (`r5n_pkey` instead of `r5n_expr_r2_r3_r4_idx`); stale statistics read from the copy would explain it, a plan flake would too | low |
+| Row K | `PgIndexBackfillTest.RetainDeleteMarkersRecoveryViaSeveralRequests/1`, `XClusterDDLReplicationSwitchoverTest.PartmanExtension` | 2 | a CREATE right after `ExternalMiniCluster::Restart` hit "the database system is starting up"; partman is known flaky | verified / unknown |
+
+The four startup-wait failures are the wait working as designed: in each, a tserver whose flags
+allow the copy never got a serving copy, and before the wait the test passed with that tserver's
+catalog reads all going to master.
+
+## Master push (push-plan.md), 2026-10-07
+
+Implements [push-plan.md](push-plan.md) steps 1-7 in repo6 (uncommitted), fastdebug only.
+Nobody pulls: `GetSysCatalogChanges`, `cdc/sys_catalog_change_service.{h,cc}` and the
+tserver's poll loop are gone; `LocalCatalogPoller` is now `LocalCatalogApplier`.
+
+**What was built.**
+
+| Plan step | Code |
+|---|---|
+| 1 Page cache | `master/sys_catalog_pusher.{h,cc}`: pages built with `cdc::PopulateXClusterRecords` (factored out of `GetChangesForXCluster`) over `RaftConsensus::ReadCommittedMessages` (new); cycle = clock update, `LeaderSafeTime`, `ResolveIntents`, majority-replicated index, pages up to it. The interim "pull answered from the cache" was written and removed again with step 7, never measured. |
+| 2 Receiver | `TabletServerService.PushSysCatalogChanges`; apply queue keyed by `page_from`; gap, overlap and term rules; `RequestPush(floor)` → `RequestSysCatalogPush` floor requests |
+| 3 Scheduler | target map, in-flight bounds, transient pages below the cache, timer cycle, floor handler |
+| 4 Release | `PrepareRelease`: one cycle, cached pages inline up to 4 MB, else priority push; release answers carry the copy's position and C |
+| 5 Lease regain | `OnLeaseGained` requests a push to B and leaves serving when C < B; T2 serving condition (`NotePublishedVersions`); PG start held (`DeferredPgRestart`) until the copy's state is `kServing` or `local_catalog_serve_wait_timeout_ms` (now 300 000, -1 = never) |
+| 6 Load harness | `pg_local_catalog_load-test.cc`: in-process push receivers registered through `TEST_local_catalog_push_extra_targets`; scenarios `PushSteady`, `PushFixedLag`, `PushJoinerWave`, `PushIdle`, `CreateDatabaseFanout`; `DdlWalSize` measures pushed bytes with one receiver; pull scenarios removed. Not run yet. |
+| 7 Pull removed | `enable_local_catalog_push` and every `local_catalog_poll_*` flag and metric removed; `TEST_local_catalog_fail_poll` → `TEST_local_catalog_fail_push`, `TEST_local_catalog_poll_checkpoint_too_old` → `TEST_local_catalog_push_reseed`, `TEST_local_catalog_pause_poller` → `TEST_local_catalog_pause_applier` |
+
+**Deviations from the plan.**
+
+- A push RPC carries `repeated LocalCatalogPagePB pages` (consecutive pages up to one page
+  size), and the release's `local_catalog_changes` is the same message serialized, so the
+  receiver has one apply path.
+- `Drain` scans all targets only when pages were added, on a request, and once a second; a
+  completed push re-queues only its own target. A scan per acknowledgement is O(N) per ack and
+  O(N²) per catch-up wave at thousands of tservers.
+- A floor request from a target overrides "a release carrying pages is in flight to it": the
+  request means those pages did not get the copy to the gate.
+- PG's start waits for the copy's state, not `IsServing()`: `IsServing()` is also false during a
+  major version upgrade and under `TEST_local_catalog_disable_serving`, and holding PG for those
+  reasons would hold it until the timeout (found by `FirstQueryLatencyAfterRestart`).
+- `OnLeaseGained` asks for a push to B in every non-serving state, not only `kDisabledLease`.
+  Without that, a copy bootstrapping when the first lease arrived published a C below B and
+  then nothing asked master to move it, so it never served (first run of
+  `BootstrapReachesServing`).
+- A read with its own time h above C waits for a push up to h and is served locally (plan
+  §2.7), so `ExplicitReadTimeRouting` now asserts a served read and a floor request, and
+  routes to master only when the applier is paused and the wait times out.
+- Master pushes only to tservers with a live YSQL lease (plan §2.1). At cluster start a copy
+  that asks before its first lease waits for the lease (1-2 s in the tests).
+- Not implemented from the test list: 9.1 `BelowRetentionIsReseed`, `InFlightBoundsHold`,
+  `GapAnswerRewinds`, `TermChangeClearsCache`; 9.2 (applier unit tests; the cluster tests
+  `GapFromStaleReportIsRepushed`, `LostPushIsRepairedNextCycle`,
+  `ApplyOutlivingItsCallerDoesNotCrash` cover gap, overlap and the outliving handoff);
+  9.3 `DropSchemaCascadeIsInlineMultiPage`; 9.4 `RejoinBelowRetentionReseeds`,
+  `RejoinPgStartHoldNever`, `RejoinWaveDoesNotHoldDdl`; 9.5
+  `MasterSnapshotTimeIsFloorForNextLocalRead`, `TimerCycleAdvancesIdleC` (contradicts the
+  plan's own rule that a tick with no new WAL does nothing), `FallbackKnobNeverHoldsTheStatement`,
+  `StalledApplyTimesOutAndRecovers`, `RestoreIsReseedByPush`; 9.6 Java
+  `PgBackendsTest.CachedVersion`.
+
+**Test results (fastdebug).** `sys_catalog_pusher-test` 6/6. `pg_local_catalog-test` full run
+on the step-7 build: 51 of 56 passed. The five failures and their causes:
+
+| Test | Cause | Fix |
+|---|---|---|
+| `FirstQueryLatencyAfterRestart` | PG start held on `IsServing()`, which the test's `TEST_local_catalog_disable_serving` keeps false; PG never started, connect refused for 60 s | wait on the state (product fix above) |
+| `StragglerIsPushedNotPolled` | test thread called `status()` on a successful `Result<PGConn>`; CHECK failure | test fix |
+| `ConcurrentDdlsShareCycles` | 82 cycles for 40 DDLs exceeded the test's bound of 2 per DDL; the 40 DDLs made about 84 version-publishing releases (252 payloads / 3 targets) | bound = releases + floor requests, counted by the new master counter `local_catalog_push_release_requests` |
+| `TempTableFloorRequestsOneCycle` | the copy already held the temp table's rows (C 08:47:28.938 ≥ own-write floor 28.930), so no floor request was sent | assert at most one floor request and a locally served read |
+| `RejoinCatchesUpFromCache` | `CREATE INDEX` while the joiner had no lease: index backfill connects to the PG of every tserver holding a tablet, and the joiner's PG was stopped; hung 600 s | build the index before the lease loss; `ADD COLUMN ... DEFAULT` and `CREATE VIEW` during it |
+
+Rerun of the five after the fixes: 5/5 passed. Final full run on the final code (after the
+change below): `pg_local_catalog-test` 56/56, `sys_catalog_pusher-test` 6/6, fastdebug,
+2026-10-07 09:13-09:35.
+
+**Load harness smoke runs (fastdebug, 20 receivers, 10 s; checks that the harness works, not
+measurements).** `PushSteady`: 180 DDLs, 357 cycles, 7139 push RPCs, every receiver at the
+head. `PushIdle`: 0 cycles, 0 push RPCs. `PushJoinerWave` (100 lag DDLs, look-back 50 ops): 20
+of 20 receivers caught up, p50 590 ms. `CreateDatabaseFanout`: one release skipped inline (the
+pages exceed 4 MB), 307 push RPCs, 485 MB, in flight at most 21 RPCs and 53 MB.
+
+The smoke runs found one defect, fixed: the harness's real tserver keeps no copy, so master
+never learned its position, and every release carried the cache's whole look-back to it inline
+(243 009 pages in 10 s). Now a target whose position is unknown gets no inline pages and is
+pushed from the start of the cache by the scheduler (plan §2.5), and a tserver that answers a
+push with "no local copy" (`NotSupported`) gets no pushes until its heartbeat reports a
+position. The harness also had to ask master for a cycle (a floor request) before recording
+the receivers' head: the committed index after the lag DDLs includes master's own later writes,
+which no cycle had certified, so receivers at the cache's end never counted as caught up.
+
+Not done: release-build runs of the suites; the push scenarios at scale (push-plan §9.7) and
+the benchmark re-run of push-plan §10.
+
+### Master push, second round: the remaining §9 tests, release runs (2026-10-07 afternoon)
+
+**Tests added.** Master unit (`sys_catalog_pusher-test`, now 10): `InFlightBoundsHold` (200
+in-process receivers, bound 8: never more than 8 RPCs in flight, never two to one target),
+`GapAnswerRewinds`, `TermChangeClearsCache` (`EmulateElection`), `BelowRetentionIsReseed`
+(1 MB segments, retention 0, log GC; the log cache limit has to be 0 as well, because master's
+log cache keeps system catalog operations until memory forces them out, and an operation in it
+is still retained for a copy). Cluster (`pg_local_catalog-test`, now 69): §9.2 as RPC-level
+tests against a real tserver with record-less pages (`GapIsAnsweredNotApplied`,
+`OverlapIsFiltered`, `StaleTermAndWrongTargetAreRefused`, `QueueOrdersByPageFrom`); §9.3
+`DropSchemaCascadeIsInlineMultiPage`; §9.4 `RejoinBelowRetentionReseeds` (retention loss
+injected with `TEST_local_catalog_push_reseed`), `RejoinPgStartHoldNever`,
+`RejoinWaveDoesNotHoldDdl`; §9.5 `MasterSnapshotTimeIsFloorForNextLocalRead`,
+`FallbackKnobNeverHoldsTheStatement`, `StalledApplyTimesOutAndRecovers`,
+`TimerCycleCarriesWritesOutsideDdl` (replaces `TimerCycleAdvancesIdleC`: a catalog write under
+`yb_non_ddl_txn_for_sys_tables_allowed`, which no release carries, reaches the copy on the timer
+cycle without a floor request).
+
+**Implemented for §9.5: todos T13.** A catalog read the copy could have answered that went to
+master sets `catalog_read_from_master_` on the session; the session's next read from the copy
+waits (floor request) until C reaches this server's clock reading, which the master response
+moved past master's read time.
+
+**Pusher defects found by the new master tests, fixed.**
+
+- A copy that answered "gap, I am at 0.0" was treated as having an unknown position, so master
+  re-sent the start of the cache, which gapped again: a loop with no backoff, one push every
+  0.6 ms. A position the tserver states is now known even when it is 0, and a copy with no
+  position at all is told to re-seed (the log reader reads index 0 as "the earliest entry").
+- Any successful answer that does not move the copy past pages that end above its position (a
+  gap at the same position, a re-seed not started) now counts as a failure and backs off.
+
+**Defect found by `RejoinWaveDoesNotHoldDdl` (release), fixed: floors ratcheted the hybrid
+clock.** The cycle moved master's clock up to the highest pending floor, as the pull path's
+`wait_for_safe_time` did and as push-plan §2.3 says. A rejoining tserver's floor is its
+`MaxGlobalNow()`, its clock plus the 500 ms maximum skew. Two tservers rejoined one after the
+other: master's clock went to the first one's bound; master's responses carried it to the second,
+whose `MaxGlobalNow()` was then that time plus another 500 ms; master's clock followed. Tserver 0
+received the result and crashed with `Too big clock skew is detected: 0.893s, while max allowed
+is: 0.500s` (hybrid_clock.cc:208), killing the test's DDL connection. Now a floor never moves
+master's clock; the scheduler re-runs cycles, at most every 50 ms, until master's own clock has
+passed the floor. A wait for a floor ahead of master's clock costs up to the skew bound.
+Unit test `FloorMovesTheSafeTime` became `FloorIsReachedWithoutMovingTheClock`.
+
+**Release results.** `sys_catalog_pusher-test` 10/10. `pg_local_catalog-test` 68/68 (one
+disabled) after the clock fix. §9.5 restore: `YbAdminSnapshotScheduleTestWithYsql.TransactionDuringPITRRepro23399`
+and `YbAdminSnapshotScheduleTestWithYsqlColocationRestoreParam.Pgsql/*` (5 parameters), 6/6, feature
+on by default in release.
+
+**§9.6 `PgBackendsTest.CachedVersion` failed in release, caused by push; fixed (todos T14).**
+`BumpCatalogVersion` raises versions with `yb_increment_all_db_catalog_versions`, which makes no
+lock release, so tservers learn the versions from the heartbeat, whose gate compares the report's
+read time with C. Sequence on ts-1:
+
+```
+heartbeat (47.577): report read at 47.276 > C 46.49 → skipped, floor request 47.276
+push:               C := 47.578
+heartbeat (48.578): new report read at 48.276 > C 47.578 → skipped, floor request 48.276
+push:               C := 48.578
+... (10 s, test times out)
+```
+
+Each heartbeat carries a report read later than the C the previous floor bought. With pull, C
+advanced every 100 ms on its own and the report usually landed (it failed in CI under load: row H
+of the fifth CI run). With push, C moves only on request, so the report never lands. Fix, as plan2
+§4.3 already specifies (held and published on catch-up): the heartbeater keeps the first report
+the gate held (`held_version_report_`) and publishes it on a later heartbeat as soon as the copy
+holds its read time, before evaluating the newer report. After the fix `pg_backends-test` 27/27 in
+release, including `CachedVersion` and the row-H tests `AlreadySatisfiedVersion`, `CachedJob`,
+`WaitAllBackends`, `WaitOnlySameDatabase`, `PgBackendsTestRf3Block.LeaderChangeInFlightLater`.
+A held report still waits for the next heartbeat (1 s) after the copy catches up; publishing it
+from the applier at once is the rest of T14.
+
+### Master push, §9.7 load results from session 0ef85aa9 and the follow-up fixes (2026-10-07 evening)
+
+Session `0ef85aa9` ("local tserver copy master load test 16 core") ran §9.7 in release; its
+notes hold the numbers. Summary: a copy that catches up costs master 1.0-1.5 ms CPU per MB
+(pull: 25); CREATE DATABASE pushed to 1000 receivers costs 11.85 GB and 10.5 CPU-s;
+`PushSteady` with 1000 receivers uses 4.33-4.43 cores, about 75 µs per push RPC; `PushIdle`
+runs 0 cycles. It asked four questions:
+
+- **Q1, `PushFixedLag` gaps: intended.** A fixed-lag receiver accepts the first page of each push
+  and does not move its position, so the second page starts above it and it answers "gap". The
+  50 lag DDLs are inside master's cache, so master builds no transient pages. Master treats a
+  successful answer that does not move the copy as a failure and backs off.
+- **Q2, `CreateDatabaseFanout` caught-up time: harness defect, fixed.** `SetHead` moved the head
+  but kept each receiver's caught-up time and the start time, so the reported time was that of
+  the first push. `SetHead` now restarts the clock and clears the caught-up time of receivers
+  below the new head. 100 receivers: p50 108 ms, max 110 ms after the statement returns.
+- **Q3, `DdlWalSize` pushed bytes include about 247 KB of look-back: harness defect and pusher
+  defect, both fixed.**
+  - Harness: `PushedBytes` now reports the receiver's position (`RequestSysCatalogPush` with
+    `applied_op_id`) before it makes the receiver a target, and reports `record_bytes`, the
+    serialized size of the records above the start position.
+  - Pusher: the first cycle of a leader sets the term from 0 and ran the term-change reset,
+    which dropped every target position, including positions that floor requests or heartbeats
+    reported before that cycle. An idle master runs no cycles, so the receiver's reported
+    position was dropped and master pushed its whole cache (577 pages) to it. A tserver that
+    reports its position to a newly started master before the first cycle had the same
+    problem. `ResetForTermUnlocked` now keeps target positions when the previous term was 0.
+  - Release result: idle control 1 page; `record_bytes` is 82-96% of `log_bytes_logged`
+    (CREATE TABLE 12.8 of 15.6 KB; 100 x CREATE TABLE 1.29 of 1.56 MB; DROP SCHEMA CASCADE
+    with 100 tables 1.81 of 2.04 MB). `sys_catalog_pusher-test` 10/10.
+- **Q4, receivers hold no lease: limitation.** Lock release does not wait for fake receivers, so
+  the synchronous release path across 1000 copies is not measured.
+
+Future work, not implemented: `PushSteady` shows that per-RPC cost dominates at one DDL per push;
+pushing several DDLs' pages in one RPC per target would cut it.
+
+#### Rerun by 0ef85aa9 and two more fixes (2026-10-07, 19:00-19:50)
+
+- **Rerun results (host4, release):** `DdlWalSize` fix confirmed (idle 1 page, 0 bytes;
+  `record_bytes` 82-96% of WAL bytes; CREATE DATABASE 145%). `CreateDatabaseFanout` master CPU:
+  N=100 1.76 CPU-s, N=1000 9.16 CPU-s (11.85 GB in 10,001 RPCs, at most 48 RPCs and 70 MB in
+  flight). Caught-up time was not consistent: N=100 had 0/100 caught up, although every receiver
+  got all its bytes.
+- **Harness defect, fixed.** After CREATE DATABASE returned, the harness requested a cycle, slept
+  500 ms and then read the committed index as the head. Writes committed after that cycle (for
+  example DDL verification writes) put the head above everything the cycle carried, and nothing
+  started another cycle in the phase. With N=100 all pushes ended inside the 500 ms, so no
+  receiver reached the head. The harness now reads the head and starts the clock when the
+  statement returns, then requests the cycle, which carries at least that index. Local release:
+  N=100 100/100, p50 854 ms; N=1000 1000/1000, p50 9.9 s (receivers on the same 16-core host as
+  the cluster).
+- **Shutdown crash, fixed (release suite run).** `ExplicitReadTimeRouting` passed but ts-1
+  crashed with SIGSEGV at shutdown. Sequence:
+
+  ```
+  RPC thread (push)                          shutdown thread
+  ApplyPushedPages: queue push, wait on
+    push_cond_ until the RPC deadline (30 s)
+                                             LocalCatalogApplier::Shutdown: stops the apply
+                                               thread, leaves the queued push uncompleted
+                                             CompleteShutdown: applier_.reset()
+                                               ~condition_variable blocks on the waiter (16 s)
+  wait times out, touches freed push_mutex_
+    → SIGSEGV
+  ```
+
+  The same code existed for release-carried pages before push (`ApplyPushedBatch`); push makes
+  every tserver run it continuously. Fix: `Shutdown` refuses new pushes, completes queued pushes
+  with ShutdownInProgress, wakes waiters and waits until no RPC thread is inside
+  `ApplyPushedPages`; `CompleteShutdown` no longer destroys the applier (the replica destructor
+  does). New test `ShutdownWhilePushWaits` (pause the applier, wait for a push, graceful
+  shutdown): without the fix the shutdown takes 60 s and ts-1 crashes; with it the test passes.
+  Release `pg_local_catalog-test` 69/69.
+- **Rerun 3 by 0ef85aa9 (host4, release, both fixes):** N=100 100/100 caught up, p50 499 ms,
+  max 500 ms, master 2.13 CPU-s, 1.185 GB in 1001 RPCs; N=1000 1000/1000, p50 4.74 s, master
+  9.55 CPU-s (0.81 ms/MB), 11.85 GB in 10,001 RPCs, at most 48 RPCs / 70 MB in flight. The N=100
+  time equals `CertifyNow`'s 500 ms sleep, but the receivers record their time in the push
+  handler, which the sleep does not delay. Both runs move about 2.4-2.5 GB/s (1.185 GB / 0.5 s,
+  11.85 GB / 4.74 s), so the time scales with the bytes pushed.
+- **Rerun 4 by 0ef85aa9 (quiet host4; rerun 3 overlapped another session's build):** N=100
+  100/100, p50 487 ms, max 488 ms, master 1.92 CPU-s; N=1000 1000/1000, p50 4.65 s, max
+  4.66 s, master 9.66 CPU-s. A logged N=100 run (`--vmodule=sys_catalog_pusher=2` on master)
+  confirms that the time is transfer time: the statement returned at 41.09, the cycle certified
+  index 642 at 41.147, and the pushes ran from 41.148 to 41.627 (480 ms for 1.18 GB, about
+  2.5 GB/s). The pages went out as 9 page ranges, each sent to all 100 receivers before the
+  next, so all receivers finish within a few ms of each other (p50 = max).
+
+## Master push: state on 2026-10-09
+
+**Code.** All of push-plan.md steps 1-8 is in repo6 (branch `docdb_local_catalog`, on top of
+`cc0b13766e6`), uncommitted: 43 files changed (+5357/-2072), plus the untracked
+`notes/push-plan.md` and `src/yb/yql/pgwrapper/pg_local_catalog_load-test.cc`.
+
+- The pull path is gone: master's `GetSysCatalogChanges` RPC and the tserver poll loop were
+  removed in step 7. Master pushes pages of its system catalog WAL to every tserver with a live
+  YSQL lease (`master/sys_catalog_pusher.cc`); a tserver sends only floor requests
+  (`RequestSysCatalogPush`) when a waiter needs C at a given time.
+- What remains of phase 1: the record format and WAL reader (`PopulateXClusterRecords`,
+  `ReadCommittedMessages`) with an in-memory stream id, and the flag name
+  `sys_catalog_change_stream_idle_timeout_sec`, which now sets how long master keeps the position
+  of a tserver that left.
+- The tserver's `LocalCatalogApplier` still runs on `MasterLeaderPollScheduler`, whose interface
+  names its callback `Poll()`. That thread does not read master's WAL: it creates or re-seeds the
+  copy, applies queued pushed pages, repeats an open floor request every 1 s and persists the
+  applied position. Comments that still described a poll were updated on 2026-10-09
+  (`local_catalog_applier.{h,cc}`, `pg_client_session.cc`, `tablet_server.cc`, `tserver.proto`,
+  `pg_local_catalog_load-test.cc`); `todos.md` links to removed plan2 sections were fixed and its
+  open items T1, T7, T11 restated in push terms.
+
+**Tests (release, 2026-10-07).** `sys_catalog_pusher-test` 10/10; `pg_local_catalog-test` 69/69
+(one disabled) including `ShutdownWhilePushWaits`; `pg_backends-test` 27/27; PITR restore tests
+of `yb-admin-snapshot-schedule-test` 6/6.
+
+**Defects fixed after the first push runs** (details in the sections above):
+
+| Defect | Fix |
+|---|---|
+| A floor moved master's hybrid clock; successive lease-bound floors ratcheted it until a tserver crashed on the skew check | floors never move master's clock; cycles repeat until master's clock passes the floor |
+| `PgBackendsTest.CachedVersion`: each heartbeat report was read after the C the previous floor bought, so no report landed | the heartbeater holds the first blocked report and publishes it once the copy holds its read time (T14, partly) |
+| A new leader's first cycle dropped target positions reported before it, so master pushed its whole cache | positions are kept when the previous term was 0 |
+| Shutdown destroyed the applier under an RPC thread waiting for a pushed page (SIGSEGV) | applier shutdown completes waiting pushes and waits for RPC threads to leave |
+
+**Perf runs (session `0ef85aa9`, "local tserver copy master load test 16 core"; host4, 16 vCPU,
+release, push receivers in the test process).**
+
+- Summary tables: [loadtest-summary.md](loadtest-summary.md) "Push (push-plan.md §9.7),
+  2026-10-07"; [load_user_scenario_summary.md](load_user_scenario_summary.md) "With master push
+  (measured 2026-10-07)"; [post-perf-design.md](post-perf-design.md) §4 (pull against push).
+- Raw logs: `loadtest-results/host4-push/` (first round, `pl-run-*.log.gz`, vmstat and perf
+  files, `runs.sh`, `runs2.sh`, source patch); `rerun-2/` (DdlWalSize and CreateDatabaseFanout
+  after the position and harness fixes); `rerun-3/` (CreateDatabaseFanout after the head and
+  shutdown fixes, overlapped another build); `rerun-4/` (the same on a quiet host, and a logged
+  N=100 run).
+- Headline numbers: catch-up costs master 1.0-1.5 ms CPU per MB (pull: 25-61 ms); CREATE
+  DATABASE to 1000 tservers 9.66 CPU-s and 4.65 s to reach all of them (100: 1.92 CPU-s,
+  487 ms), about 2.5 GB/s on loopback; steady DDLs to 1000 tservers 2.8-2.9 cores above the DDL
+  baseline (about 75 µs per push RPC); idle cluster of 8000 tservers: no cycles.
+
+**Open (push-specific).**
+
+- Commit the work (not requested yet).
+- T14 rest: publish a held heartbeat report as soon as the copy catches up, not at the next
+  heartbeat (up to 1 s later).
+- T13: implemented. `MasterSnapshotTimeIsFloorForNextLocalRead` passes in release, and fails
+  when the session wait in `LocalCatalogCompleteTime` is disabled (no floor request is sent:
+  11 vs 11), checked 2026-10-09. It checks counters (a floor request sent, C past the master
+  read time), not that a session would otherwise read a stale catalog. Not yet run in CI.
+  One run of it on 2026-10-09 failed before the test body: master logged "Master server
+  successfully started" and began shutting down 10 ms later with no error, so the tservers
+  timed out finding it (`/tmp/push-t13-pos.log`); the cause is unknown and the rerun passed.
+- Test `RestoreIsReseedByPush` not written; the PITR restore tests pass with the feature on but
+  do not assert that every tserver received the re-seed by push.
+- Not measured: a DDL's lock release waiting for 1000 real, lease-holding copies.
+- Future optimization: several DDLs' pages in one push RPC per target, which would cut the
+  per-RPC cost that dominates steady fan-out.
