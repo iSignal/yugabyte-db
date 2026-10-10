@@ -929,7 +929,7 @@ Status TabletServer::Start() {
 
   AutoInitServiceFlags();
 
-  // Created before the services so that PgClientServiceImpl can capture it; the poll thread is
+  // Created before the services so that PgClientServiceImpl can capture it; the apply thread is
   // started further down, once the tablet manager can open the copy's tablet.
   if (FLAGS_enable_local_tserver_catalog) {
     if (LocalCatalogPrerequisitesMet()) {
@@ -1058,7 +1058,7 @@ void TabletServer::Shutdown() {
     remote_bootstrap_service->StartShutdown();
   }
 
-  // The poll thread holds RPCs to master and writes to the local catalog copy, so it must be
+  // The apply thread holds RPCs to master and writes to the local catalog copy, so it must be
   // joined before the reactors are, and the copy's tablet peer shut down before the tablet
   // manager's own shutdown completes.
   if (local_catalog_replica_) {
@@ -1640,6 +1640,9 @@ void TabletServer::SetYsqlCatalogVersion(uint64_t new_version, uint64_t new_brea
 void TabletServer::SetYsqlDBCatalogVersionsUnlocked(
   const tserver::DBCatalogVersionDataPB& db_catalog_version_data, uint64_t debug_id) {
   DCHECK_GT(db_catalog_version_data.db_catalog_versions_size(), 0);
+  if (local_catalog_replica_) {
+    local_catalog_replica_->NotePublishedVersions(db_catalog_version_data);
+  }
 
   bool catalog_changed = false;
   std::unordered_set<uint32_t> db_oid_set;

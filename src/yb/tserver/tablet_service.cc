@@ -103,6 +103,7 @@
 
 #include "yb/tserver/heartbeater.h"
 #include "yb/tserver/pg_txn_snapshot_manager.h"
+#include "yb/tserver/local_catalog_replica.h"
 #include "yb/tserver/read_query.h"
 #include "yb/tserver/service_util.h"
 #include "yb/tserver/tablet_server.h"
@@ -3999,11 +4000,37 @@ void TabletServiceImpl::ReleaseObjectLocks(
   }
   auto res = ts_local_lock_manager->ReleaseObjectLocks(*req, context.GetClientDeadline());
   resp->set_propagated_hybrid_time(server_->Clock()->Now().ToUint64());
+  if (auto* local_catalog = server_->local_catalog_replica();
+      local_catalog && req->has_catalog_versions_read_time()) {
+    // Lets master pick the next pages for this copy without waiting for a heartbeat.
+    if (auto applied = local_catalog->applied_op_id(); !applied.empty()) {
+      applied.ToPB(resp->mutable_local_catalog_applied_op_id());
+    }
+    if (auto safe_time = local_catalog->safe_time(); safe_time.is_valid()) {
+      resp->set_local_catalog_safe_time(safe_time.ToUint64());
+    }
+  }
   if (!res.ok()) {
     SetupErrorAndRespond(resp->mutable_error(), res.status(), &context);
   } else {
     context.RespondSuccess();
   }
+}
+
+void TabletServiceImpl::PushSysCatalogChanges(
+    const PushSysCatalogChangesRequestPB* req, PushSysCatalogChangesResponsePB* resp,
+    rpc::RpcContext context) {
+  auto* local_catalog = server_->local_catalog_replica();
+  if (!local_catalog) {
+    return SetupErrorAndRespond(
+        resp->mutable_error(),
+        STATUS(NotSupported, "This tserver has no local copy of the system catalog"), &context);
+  }
+  auto status = local_catalog->HandlePush(*req, resp, context.GetClientDeadline());
+  if (!status.ok()) {
+    return SetupErrorAndRespond(resp->mutable_error(), status, &context);
+  }
+  context.RespondSuccess();
 }
 
 void TabletServiceImpl::WaitForLockersMultiple(

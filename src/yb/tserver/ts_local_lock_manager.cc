@@ -29,8 +29,8 @@
 
 #include "yb/server/server_base.h"
 
-#include "yb/cdc/cdc_service.pb.h"
 
+#include "yb/tserver/local_catalog_applier.h"
 #include "yb/tserver/local_catalog_replica.h"
 
 #include "yb/tserver/service_util.h"
@@ -548,29 +548,32 @@ class TSLocalLockManager::Impl {
       // published immediately.
       auto* local_catalog = server_->local_catalog_replica();
 
-      // Master may have carried the very records this copy is missing. Applying them here is what
-      // turns the wait below into a no-op; when they cannot be used, the wait does its job as
-      // before, so nothing about correctness rests on this.
-      if (local_catalog && local_catalog->IsServing() && req.has_local_catalog_changes()) {
+      // Master may have carried the very pages this copy is missing. Applying them here is what
+      // turns the wait below into a no-op; when they cannot be used, the wait asks master for a
+      // push, so nothing about correctness rests on this. A copy that is not serving has no
+      // backends to protect, so it queues the pages and acknowledges without waiting for them.
+      if (local_catalog && local_catalog->tablet_peer() && req.has_local_catalog_changes()) {
         local_catalog->IncPushesReceived();
-        cdc::GetSysCatalogChangesResponsePB batch;
-        Status push_status;
+        auto pages = std::make_shared<PushSysCatalogChangesRequestPB>();
+        Result<LocalCatalogPushOutcome> outcome{STATUS(Uninitialized, "")};
         if (PREDICT_FALSE(FLAGS_TEST_local_catalog_drop_pushed_batch)) {
-          push_status = STATUS(Aborted, "TEST_local_catalog_drop_pushed_batch is set");
-        } else if (!batch.ParseFromString(req.local_catalog_changes())) {
-          push_status = STATUS(Corruption, "Could not parse the pushed system catalog batch");
+          outcome = STATUS(Aborted, "TEST_local_catalog_drop_pushed_batch is set");
+        } else if (!pages->ParseFromString(req.local_catalog_changes())) {
+          outcome = STATUS(Corruption, "Could not parse the pushed system catalog pages");
         } else {
-          push_status = local_catalog->ApplyPushedBatch(batch, deadline);
+          outcome = local_catalog->ApplyPushedPages(
+              std::move(pages), deadline, /* wait= */ local_catalog->IsServing());
         }
-        if (push_status.ok()) {
+        if (outcome.ok() && !outcome->gap) {
           local_catalog->IncPushesApplied();
-          VLOG(1) << "Applied the system catalog change records carried by the release of txn "
-                  << txn;
+          VLOG(1) << "Applied the system catalog pages carried by the release of txn " << txn
+                  << "; the copy is at " << outcome->applied;
         } else {
           local_catalog->IncPushesRefused();
-          local_catalog->RequestImmediatePoll();
-          VLOG(1) << "Could not use the system catalog change records carried by the release of "
-                  << "txn " << txn << ", falling back to the poller: " << push_status;
+          VLOG(1) << "Could not use the system catalog pages carried by the release of txn "
+                  << txn << ", waiting for master to push: "
+                  << (outcome.ok() ? Format("gap at $0", outcome->applied)
+                                   : outcome.status().ToString());
         }
       }
 

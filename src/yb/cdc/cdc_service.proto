@@ -79,50 +79,27 @@ service CDCService {
       returns (UpdatePublicationTableListResponsePB);
 }
 
-// Request for the tserver-local copy of the master system catalog tablet. The copy pulls the
-// master system catalog tablet's WAL through this method; master keeps one apply-safe-time state
-// per requesting tserver, so that a safe time is reported to a tserver only once every record up
-// to it has been included in a response to that same tserver.
-message GetSysCatalogChangesRequestPB {
-  // Permanent uuid of the requesting tserver. Master keys its per-requestor stream state on it.
+// A tserver whose local catalog copy must be complete up to a hybrid time asks master to push to
+// it. Master records the copy's position and the floor and runs a push cycle whose safe time is at
+// or above the floor; requests that arrive close together share one cycle.
+message RequestSysCatalogPushRequestPB {
   optional bytes requestor_uuid = 1;
-
-  // The WAL position the requesting copy has already applied. The response starts after it. When
-  // unset, master starts from the beginning of the retained WAL.
-  optional CDCCheckpointPB from_checkpoint = 2;
+  // The copy's applied position, so that master needs no heartbeat to know where to push from.
+  optional OpIdPB applied_op_id = 2;
+  // Hybrid time the copy must be complete up to. Unset when the tserver only reports its position.
+  optional fixed64 floor = 3;
 }
 
-message GetSysCatalogChangesResponsePB {
+message RequestSysCatalogPushResponsePB {
   optional CDCErrorPB error = 1;
-
-  // The WAL records, the WAL position they end at, and the safe time, as produced by the same
-  // code path xCluster uses. Empty when the request failed.
-  optional GetChangesResponsePB changes = 2;
-
-  // Set when master stopped reading the WAL before its end, so the requestor should poll again
-  // without waiting out its idle interval.
-  optional bool have_more_messages = 3;
-
-  // The position the records were sliced from, set only when master carries this batch on a lock
-  // release rather than answering a poll. Everything above it and up to the batch's checkpoint is
-  // present, which is what lets the receiver decide whether the batch continues what it holds:
-  // not every WAL operation produces a record, so the first record's position says nothing about
-  // whether anything is missing.
-  optional OpIdPB slice_from = 4;
-
-  // Set when the batch would have crossed a restore of master's system catalog. A restore rewrites
-  // catalog rows directly into master's RocksDB while it applies the restore operation, so those
-  // rows never appear as WAL records and no batch can carry them. The requestor must discard its
-  // copy and fetch master's tablet again. No records accompany this.
-  optional bool reseed_required = 5;
 }
 
 // Ships the master system catalog tablet's WAL to the tserver-local copies of it. Separate from
 // CDCService because the copies are not CDC streams: they are not recorded in the master catalog
 // or in the cdc_state table, and each copy persists its own WAL position with its local tablet.
 service SysCatalogChangeService {
-  rpc GetSysCatalogChanges (GetSysCatalogChangesRequestPB)
-      returns (GetSysCatalogChangesResponsePB);
+  rpc RequestSysCatalogPush (RequestSysCatalogPushRequestPB)
+      returns (RequestSysCatalogPushResponsePB);
 }
 
 message CDCErrorPB {

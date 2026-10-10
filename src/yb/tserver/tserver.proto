@@ -510,13 +510,63 @@ message DBCatalogInvalMessagesDataPB {
 
 // Persisted next to the tserver-local copy of the master system catalog tablet. It records the
 // position in the master system catalog tablet's WAL up to which the copy has applied records, so
-// that a tserver restart resumes the poll from there instead of re-seeding.
+// that after a tserver restart master pushes from there instead of the copy being re-seeded.
 //
 // Re-applying a suffix of the WAL is harmless -- a record writes the same key at the same hybrid
 // time, and an apply record for a transaction whose intents are already gone is a no-op -- so this
 // is flushed on a bounded cadence rather than after every response.
 message LocalCatalogCheckpointPB {
   optional OpIdPB checkpoint = 1;
+}
+
+// One page of change records for the tserver-local copy of the master system catalog tablet:
+// every operation of master's system catalog WAL in (page_from.index, page_end.index], converted
+// to change records. Operations that produce no record (a transaction status record that is not an
+// apply, an election's no-op) are covered all the same, so a receiver whose applied position is at
+// or above page_from and below page_end holds everything up to page_end after applying the page.
+message LocalCatalogPagePB {
+  optional OpIdPB page_from = 1;
+  optional OpIdPB page_end = 2;
+
+  // The page's records as a serialized cdc.GetChangesResponsePB holding only its repeated records
+  // field, each record stamped with the position of the operation it came from. Carried as bytes
+  // because tserver.proto cannot import cdc_service.proto, which already imports this file, and
+  // because master serializes a page once and sends the same bytes to every receiver.
+  optional bytes records = 3;
+
+  // Set only on a page that ends at a position master certified: every catalog transaction that
+  // committed at or below this hybrid time has its apply record at or before page_end. A receiver
+  // whose applied position is at or above page_end may publish it as its safe time C.
+  optional fixed64 safe_time = 4;
+
+  // The page ends at a restore of master's system catalog. A restore rewrites catalog rows
+  // directly into master's RocksDB, so no record carries them; the receiver must discard its copy
+  // and fetch master's tablet again. No records accompany this.
+  optional bool reseed_required = 5;
+}
+
+// Pages master pushes to one tserver's local catalog copy, in WAL order. Also the content of
+// ReleaseObjectLockRequestPB.local_catalog_changes.
+message PushSysCatalogChangesRequestPB {
+  // Permanent uuid of the receiving tserver. A tserver refuses pages meant for another.
+  optional bytes target_uuid = 1;
+  repeated LocalCatalogPagePB pages = 2;
+  // Term of master's system catalog tablet when the pages were built. A receiver refuses pages
+  // from a term below the highest it has applied pages from: a deposed leader may hold WAL entries
+  // that the new leader replaced.
+  optional int64 master_term = 3;
+}
+
+message PushSysCatalogChangesResponsePB {
+  optional TabletServerErrorPB error = 1;
+  // The copy's applied position after the pages, or, with gap set, the position at which a gap
+  // was found.
+  optional OpIdPB applied_op_id = 2;
+  // The copy's safe time C after the pages.
+  optional fixed64 safe_time = 3;
+  // A page started above the applied position, so records between them would be missing. Master
+  // re-sends from applied_op_id.
+  optional bool gap = 4;
 }
 
 message ReleaseObjectLockRequestPB {
@@ -569,15 +619,14 @@ message ReleaseObjectLockRequestPB {
   // possibly outstanding acquire.
   optional fixed64 catalog_versions_read_time = 15;
 
-  // Change records for the receiving tserver's local copy of the master system catalog tablet, as
-  // a serialized cdc.GetSysCatalogChangesResponsePB: the records above that tserver's own applied
-  // position, the position they end at, and the safe time master certified for it. Applying them
-  // is what lets the receiving tserver pass the catalog_versions_read_time gate above without
-  // waiting for its own poll. Carried as bytes because tserver.proto cannot import
-  // cdc_service.proto, which already imports this file.
+  // Pages for the receiving tserver's local copy of the master system catalog tablet, as a
+  // serialized PushSysCatalogChangesRequestPB: the pages from that tserver's applied position up
+  // to a position master certified after the DDL committed. Applying them is what lets the
+  // receiving tserver pass the catalog_versions_read_time gate above without waiting for a
+  // separate push.
   //
-  // Never persisted and never required: a tserver that receives none, or one it cannot use, waits
-  // for its poller exactly as it did before.
+  // Never persisted and never required: a tserver that receives none, or pages it cannot use,
+  // waits at the gate for master's separate pushes.
   optional bytes local_catalog_changes = 16;
   // If any new field is added here. Do not forget to update
   // ReleaseRequestToPersist accordingly.
@@ -586,6 +635,10 @@ message ReleaseObjectLockRequestPB {
 message ReleaseObjectLockResponsePB {
   optional TabletServerErrorPB error = 1;
   optional fixed64 propagated_hybrid_time = 2;
+  // The receiver's local catalog copy's applied position and safe time after the release, so that
+  // master knows which pages that copy still needs without waiting for a heartbeat.
+  optional OpIdPB local_catalog_applied_op_id = 3;
+  optional fixed64 local_catalog_safe_time = 4;
 }
 
 message WaitForLockersMultipleRequestPB {

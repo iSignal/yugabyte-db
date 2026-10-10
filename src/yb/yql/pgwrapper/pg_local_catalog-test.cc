@@ -14,10 +14,18 @@
 
 #include "yb/gutil/walltime.h"
 
+#include "yb/consensus/consensus.pb.h"
+#include "yb/consensus/consensus.proxy.h"
+
 #include "yb/integration-tests/external_mini_cluster.h"
+
+#include "yb/master/sys_catalog_constants.h"
+
+#include "yb/rpc/rpc_controller.h"
 
 #include "yb/tserver/local_catalog_replica.h"
 #include "yb/tserver/tserver_service.pb.h"
+#include "yb/tserver/tserver_service.proxy.h"
 
 #include "yb/util/backoff_waiter.h"
 #include "yb/util/metrics.h"
@@ -34,17 +42,23 @@ METRIC_DECLARE_counter(local_catalog_reads_waited_for_version);
 METRIC_DECLARE_counter(local_catalog_reads_waited_for_own_writes);
 METRIC_DECLARE_counter(local_catalog_reads_to_master_in_ddl);
 METRIC_DECLARE_counter(local_catalog_reads_to_master_not_serving);
-METRIC_DECLARE_counter(local_catalog_poll_failures);
 METRIC_DECLARE_counter(local_catalog_apply_failures);
 METRIC_DECLARE_counter(local_catalog_reseeds);
 METRIC_DECLARE_counter(local_catalog_pushes_received);
 METRIC_DECLARE_counter(local_catalog_pushes_applied);
 METRIC_DECLARE_counter(local_catalog_pushes_refused);
-METRIC_DECLARE_counter(local_catalog_release_pushes_sent);
-METRIC_DECLARE_counter(local_catalog_release_pushes_skipped);
+METRIC_DECLARE_counter(local_catalog_floor_requests_sent);
+METRIC_DECLARE_counter(local_catalog_push_cycles);
+METRIC_DECLARE_counter(local_catalog_push_release_requests);
+METRIC_DECLARE_counter(local_catalog_push_rpcs_sent);
+METRIC_DECLARE_counter(local_catalog_push_transient_pages_built);
+METRIC_DECLARE_counter(local_catalog_floor_requests_received);
+METRIC_DECLARE_counter(local_catalog_release_inline_pages);
+METRIC_DECLARE_counter(local_catalog_release_inline_skipped);
+METRIC_DECLARE_gauge_uint64(local_catalog_push_in_flight_rpcs_max);
+METRIC_DECLARE_gauge_uint64(local_catalog_push_in_flight_bytes_max);
 METRIC_DECLARE_gauge_uint32(local_catalog_serving_state);
 METRIC_DECLARE_gauge_uint64(local_catalog_safe_time_micros);
-METRIC_DECLARE_event_stats(local_catalog_poll_latency_us);
 METRIC_DECLARE_event_stats(local_catalog_apply_latency_us);
 METRIC_DECLARE_event_stats(local_catalog_gate_wait_us);
 METRIC_DECLARE_histogram(handler_latency_yb_tserver_TabletServerService_Read);
@@ -59,6 +73,7 @@ namespace {
 // LocalCatalogServingState::kServing. The gauge carries the enum's numeric value; a test in
 // another process cannot see the enum itself.
 constexpr uint32_t kServingStateServing = 1;
+constexpr uint32_t kServingStateDisabledLease = 2;
 
 constexpr auto kServingTimeout = 180s;
 
@@ -85,12 +100,13 @@ class PgLocalCatalogTest : public LibPqTestBase {
       // assertion below racy.
       flags->push_back("--ysql_enable_auto_analyze=false");
       // Level 1 across the feature's modules, so a failure can be read out of the daemon logs.
-      // The poller's level 3 is deliberately not on here: it logs one line per applied row, which
+      // The applier's level 3 is deliberately not on here: it logs one line per applied row, which
       // ran to 170k lines and 540k in the suite log, and slowed the timing-sensitive tests enough
       // to make the lease-loss test flake. Use it on a single test or a live cluster instead.
       flags->push_back(
-          "--vmodule=local_catalog_poller=1,local_catalog_replica=1,local_catalog_read=1,"
-          "pg_client_session=1,ts_local_lock_manager=1,heartbeater=1,object_lock_info_manager=1");
+          "--vmodule=local_catalog_applier=1,local_catalog_replica=1,local_catalog_read=1,"
+          "pg_client_session=1,ts_local_lock_manager=1,heartbeater=1,object_lock_info_manager=1,"
+          "sys_catalog_pusher=2,ysql_lease_manager=1");
     }
   }
 
@@ -132,7 +148,7 @@ class PgLocalCatalogTest : public LibPqTestBase {
         &METRIC_handler_latency_yb_tserver_TabletServerService_Read, "total_count");
   }
 
-  // How many times master has answered IsInitDbDone. The poller asks only when it has no copy on
+  // How many times master has answered IsInitDbDone. The applier asks only when it has no copy on
   // disk, so this count staying still across a restart is what proves a reused copy needs nothing
   // from master.
   Result<int64_t> MasterInitDbDoneCount() {
@@ -166,15 +182,41 @@ class PgLocalCatalogTest : public LibPqTestBase {
 
   // Waits until the copy on tserver idx holds a state at or above the given wall clock reading.
   // The gauge carries C's physical microseconds, and on a single-host cluster the tserver clocks
-  // and this process read the same wall clock, so the two are comparable.
+  // and this process read the same wall clock, so the two are comparable. Master moves C only
+  // when it pushes, so the wait reads the catalog at an explicit time past micros on that
+  // tserver, which asks master for a push up to it.
   Status WaitForSafeTimePast(size_t idx, int64_t micros, const std::string& what) {
     return LoggedWaitFor(
         [this, idx, micros]() -> Result<bool> {
           auto value = Counter(idx, METRIC_local_catalog_safe_time_micros);
-          return value.ok() && *value > micros;
+          if (value.ok() && *value > micros) {
+            return true;
+          }
+          if (GetCurrentTimeMicros() > micros + 1) {
+            auto conn = VERIFY_RESULT(ConnectTo(idx));
+            RETURN_NOT_OK(conn.ExecuteFormat("SET yb_read_time = $0", micros + 1));
+            WARN_NOT_OK(
+                ResultToStatus(conn.FetchRow<int64_t>("SELECT count(*) FROM pg_catalog.pg_am")),
+                "Catalog read at an explicit time failed");
+          }
+          return false;
         },
         kServingTimeout,
         Format("Local catalog copy on tserver $0 to hold state past $1 ($2)", idx, micros, what));
+  }
+
+  // The leader master's counters: it is the one that pushes, and a step-down moves them to
+  // another process.
+  Result<int64_t> MasterCounter(const MetricPrototype& proto) {
+    return cluster_->GetLeaderMaster()->GetMetric<int64_t>(
+        &METRIC_ENTITY_server, /* entity_id= */ nullptr, &proto, "value");
+  }
+
+  Status SetOnAllTServers(const std::string& flag, const std::string& value) {
+    for (int i = 0; i < GetNumTabletServers(); ++i) {
+      RETURN_NOT_OK(cluster_->SetFlag(&TServer(i), flag, value));
+    }
+    return Status::OK();
   }
 
   Result<int64_t> CatalogVersion(PGConn* conn) {
@@ -192,13 +234,12 @@ class PgLocalCatalogTest : public LibPqTestBase {
   }
 };
 
-// Phase 7 test 12: the copy exists and serves on every tserver of a fresh cluster, and the poll
-// and apply histograms show a response was actually fetched and applied rather than the state
+// Phase 7 test 12: the copy exists and serves on every tserver of a fresh cluster, and the apply
+// histogram shows a page was actually pushed and applied rather than the state
 // having been assumed.
 TEST_F(PgLocalCatalogTest, BootstrapReachesServing) {
   ASSERT_OK(WaitForAllServing());
   for (int i = 0; i < GetNumTabletServers(); ++i) {
-    ASSERT_GT(ASSERT_RESULT(EventStatsCount(i, METRIC_local_catalog_poll_latency_us)), 0);
     ASSERT_GT(ASSERT_RESULT(EventStatsCount(i, METRIC_local_catalog_apply_latency_us)), 0);
     ASSERT_GT(ASSERT_RESULT(Counter(i, METRIC_local_catalog_safe_time_micros)), 0);
     ASSERT_EQ(ASSERT_RESULT(Counter(i, METRIC_local_catalog_reseeds)), 0);
@@ -403,10 +444,10 @@ TEST_F(PgLocalCatalogTest, OwnTserverDdlServedLocally) {
 // below the time master read that version at, and a backend already at that version would read a
 // copy that lacks its rows.
 //
-// Pausing the poller alone cannot set this up: the release gate would then hold the DDL's commit,
-// which is what GateHoldsDdlWhilePollerIsPaused demonstrates. Serving is disabled as well, which
-// makes the gate publish the version immediately, and only then re-enabled with the poller still
-// frozen.
+// Pausing the applier alone cannot set this up: the release gate would then hold the DDL's commit,
+// which is what GateHoldsDdlWhileApplierIsPaused demonstrates. Serving is disabled as well, which
+// makes the gate publish the version immediately, and only then re-enabled with the applier still
+// paused.
 TEST_F(PgLocalCatalogTest, ReadWaitsForAVersionPublishedWhileNotServing) {
   ASSERT_OK(WaitForAllServing());
   {
@@ -415,7 +456,7 @@ TEST_F(PgLocalCatalogTest, ReadWaitsForAVersionPublishedWhileNotServing) {
   }
 
   ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_disable_serving", "true"));
-  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_pause_poller", "true"));
+  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_pause_applier", "true"));
 
   // The gate on tserver 0 publishes without waiting because its copy is not serving, so this
   // commits even though that copy is frozen and behind.
@@ -451,7 +492,7 @@ TEST_F(PgLocalCatalogTest, ReadWaitsForAVersionPublishedWhileNotServing) {
       120s, "A catalog read to wait for a version the copy has not applied"));
   ASSERT_FALSE(read_returned.load()) << "Read answered from a copy that lacks the version";
 
-  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_pause_poller", "false"));
+  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_pause_applier", "false"));
   threads.JoinAll();
   ASSERT_OK(read_status);
   ASSERT_EQ(value, "v");
@@ -757,47 +798,46 @@ TEST_F(PgLocalCatalogTest, TypeAndMissingValueAcrossTservers) {
   ASSERT_EQ(note.size(), 400);
 }
 
-// Phase 7 test 15: a failing change request is counted and leaves C where it was; the copy keeps
-// serving reads at that C.
-TEST_F(PgLocalCatalogTest, PollFailuresDoNotMoveSafeTime) {
+// Phase 7 test 15: pushes that fail to apply are counted and leave C where it was; the copy keeps
+// serving reads at that C, and master's retries move it once the failures stop. A catalog read at
+// an explicit time above C is what asks master to push; with the copy failing, that read gives up
+// after local_catalog_serve_wait_timeout_ms and reads master.
+TEST_F(PgLocalCatalogTest, PushFailuresDoNotMoveSafeTime) {
   ASSERT_OK(WaitForAllServing());
-  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_fail_poll", "true"));
+  ASSERT_OK(cluster_->SetFlag(&TServer(0), "local_catalog_serve_wait_timeout_ms", "2000"));
+  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_fail_push", "true"));
+  const auto failures_before = ASSERT_RESULT(Counter(0, METRIC_local_catalog_apply_failures));
+  const auto safe_time_frozen = ASSERT_RESULT(Counter(0, METRIC_local_catalog_safe_time_micros));
 
-  // C is read only after a poll has already failed. Reading it before setting the flag would race
-  // with the poll in flight at that moment, which is free to advance C.
-  const auto failures_before = ASSERT_RESULT(Counter(0, METRIC_local_catalog_poll_failures));
-  const auto wait_for_failures = [this](int64_t more_than) -> Status {
-    return LoggedWaitFor(
-        [this, more_than]() -> Result<bool> {
-          auto now = Counter(0, METRIC_local_catalog_poll_failures);
-          return now.ok() && *now > more_than;
-        },
-        60s, Format("More than $0 poll failures to be counted", more_than));
+  const auto read_above_c = [this]() -> Status {
+    auto conn = VERIFY_RESULT(ConnectTo(0));
+    RETURN_NOT_OK(conn.ExecuteFormat("SET yb_read_time = $0", GetCurrentTimeMicros()));
+    return ResultToStatus(conn.FetchRow<int64_t>("SELECT count(*) FROM pg_catalog.pg_am"));
   };
-  ASSERT_OK(wait_for_failures(failures_before));
-  const auto safe_time_frozen =
-      ASSERT_RESULT(Counter(0, METRIC_local_catalog_safe_time_micros));
-
-  // Several more failures, so that the equality below covers a span of time rather than an
-  // instant.
-  ASSERT_OK(wait_for_failures(failures_before + 3));
+  ASSERT_OK(read_above_c());
+  ASSERT_OK(LoggedWaitFor(
+      [this, failures_before]() -> Result<bool> {
+        return VERIFY_RESULT(Counter(0, METRIC_local_catalog_apply_failures)) >
+               failures_before + 1;
+      },
+      60s, "Failed pushes to be counted"));
   ASSERT_EQ(ASSERT_RESULT(Counter(0, METRIC_local_catalog_safe_time_micros)), safe_time_frozen);
   ASSERT_EQ(
       ASSERT_RESULT(Counter(0, METRIC_local_catalog_serving_state)), kServingStateServing);
 
-  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_fail_poll", "false"));
+  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_fail_push", "false"));
   ASSERT_OK(LoggedWaitFor(
       [this, safe_time_frozen]() -> Result<bool> {
         auto now = Counter(0, METRIC_local_catalog_safe_time_micros);
         return now.ok() && *now > safe_time_frozen;
       },
-      60s, "C to advance again after polls succeed"));
+      60s, "C to advance again after pushes succeed"));
 }
 
-// Phase 4's gate and phase 7 test 16: while the poller cannot advance C, a DDL's commit cannot
+// Phase 4's gate and phase 7 test 16: while the applier cannot advance C, a DDL's commit cannot
 // return, because the lock release it waits on cannot publish the new catalog versions until the
 // copy holds them.
-TEST_F(PgLocalCatalogTest, GateHoldsDdlWhilePollerIsPaused) {
+TEST_F(PgLocalCatalogTest, GateHoldsDdlWhileApplierIsPaused) {
   ASSERT_OK(WaitForAllServing());
   {
     auto conn = ASSERT_RESULT(ConnectTo(0));
@@ -806,9 +846,7 @@ TEST_F(PgLocalCatalogTest, GateHoldsDdlWhilePollerIsPaused) {
   const auto gate_waits_before =
       ASSERT_RESULT(EventStatsCount(0, METRIC_local_catalog_gate_wait_us));
 
-  for (int i = 0; i < GetNumTabletServers(); ++i) {
-    ASSERT_OK(cluster_->SetFlag(&TServer(i), "TEST_local_catalog_pause_poller", "true"));
-  }
+  ASSERT_OK(SetOnAllTServers("TEST_local_catalog_pause_applier", "true"));
 
   TestThreadHolder threads;
   std::atomic<bool> ddl_returned{false};
@@ -819,22 +857,20 @@ TEST_F(PgLocalCatalogTest, GateHoldsDdlWhilePollerIsPaused) {
     ddl_returned = true;
   });
 
-  // The DDL must still be in flight. Two seconds is far longer than the 100 ms poll interval it
-  // would otherwise take.
+  // The DDL must still be in flight. Two seconds is far longer than the push it would otherwise
+  // take.
   SleepFor(2s * kTimeMultiplier);
   ASSERT_FALSE(ddl_returned.load()) << "DDL returned while every local catalog copy was frozen";
 
-  for (int i = 0; i < GetNumTabletServers(); ++i) {
-    ASSERT_OK(cluster_->SetFlag(&TServer(i), "TEST_local_catalog_pause_poller", "false"));
-  }
+  ASSERT_OK(SetOnAllTServers("TEST_local_catalog_pause_applier", "false"));
   threads.JoinAll();
   ASSERT_OK(ddl_status);
   ASSERT_GT(
       ASSERT_RESULT(EventStatsCount(0, METRIC_local_catalog_gate_wait_us)), gate_waits_before);
 }
 
-// Phase 7 test 13: a restarted tserver reopens the copy it already has and resumes the poll from
-// the position it persisted, without fetching a new copy.
+// Phase 7 test 13: a restarted tserver reopens the copy it already has and resumes from the
+// position it persisted, without fetching a new copy.
 TEST_F(PgLocalCatalogTest, RestartResumesWithoutReseed) {
   ASSERT_OK(WaitForAllServing());
   {
@@ -886,10 +922,10 @@ TEST_F(PgLocalCatalogTest, ServingDisabledRoutesToMaster) {
 }
 
 // Phase 7 test 14: master no longer retains the WAL the copy needs, so the copy cannot catch up
-// incrementally and only a fresh copy of master's tablet makes it current again. The error the
-// poll gets is injected rather than produced by shrinking master's retention, because doing that
-// far enough to lose a stopped poller's position also disturbs every other tablet in the cluster;
-// the injected error is the same CHECKPOINT_TOO_OLD the poll would see, on the same branch.
+// incrementally and only a fresh copy of master's tablet makes it current again. The answer is
+// injected rather than produced by shrinking master's retention, because doing that far enough to
+// lose a stopped copy's position also disturbs every other tablet in the cluster; the injected
+// answer takes the same re-seed branch a reseed_required page takes.
 TEST_F(PgLocalCatalogTest, CheckpointTooOldReseeds) {
   ASSERT_OK(WaitForAllServing());
   {
@@ -899,14 +935,20 @@ TEST_F(PgLocalCatalogTest, CheckpointTooOldReseeds) {
   }
   ASSERT_EQ(ASSERT_RESULT(Counter(0, METRIC_local_catalog_reseeds)), 0);
 
-  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_poll_checkpoint_too_old", "true"));
+  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_push_reseed", "true"));
+  // The next pages master sends tserver 0 are treated as a re-seed answer; a DDL elsewhere sends
+  // some.
+  {
+    auto conn = ASSERT_RESULT(ConnectTo(1));
+    ASSERT_OK(conn.Execute("CREATE TABLE triggers_a_push (k INT PRIMARY KEY)"));
+  }
   ASSERT_OK(LoggedWaitFor(
       [this]() -> Result<bool> {
         auto reseeds = Counter(0, METRIC_local_catalog_reseeds);
         return reseeds.ok() && *reseeds > 0;
       },
       120s, "The copy to be re-seeded after CHECKPOINT_TOO_OLD"));
-  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_poll_checkpoint_too_old", "false"));
+  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_push_reseed", "false"));
 
   ASSERT_OK(WaitForServing(0));
   auto conn = ASSERT_RESULT(ConnectTo(0));
@@ -926,7 +968,7 @@ TEST_F(PgLocalCatalogTest, CheckpointTooOldReseeds) {
 
 // A DDL transaction that is open while a copy is re-seeded has written catalog rows that the copy
 // receives through the remote bootstrap, as intents in its own tablet, and not as records from the
-// poller. Only the transaction's later writes and its APPLY record arrive through the poller. The
+// applier. Only the transaction's later writes and its APPLY record arrive in pushed pages. The
 // DDL's rows must still be readable on that tserver once the DDL has committed. Disabled: the
 // copy does not apply those intents yet (notes/todos.md T3(b)).
 TEST_F(PgLocalCatalogTest, DISABLED_DdlOpenAcrossReseedIsVisibleAfterCommit) {
@@ -936,14 +978,14 @@ TEST_F(PgLocalCatalogTest, DISABLED_DdlOpenAcrossReseedIsVisibleAfterCommit) {
   ASSERT_OK(ddl_conn.Execute("CREATE TABLE open_across_reseed (k INT PRIMARY KEY, v TEXT)"));
 
   const auto reseeds_before = ASSERT_RESULT(Counter(0, METRIC_local_catalog_reseeds));
-  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_poll_checkpoint_too_old", "true"));
+  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_push_reseed", "true"));
   ASSERT_OK(LoggedWaitFor(
       [this, reseeds_before]() -> Result<bool> {
         auto reseeds = Counter(0, METRIC_local_catalog_reseeds);
         return reseeds.ok() && *reseeds > reseeds_before;
       },
       120s, "The copy to be re-seeded after CHECKPOINT_TOO_OLD"));
-  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_poll_checkpoint_too_old", "false"));
+  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_push_reseed", "false"));
   ASSERT_OK(WaitForServing(0));
 
   ASSERT_OK(ddl_conn.Execute("INSERT INTO open_across_reseed VALUES (1, 'one')"));
@@ -992,7 +1034,7 @@ TEST_F(PgLocalCatalogTest, NonDdlSysTableSessionReadsMaster) {
 // DDL wait for every open DDL block anywhere in the cluster.
 class PgLocalCatalogOpenBlockTest : public PgLocalCatalogTest {
  protected:
-  // A ceiling far above a few poll intervals and far below the idle period the open block would
+  // A ceiling far above a few push round trips and far below the idle period the open block would
   // impose if it did serialize the second DDL.
   static constexpr auto kSecondDdlCeiling = 30s;
 
@@ -1120,7 +1162,7 @@ TEST_F(PgLocalCatalogTest, ConcurrentDdlsFromTwoTserversConverge) {
   }
   ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_disable_serving", "false"));
 
-  // Every copy converges on it. The wait is for the pollers, which advance A[db] a poll at a time.
+  // Every copy converges on it.
   for (int i = 0; i < GetNumTabletServers(); ++i) {
     auto conn = ASSERT_RESULT(ConnectTo(i));
     ASSERT_OK(LoggedWaitFor(
@@ -1169,10 +1211,25 @@ TEST_F(PgLocalCatalogTest, ExplicitReadTimeRouting) {
     return result.ok();
   };
 
-  // Above C: master answers. The poller is paused first, because C otherwise catches up to any
-  // wall clock reading within a poll interval; a read time above C is by definition one the copy
-  // has not reached yet.
-  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_pause_poller", "true"));
+  // Above C: the copy asks master for a push up to the read time and serves once it holds it.
+  {
+    const auto floors_before = ASSERT_RESULT(Counter(0, METRIC_local_catalog_floor_requests_sent));
+    const auto served_before = ASSERT_RESULT(Counter(0, METRIC_local_catalog_reads_served));
+    const auto to_master_before =
+        ASSERT_RESULT(Counter(0, METRIC_local_catalog_reads_to_master_not_serving));
+    ASSERT_TRUE(ASSERT_RESULT(read_at(GetCurrentTimeMicros())));
+    ASSERT_GT(ASSERT_RESULT(Counter(0, METRIC_local_catalog_floor_requests_sent)), floors_before);
+    ASSERT_GT(ASSERT_RESULT(Counter(0, METRIC_local_catalog_reads_served)), served_before)
+        << "A read time above C was not served after the push. " << RoutingCounters(0);
+    ASSERT_EQ(
+        ASSERT_RESULT(Counter(0, METRIC_local_catalog_reads_to_master_not_serving)),
+        to_master_before)
+        << RoutingCounters(0);
+  }
+
+  // Above C with the copy unable to apply: master answers once the wait runs out.
+  ASSERT_OK(cluster_->SetFlag(&TServer(0), "local_catalog_serve_wait_timeout_ms", "1000"));
+  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_pause_applier", "true"));
   {
     const auto to_master_before =
         ASSERT_RESULT(Counter(0, METRIC_local_catalog_reads_to_master_not_serving));
@@ -1182,7 +1239,27 @@ TEST_F(PgLocalCatalogTest, ExplicitReadTimeRouting) {
         to_master_before)
         << "A read time above C was not routed to master. " << RoutingCounters(0);
   }
-  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_pause_poller", "false"));
+  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_pause_applier", "false"));
+}
+
+// A tserver shut down while a push RPC waits for its paused apply thread completes the push and
+// stops cleanly, without destroying the applier under the waiting RPC thread.
+TEST_F(PgLocalCatalogTest, ShutdownWhilePushWaits) {
+  ASSERT_OK(WaitForAllServing());
+  // Not serving, so the lock release of the DDL below does not wait for the paused copy.
+  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_disable_serving", "true"));
+  ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_pause_applier", "true"));
+  const auto received = ASSERT_RESULT(Counter(0, METRIC_local_catalog_pushes_received));
+  auto conn = ASSERT_RESULT(ConnectTo(1));
+  ASSERT_OK(conn.Execute("CREATE TABLE shutdown_push (a INT)"));
+  ASSERT_OK(LoggedWaitFor(
+      [&]() -> Result<bool> {
+        return VERIFY_RESULT(Counter(0, METRIC_local_catalog_pushes_received)) > received;
+      },
+      30s, "A push to reach the paused tserver"));
+  const auto start = CoarseMonoClock::Now();
+  TServer(0).Shutdown(SafeShutdown::kTrue, RequireExitCode0::kTrue);
+  ASSERT_LT(CoarseMonoClock::Now() - start, 10s);
 }
 
 // The copy retains system catalog history for
@@ -1429,253 +1506,219 @@ TEST_F(PgLocalCatalogSlowRetryTest, RestartReusesTheCopyWithoutAskingMaster) {
       << RoutingCounters(0);
 }
 
-// Phase 8: master carries the DDL's own change records in the lock release, so that each tserver's
-// copy reaches the release's catalog version read time without a poll of its own. The pollers are
-// paused in these tests, which is what makes the push the only way the copies can advance.
+
+// Plan section 9.3: lock releases carry pages, master pushes the rest, nobody pulls.
 class PgLocalCatalogPushTest : public PgLocalCatalogTest {
  protected:
-  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
-    PgLocalCatalogTest::UpdateMiniClusterOptions(options);
-    options->extra_master_flags.push_back("--enable_local_catalog_release_push=true");
+  // Master learns each copy's position from the first release's answers; until then it would
+  // carry its whole look-back to every target.
+  Status WarmUp() {
+    RETURN_NOT_OK(WaitForAllServing());
+    auto conn = VERIFY_RESULT(ConnectTo(0));
+    RETURN_NOT_OK(conn.Execute("CREATE TABLE IF NOT EXISTS push_warmup (k INT PRIMARY KEY)"));
+    return conn.Execute("DROP TABLE push_warmup");
   }
 
-  // The leader master is the one that fans releases out, and a step-down moves these counters to
-  // another process.
-  Result<int64_t> MasterCounter(const MetricPrototype& proto) {
-    return cluster_->GetLeaderMaster()->GetMetric<int64_t>(
-        &METRIC_ENTITY_server, /* entity_id= */ nullptr, &proto, "value");
-  }
-
-  // Master decides what to carry from the applied position each tserver reported by heartbeat, so
-  // the reports have to exist before a DDL can be pushed.
-  Status WaitForAppliedPositionReports() {
-    return LoggedWaitFor(
-        [this]() -> Result<bool> {
-          auto conn = VERIFY_RESULT(ConnectTo(0));
-          RETURN_NOT_OK(conn.Execute("CREATE TABLE IF NOT EXISTS push_warmup (k INT PRIMARY KEY)"));
-          auto sent = MasterCounter(METRIC_local_catalog_release_pushes_sent);
-          return sent.ok() && *sent > 0;
-        },
-        60s, "Master to carry change records on a release");
-  }
-
-  Status PauseAllPollers(bool paused) {
-    for (int i = 0; i < GetNumTabletServers(); ++i) {
-      RETURN_NOT_OK(cluster_->SetFlag(
-          &TServer(i), "TEST_local_catalog_pause_poller", paused ? "true" : "false"));
-    }
+  Status ReadOn(size_t idx, const std::string& table, const std::string& expected) {
+    auto conn = VERIFY_RESULT(ConnectTo(idx));
+    auto value = VERIFY_RESULT(conn.FetchRow<std::string>(
+        Format("SELECT v FROM $0 WHERE k = 1", table)));
+    SCHECK_EQ(value, expected, IllegalState, Format("Wrong row in $0 on tserver $1", table, idx));
     return Status::OK();
   }
 };
 
-TEST_F(PgLocalCatalogPushTest, ReleaseCarriesTheDdlsOwnRecords) {
-  ASSERT_OK(WaitForAllServing());
-  ASSERT_OK(WaitForAppliedPositionReports());
-
-  // With every poller paused, a copy can only advance through what the release carries.
-  ASSERT_OK(PauseAllPollers(true));
+TEST_F(PgLocalCatalogPushTest, ReleaseCarriesOnePageInline) {
+  ASSERT_OK(WarmUp());
+  const auto inline_before =
+      ASSERT_RESULT(MasterCounter(METRIC_local_catalog_release_inline_pages));
+  const auto rpcs_before = ASSERT_RESULT(MasterCounter(METRIC_local_catalog_push_rpcs_sent));
   std::vector<int64_t> applied_before(GetNumTabletServers());
+  std::vector<int64_t> floors_before(GetNumTabletServers());
   for (int i = 0; i < GetNumTabletServers(); ++i) {
     applied_before[i] = ASSERT_RESULT(Counter(i, METRIC_local_catalog_pushes_applied));
+    floors_before[i] = ASSERT_RESULT(Counter(i, METRIC_local_catalog_floor_requests_sent));
   }
-
-  const auto ddl_start = MonoTime::Now();
   {
     auto conn = ASSERT_RESULT(ConnectTo(0));
-    ASSERT_OK(conn.Execute("CREATE TABLE pushed (k INT PRIMARY KEY, v TEXT)"));
-    ASSERT_OK(conn.Execute("INSERT INTO pushed VALUES (1, 'p')"));
+    ASSERT_OK(conn.Execute("CREATE TABLE inline_page (k INT PRIMARY KEY, v TEXT)"));
+    ASSERT_OK(conn.Execute("INSERT INTO inline_page VALUES (1, 'i')"));
   }
-  const auto ddl_elapsed = MonoTime::Now() - ddl_start;
-  LOG(INFO) << "DDL with pollers paused took " << ddl_elapsed;
-
-  for (int i = 0; i < GetNumTabletServers(); ++i) {
+  ASSERT_GE(
+      ASSERT_RESULT(MasterCounter(METRIC_local_catalog_release_inline_pages)) - inline_before,
+      GetNumTabletServers());
+  for (int i = 1; i < GetNumTabletServers(); ++i) {
     ASSERT_GT(ASSERT_RESULT(Counter(i, METRIC_local_catalog_pushes_applied)), applied_before[i])
-        << "tserver " << i << " applied no pushed batch. " << RoutingCounters(i);
+        << RoutingCounters(i);
+    ASSERT_EQ(ASSERT_RESULT(Counter(i, METRIC_local_catalog_floor_requests_sent)), floors_before[i])
+        << "tserver " << i << " had to ask for a push";
   }
+  LOG(INFO) << "Push RPCs beside the release: "
+            << ASSERT_RESULT(MasterCounter(METRIC_local_catalog_push_rpcs_sent)) - rpcs_before;
 
-  // A cold backend elsewhere reads the new table from its own copy, still without a poll.
-  auto cold = ASSERT_RESULT(ConnectTo(2));
   const auto served_before = ASSERT_RESULT(Counter(2, METRIC_local_catalog_reads_served));
-  ASSERT_EQ(ASSERT_RESULT(cold.FetchRow<std::string>("SELECT v FROM pushed WHERE k = 1")), "p");
-  ASSERT_GT(ASSERT_RESULT(Counter(2, METRIC_local_catalog_reads_served)), served_before)
-      << RoutingCounters(2);
-
-  ASSERT_OK(PauseAllPollers(false));
+  const auto master_reads_before = ASSERT_RESULT(MasterCatalogReadCount());
+  ASSERT_OK(ReadOn(2, "inline_page", "i"));
+  ASSERT_GT(ASSERT_RESULT(Counter(2, METRIC_local_catalog_reads_served)), served_before);
+  ASSERT_EQ(ASSERT_RESULT(MasterCatalogReadCount()), master_reads_before) << RoutingCounters(2);
 }
 
-// A push that does not continue the copy's applied position is refused rather than applied out of
-// order, and the release completes through the poller as it did before Phase 8. The report is made
-// to run ahead of the copy, which is what a restart from a checkpoint file written before the last
-// applies looks like to master, and the only way a slice can start above what the copy holds.
-TEST_F(PgLocalCatalogPushTest, PushWithAGapIsRefusedAndPulled) {
-  ASSERT_OK(WaitForAllServing());
-  ASSERT_OK(WaitForAppliedPositionReports());
+TEST_F(PgLocalCatalogPushTest, CreateDatabaseIsPagedNotInline) {
+  ASSERT_OK(WarmUp());
+  const auto skipped_before =
+      ASSERT_RESULT(MasterCounter(METRIC_local_catalog_release_inline_skipped));
+  const auto rpcs_before = ASSERT_RESULT(MasterCounter(METRIC_local_catalog_push_rpcs_sent));
+  {
+    auto conn = ASSERT_RESULT(ConnectTo(0));
+    ASSERT_OK(conn.Execute("CREATE DATABASE paged_db"));
+  }
+  ASSERT_GE(
+      ASSERT_RESULT(MasterCounter(METRIC_local_catalog_release_inline_skipped)) - skipped_before,
+      2);
+  // 11.6 MB of records in 1 MB pages, to two tservers at least.
+  ASSERT_GE(ASSERT_RESULT(MasterCounter(METRIC_local_catalog_push_rpcs_sent)) - rpcs_before, 10);
+  ASSERT_LE(
+      ASSERT_RESULT(MasterCounter(METRIC_local_catalog_push_in_flight_bytes_max)),
+      64 * 1024 * 1024);
 
-  // The poller has to be held off, or it closes the gap before the push arrives and the push is
-  // then a legitimate no-op.
-  ASSERT_OK(cluster_->SetFlag(&TServer(1), "TEST_local_catalog_pause_poller", "true"));
+  const auto served_before = ASSERT_RESULT(Counter(2, METRIC_local_catalog_reads_served));
+  const auto master_reads_before = ASSERT_RESULT(MasterCatalogReadCount());
+  auto conn = ASSERT_RESULT(ConnectTo(2, "paged_db"));
+  ASSERT_OK(conn.Execute("CREATE TABLE in_paged_db (k INT PRIMARY KEY, v TEXT)"));
+  ASSERT_GT(ASSERT_RESULT(Counter(2, METRIC_local_catalog_reads_served)), served_before);
+  LOG(INFO) << "Master catalog reads for the new database's first connection and DDL: "
+            << ASSERT_RESULT(MasterCatalogReadCount()) - master_reads_before;
+}
+
+TEST_F(PgLocalCatalogPushTest, SmallInlineCapPagesEveryDdl) {
+  ASSERT_OK(WarmUp());
+  ASSERT_OK(cluster_->SetFlag(
+      cluster_->GetLeaderMaster(), "local_catalog_release_inline_max_bytes", "1024"));
+  const auto skipped_before =
+      ASSERT_RESULT(MasterCounter(METRIC_local_catalog_release_inline_skipped));
+  constexpr int kDdls = 10;
+  {
+    auto conn = ASSERT_RESULT(ConnectTo(0));
+    for (int i = 0; i < kDdls; ++i) {
+      ASSERT_OK(conn.ExecuteFormat("CREATE TABLE capped_$0 (k INT PRIMARY KEY, v TEXT)", i));
+    }
+    ASSERT_OK(conn.Execute("INSERT INTO capped_9 VALUES (1, 'c')"));
+  }
+  ASSERT_GE(
+      ASSERT_RESULT(MasterCounter(METRIC_local_catalog_release_inline_skipped)) - skipped_before,
+      kDdls * GetNumTabletServers());
+  ASSERT_OK(ReadOn(2, "capped_9", "c"));
+}
+
+// A copy that cannot apply holds every DDL at its gate; once it can, master's pushes bring it to
+// the head without any pull.
+TEST_F(PgLocalCatalogPushTest, StragglerIsPushedNotPolled) {
+  ASSERT_OK(WarmUp());
+  ASSERT_OK(cluster_->SetFlag(&TServer(2), "TEST_local_catalog_pause_applier", "true"));
+  Status ddl_status;
+  std::atomic<bool> ddl_done{false};
+  TestThreadHolder threads;
+  threads.AddThreadFunctor([this, &ddl_status, &ddl_done] {
+    auto conn = ConnectTo(0);
+    if (!conn.ok()) {
+      ddl_status = conn.status();
+      ddl_done = true;
+      return;
+    }
+    for (int i = 0; ddl_status.ok() && i < 3; ++i) {
+      ddl_status = conn->ExecuteFormat("CREATE TABLE straggled_$0 (k INT PRIMARY KEY, v TEXT)", i);
+    }
+    if (ddl_status.ok()) {
+      ddl_status = conn->Execute("INSERT INTO straggled_2 VALUES (1, 's')");
+    }
+    ddl_done = true;
+  });
+  SleepFor(3s * kTimeMultiplier);
+  ASSERT_FALSE(ddl_done.load()) << "A DDL completed while a serving copy could not apply";
+  ASSERT_OK(cluster_->SetFlag(&TServer(2), "TEST_local_catalog_pause_applier", "false"));
+  threads.JoinAll();
+  ASSERT_OK(ddl_status);
+  ASSERT_OK(ReadOn(2, "straggled_2", "s"));
+  ASSERT_OK(ReadOn(1, "straggled_2", "s"));
+}
+
+// Pages a release carried are lost on the way; the gate's floor request makes master push them.
+TEST_F(PgLocalCatalogPushTest, LostPushIsRepairedNextCycle) {
+  ASSERT_OK(WarmUp());
+  ASSERT_OK(cluster_->SetFlag(&TServer(1), "TEST_local_catalog_drop_pushed_batch", "true"));
+  const auto floors_before = ASSERT_RESULT(Counter(1, METRIC_local_catalog_floor_requests_sent));
+  const auto refused_before = ASSERT_RESULT(Counter(1, METRIC_local_catalog_pushes_refused));
+  {
+    auto conn = ASSERT_RESULT(ConnectTo(0));
+    ASSERT_OK(conn.Execute("CREATE TABLE lost_push (k INT PRIMARY KEY, v TEXT)"));
+    ASSERT_OK(conn.Execute("INSERT INTO lost_push VALUES (1, 'l')"));
+  }
+  ASSERT_OK(cluster_->SetFlag(&TServer(1), "TEST_local_catalog_drop_pushed_batch", "false"));
+  ASSERT_GT(ASSERT_RESULT(Counter(1, METRIC_local_catalog_pushes_refused)), refused_before);
+  ASSERT_GT(ASSERT_RESULT(Counter(1, METRIC_local_catalog_floor_requests_sent)), floors_before);
+  ASSERT_OK(ReadOn(1, "lost_push", "l"));
+}
+
+// Master believes a copy is ahead of where it is, which is what a restart from an old checkpoint
+// looks like. The release's pages start above the copy and are answered with a gap; master pushes
+// from the position the copy gives.
+TEST_F(PgLocalCatalogPushTest, GapFromStaleReportIsRepushed) {
+  ASSERT_OK(WarmUp());
   ASSERT_OK(cluster_->SetFlag(
       &TServer(1), "TEST_local_catalog_report_applied_op_id_ahead", "20"));
   // Long enough for the overstated report to reach master.
   SleepFor(3s * kTimeMultiplier);
-
   const auto refused_before = ASSERT_RESULT(Counter(1, METRIC_local_catalog_pushes_refused));
-
-  // The DDL runs in the background: its release cannot finish on tserver 1 until that copy holds
-  // the release's read time, and with the poller paused the refused push leaves only the gate
-  // wait. Releasing the poller is what lets it through, which is the fallback being tested.
-  Status ddl_status;
-  TestThreadHolder threads;
-  threads.AddThreadFunctor([this, &ddl_status] {
-    auto conn = ConnectTo(0);
-    if (!conn.ok()) {
-      ddl_status = conn.status();
-      return;
-    }
-    ddl_status = conn->Execute("CREATE TABLE gapped (k INT PRIMARY KEY, v TEXT)");
-    if (ddl_status.ok()) {
-      ddl_status = conn->Execute("INSERT INTO gapped VALUES (1, 'g')");
-    }
-  });
-
-  ASSERT_OK(LoggedWaitFor(
-      [this, refused_before]() -> Result<bool> {
-        auto refused = Counter(1, METRIC_local_catalog_pushes_refused);
-        return refused.ok() && *refused > refused_before;
-      },
-      60s, "The push above the applied position to be refused"));
-
-  ASSERT_OK(cluster_->SetFlag(
-      &TServer(1), "TEST_local_catalog_report_applied_op_id_ahead", "0"));
-  ASSERT_OK(cluster_->SetFlag(&TServer(1), "TEST_local_catalog_pause_poller", "false"));
-  threads.JoinAll();
-  ASSERT_OK(ddl_status);
-
-  auto conn = ASSERT_RESULT(ConnectTo(1));
-  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<std::string>("SELECT v FROM gapped WHERE k = 1")), "g");
-}
-
-// With the payload cap at a byte, master carries nothing and every release behaves as it did
-// before Phase 8.
-TEST_F(PgLocalCatalogPushTest, OverTheCapMasterCarriesNothing) {
-  ASSERT_OK(WaitForAllServing());
-  ASSERT_OK(WaitForAppliedPositionReports());
-  ASSERT_OK(cluster_->SetFlag(
-      cluster_->GetLeaderMaster(), "local_catalog_release_push_max_bytes", "1"));
-
-  const auto skipped_before =
-      ASSERT_RESULT(MasterCounter(METRIC_local_catalog_release_pushes_skipped));
   {
     auto conn = ASSERT_RESULT(ConnectTo(0));
-    ASSERT_OK(conn.Execute("CREATE TABLE over_cap (k INT PRIMARY KEY, v TEXT)"));
-    ASSERT_OK(conn.Execute("INSERT INTO over_cap VALUES (1, 'c')"));
+    ASSERT_OK(conn.Execute("CREATE TABLE gapped (k INT PRIMARY KEY, v TEXT)"));
+    ASSERT_OK(conn.Execute("INSERT INTO gapped VALUES (1, 'g')"));
   }
-  ASSERT_GT(
-      ASSERT_RESULT(MasterCounter(METRIC_local_catalog_release_pushes_skipped)), skipped_before);
-
-  auto conn = ASSERT_RESULT(ConnectTo(2));
-  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<std::string>("SELECT v FROM over_cap WHERE k = 1")), "c");
+  ASSERT_OK(cluster_->SetFlag(&TServer(1), "TEST_local_catalog_report_applied_op_id_ahead", "0"));
+  LOG(INFO) << "Refused pages on tserver 1: "
+            << ASSERT_RESULT(Counter(1, METRIC_local_catalog_pushes_refused)) - refused_before;
+  ASSERT_OK(ReadOn(1, "gapped", "g"));
 }
 
-// A tserver whose reported position is too old is sent no records, because master cannot know
-// where that copy is, and it waits for its poller exactly as before.
-TEST_F(PgLocalCatalogPushTest, StaleReportGetsNoRecords) {
-  ASSERT_OK(WaitForAllServing());
-  ASSERT_OK(WaitForAppliedPositionReports());
-
-  ASSERT_OK(cluster_->SetFlag(&TServer(2), "TEST_tserver_disable_heartbeat", "true"));
-  // Longer than local_catalog_release_push_report_max_age_ms, so tserver 2's report goes stale.
-  SleepFor(8s * kTimeMultiplier);
-
-  const auto received_before = ASSERT_RESULT(Counter(2, METRIC_local_catalog_pushes_received));
-  const auto skipped_before =
-      ASSERT_RESULT(MasterCounter(METRIC_local_catalog_release_pushes_skipped));
+TEST_F(PgLocalCatalogPushTest, ConcurrentDdlsShareCycles) {
+  ASSERT_OK(WarmUp());
+  const auto cycles_before = ASSERT_RESULT(MasterCounter(METRIC_local_catalog_push_cycles));
+  const auto releases_before =
+      ASSERT_RESULT(MasterCounter(METRIC_local_catalog_push_release_requests));
+  const auto floors_before =
+      ASSERT_RESULT(MasterCounter(METRIC_local_catalog_floor_requests_received));
+  constexpr int kSessions = 4;
+  constexpr int kDdls = 10;
+  std::vector<Status> statuses(kSessions);
   {
-    auto conn = ASSERT_RESULT(ConnectTo(0));
-    ASSERT_OK(conn.Execute("CREATE TABLE stale_report (k INT PRIMARY KEY, v TEXT)"));
-    ASSERT_OK(conn.Execute("INSERT INTO stale_report VALUES (1, 's')"));
-  }
-  ASSERT_EQ(ASSERT_RESULT(Counter(2, METRIC_local_catalog_pushes_received)), received_before)
-      << "A tserver with a stale report was sent records anyway";
-  ASSERT_GT(
-      ASSERT_RESULT(MasterCounter(METRIC_local_catalog_release_pushes_skipped)), skipped_before)
-      << "Master did not count the stale-report tserver as skipped";
-
-  ASSERT_OK(cluster_->SetFlag(&TServer(2), "TEST_tserver_disable_heartbeat", "false"));
-  auto conn = ASSERT_RESULT(ConnectTo(2));
-  ASSERT_EQ(
-      ASSERT_RESULT(conn.FetchRow<std::string>("SELECT v FROM stale_report WHERE k = 1")), "s");
-}
-
-// Right after a master leader change no tserver has reported a position to the new leader, so its
-// first releases carry nothing and every copy pulls. Once heartbeats arrive, releases carry
-// records again.
-class PgLocalCatalogPushMultiMasterTest : public PgLocalCatalogPushTest {
- protected:
-  // A step-down needs another master to hand leadership to.
-  int GetNumMasters() const override { return 3; }
-};
-
-TEST_F(PgLocalCatalogPushMultiMasterTest, NewMasterLeaderCarriesNothingUntilReportsArrive) {
-  ASSERT_OK(WaitForAllServing());
-  ASSERT_OK(WaitForAppliedPositionReports());
-
-  ASSERT_OK(cluster_->StepDownMasterLeaderAndWaitForNewLeader());
-
-  {
-    auto conn = ASSERT_RESULT(ConnectTo(0));
-    ASSERT_OK(conn.Execute("CREATE TABLE after_stepdown (k INT PRIMARY KEY, v TEXT)"));
-    ASSERT_OK(conn.Execute("INSERT INTO after_stepdown VALUES (1, 'a')"));
-  }
-  auto reader = ASSERT_RESULT(ConnectTo(2));
-  ASSERT_EQ(
-      ASSERT_RESULT(reader.FetchRow<std::string>("SELECT v FROM after_stepdown WHERE k = 1")),
-      "a");
-
-  // The new leader learns the positions from heartbeats and starts carrying records again.
-  ASSERT_OK(WaitForAppliedPositionReports());
-}
-
-// Ten pairs of concurrent DDLs from two tservers: every release either carries usable records or
-// falls back, every copy ends at master's catalog version, and refusals stay rare.
-TEST_F(PgLocalCatalogPushTest, ConcurrentDdlsDoNotStormRefusals) {
-  ASSERT_OK(WaitForAllServing());
-  ASSERT_OK(WaitForAppliedPositionReports());
-
-  int64_t refused_before = 0;
-  for (int i = 0; i < GetNumTabletServers(); ++i) {
-    refused_before += ASSERT_RESULT(Counter(i, METRIC_local_catalog_pushes_refused));
-  }
-
-  constexpr int kIterations = 10;
-  for (int i = 0; i < kIterations; ++i) {
-    auto conn_a = ASSERT_RESULT(ConnectTo(0));
-    auto conn_b = ASSERT_RESULT(ConnectTo(1));
-    Status status_a, status_b;
-    {
-      TestThreadHolder threads;
-      threads.AddThreadFunctor([&conn_a, &status_a, i] {
-        status_a = conn_a.ExecuteFormat("CREATE TABLE push_a_$0 (k INT PRIMARY KEY, v TEXT)", i);
+    TestThreadHolder threads;
+    for (int s = 0; s < kSessions; ++s) {
+      threads.AddThreadFunctor([this, s, &statuses] {
+        auto conn = ConnectTo(s % GetNumTabletServers());
+        if (!conn.ok()) {
+          statuses[s] = conn.status();
+          return;
+        }
+        for (int i = 0; i < kDdls && statuses[s].ok(); ++i) {
+          statuses[s] =
+              conn->ExecuteFormat("CREATE TABLE shared_$0_$1 (k INT PRIMARY KEY, v TEXT)", s, i);
+        }
       });
-      threads.AddThreadFunctor([&conn_b, &status_b, i] {
-        status_b = conn_b.ExecuteFormat("CREATE TABLE push_b_$0 (k INT PRIMARY KEY, v TEXT)", i);
-      });
-      threads.JoinAll();
     }
-    ASSERT_TRUE(status_a.ok()) << "iteration " << i << ": " << status_a;
-    ASSERT_TRUE(status_b.ok()) << "iteration " << i << ": " << status_b;
   }
-
-  int64_t refused_after = 0;
-  for (int i = 0; i < GetNumTabletServers(); ++i) {
-    refused_after += ASSERT_RESULT(Counter(i, METRIC_local_catalog_pushes_refused));
+  for (const auto& status : statuses) {
+    ASSERT_OK(status);
   }
-  LOG(INFO) << "Refusals across " << kIterations << " concurrent DDL pairs: "
-            << refused_after - refused_before;
-  // With the slice-from rule there is nothing for two racing releases to refuse: a slice taken at
-  // or below the copy's position is always usable, so anything above zero here means the position
-  // bookkeeping is wrong.
-  ASSERT_LE(refused_after - refused_before, 2);
+  const auto cycles =
+      ASSERT_RESULT(MasterCounter(METRIC_local_catalog_push_cycles)) - cycles_before;
+  const auto releases =
+      ASSERT_RESULT(MasterCounter(METRIC_local_catalog_push_release_requests)) - releases_before;
+  const auto floors =
+      ASSERT_RESULT(MasterCounter(METRIC_local_catalog_floor_requests_received)) - floors_before;
+  LOG(INFO) << "Push cycles for " << kSessions * kDdls << " DDLs: " << cycles << ", releases "
+            << releases << ", floor requests " << floors;
+  // Releases share cycles; floor requests add at most one cycle each.
+  ASSERT_LE(cycles, releases + floors);
 
   // Every copy ends where master is.
   ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_disable_serving", "true"));
@@ -1687,27 +1730,16 @@ TEST_F(PgLocalCatalogPushTest, ConcurrentDdlsDoNotStormRefusals) {
   ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_disable_serving", "false"));
   for (int i = 0; i < GetNumTabletServers(); ++i) {
     auto conn = ASSERT_RESULT(ConnectTo(i));
-    ASSERT_OK(LoggedWaitFor(
-        [this, &conn, master_version]() -> Result<bool> {
-          auto version = CatalogVersion(&conn);
-          return version.ok() && *version == master_version;
-        },
-        kServingTimeout,
-        Format("Copy on tserver $0 to reach catalog version $1", i, master_version)));
+    ASSERT_EQ(ASSERT_RESULT(CatalogVersion(&conn)), master_version) << "tserver " << i;
   }
 }
 
-// The handoff outlives the caller. A batch is handed to the poll thread and the release handler
-// gives up on its deadline while the apply is still running, which used to leave the poll thread
-// writing its outcome into the handler's dead stack frame.
+// The handoff outlives the caller: the release handler gives up on its deadline while the apply
+// is still running.
 TEST_F(PgLocalCatalogPushTest, ApplyOutlivingItsCallerDoesNotCrash) {
-  ASSERT_OK(WaitForAllServing());
-  ASSERT_OK(WaitForAppliedPositionReports());
-
-  // Longer than the release RPC's own deadline, so the handler stops waiting mid-apply.
+  ASSERT_OK(WarmUp());
   ASSERT_OK(cluster_->SetFlag(
       &TServer(1), "TEST_local_catalog_pushed_batch_apply_delay_ms", "40000"));
-
   {
     auto conn = ASSERT_RESULT(ConnectTo(0));
     ASSERT_OK(conn.Execute("CREATE TABLE outlived (k INT PRIMARY KEY, v TEXT)"));
@@ -1715,118 +1747,587 @@ TEST_F(PgLocalCatalogPushTest, ApplyOutlivingItsCallerDoesNotCrash) {
   }
   ASSERT_OK(cluster_->SetFlag(
       &TServer(1), "TEST_local_catalog_pushed_batch_apply_delay_ms", "0"));
-
-  // The copy is still alive and still advancing, and the row is readable from it.
   ASSERT_OK(WaitForServing(1));
-  auto conn = ASSERT_RESULT(ConnectTo(1));
-  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<std::string>("SELECT v FROM outlived WHERE k = 1")), "o");
+  ASSERT_OK(ReadOn(1, "outlived", "o"));
   cluster_->AssertNoCrashes();
 }
 
-// A slice whose first record sits well above the copy's position is still usable, because the
-// operations in between produced no records. A master leader change writes exactly such an
-// operation: the new leader's no-op consumes a WAL position and yields nothing to ship.
-TEST_F(PgLocalCatalogPushMultiMasterTest, RecordlessOpsDoNotRefuseTheSlice) {
-  ASSERT_OK(WaitForAllServing());
-  ASSERT_OK(WaitForAppliedPositionReports());
+class PgLocalCatalogPushMultiMasterTest : public PgLocalCatalogPushTest {
+ protected:
+  int GetNumMasters() const override { return 3; }
+};
 
-  // The no-op of the new leader's term lands between what the copies hold and the DDL below.
+// A new master leader knows no copy's position: its first release pushes from the start of its
+// cache, and the copies drop what they already hold.
+TEST_F(PgLocalCatalogPushMultiMasterTest, NewMasterLeaderPushesFromLookback) {
+  ASSERT_OK(WarmUp());
   ASSERT_OK(cluster_->StepDownMasterLeaderAndWaitForNewLeader());
-  ASSERT_OK(WaitForAppliedPositionReports());
-
-  std::vector<int64_t> applied_before(GetNumTabletServers());
-  std::vector<int64_t> refused_before(GetNumTabletServers());
-  for (int i = 0; i < GetNumTabletServers(); ++i) {
-    applied_before[i] = ASSERT_RESULT(Counter(i, METRIC_local_catalog_pushes_applied));
-    refused_before[i] = ASSERT_RESULT(Counter(i, METRIC_local_catalog_pushes_refused));
-  }
-
   {
     auto conn = ASSERT_RESULT(ConnectTo(0));
-    ASSERT_OK(conn.Execute("CREATE TABLE after_noop (k INT PRIMARY KEY, v TEXT)"));
-    ASSERT_OK(conn.Execute("INSERT INTO after_noop VALUES (1, 'n')"));
+    ASSERT_OK(conn.Execute("CREATE TABLE after_stepdown (k INT PRIMARY KEY, v TEXT)"));
+    ASSERT_OK(conn.Execute("INSERT INTO after_stepdown VALUES (1, 'a')"));
   }
-
+  ASSERT_OK(ReadOn(2, "after_stepdown", "a"));
   for (int i = 0; i < GetNumTabletServers(); ++i) {
-    ASSERT_GT(ASSERT_RESULT(Counter(i, METRIC_local_catalog_pushes_applied)), applied_before[i])
-        << "tserver " << i << " applied no pushed batch after a record-less operation. "
-        << RoutingCounters(i);
-    ASSERT_EQ(ASSERT_RESULT(Counter(i, METRIC_local_catalog_pushes_refused)), refused_before[i])
-        << "tserver " << i << " refused a slice that only looked discontiguous";
+    ASSERT_EQ(ASSERT_RESULT(Counter(i, METRIC_local_catalog_reseeds)), 0);
   }
 }
 
-// One tserver whose poller has stalled must not disable the push for the rest: master drops it
-// from the fetch rather than dragging the batch back to its position. The straggler is also taken
-// out of the read path, because a copy that is behind *and* serving blocks every release on its
-// own gate, which is the separate problem of plan section 7.2 and would stall this test rather
-// than exercise the lag cap.
-TEST_F(PgLocalCatalogPushTest, AStragglerDoesNotDisableThePushForOthers) {
-  ASSERT_OK(WaitForAllServing());
-  ASSERT_OK(WaitForAppliedPositionReports());
-  ASSERT_OK(cluster_->SetFlag(
-      cluster_->GetLeaderMaster(), "local_catalog_release_push_max_lag_ops", "5"));
-  // Master skips a target whose reported position is older than this, and a heartbeat delayed
-  // past the five second default would then skip a healthy tserver for staleness rather than for
-  // the lag cap under test. The straggler is dropped by the cap either way: its heartbeats keep
-  // arriving, only the position they carry stops advancing.
-  ASSERT_OK(cluster_->SetFlag(
-      cluster_->GetLeaderMaster(), "local_catalog_release_push_report_max_age_ms", "60000"));
-
-  ASSERT_OK(cluster_->SetFlag(&TServer(1), "TEST_local_catalog_disable_serving", "true"));
-  ASSERT_OK(cluster_->SetFlag(&TServer(1), "TEST_local_catalog_pause_poller", "true"));
-  {
-    auto conn = ASSERT_RESULT(ConnectTo(0));
-    for (int i = 0; i < 5; ++i) {
-      ASSERT_OK(conn.ExecuteFormat("CREATE TABLE straggler_$0 (k INT PRIMARY KEY)", i));
-    }
-  }
-
-  // The straggler's frozen position has to reach master before the measured DDL, and a heartbeat
-  // carrying it can take seconds on a loaded host. Master drops a target only while preparing a
-  // release, so the wait runs its own DDLs and ends when master reports having dropped one.
-  {
-    auto conn = ASSERT_RESULT(ConnectTo(0));
-    int probe = 0;
-    ASSERT_OK(LoggedWaitFor(
-        [this, &conn, &probe]() -> Result<bool> {
-          const auto before = VERIFY_RESULT(
-              MasterCounter(METRIC_local_catalog_release_pushes_skipped));
-          RETURN_NOT_OK(conn.ExecuteFormat(
-              "CREATE TABLE straggler_probe_$0 (k INT PRIMARY KEY)", probe++));
-          return VERIFY_RESULT(MasterCounter(METRIC_local_catalog_release_pushes_skipped)) > before;
-        },
-        60s * kTimeMultiplier, "Master to drop the straggler from the fetch"));
-  }
-
-  std::vector<int64_t> applied_before(GetNumTabletServers());
-  for (int i = 0; i < GetNumTabletServers(); ++i) {
-    applied_before[i] = ASSERT_RESULT(Counter(i, METRIC_local_catalog_pushes_applied));
-  }
-  const auto skipped_before =
-      ASSERT_RESULT(MasterCounter(METRIC_local_catalog_release_pushes_skipped));
-  {
-    auto conn = ASSERT_RESULT(ConnectTo(0));
-    ASSERT_OK(conn.Execute("CREATE TABLE past_the_straggler (k INT PRIMARY KEY, v TEXT)"));
-    ASSERT_OK(conn.Execute("INSERT INTO past_the_straggler VALUES (1, 's')"));
-  }
-
-  ASSERT_GT(
-      ASSERT_RESULT(MasterCounter(METRIC_local_catalog_release_pushes_skipped)), skipped_before)
-      << "Master did not drop the straggler from the fetch";
-  for (int i : {0, 2}) {
-    ASSERT_GT(ASSERT_RESULT(Counter(i, METRIC_local_catalog_pushes_applied)), applied_before[i])
-        << "tserver " << i << " was denied a push because another tserver had fallen behind. "
-        << RoutingCounters(i);
-  }
-
-  ASSERT_OK(cluster_->SetFlag(&TServer(1), "TEST_local_catalog_pause_poller", "false"));
-  ASSERT_OK(cluster_->SetFlag(&TServer(1), "TEST_local_catalog_disable_serving", "false"));
-  ASSERT_OK(WaitForServing(1));
+// Plan section 9.5.
+TEST_F(PgLocalCatalogPushTest, TempTableFloorRequestsOneCycle) {
+  ASSERT_OK(WarmUp());
   auto conn = ASSERT_RESULT(ConnectTo(1));
+  const auto floors_before = ASSERT_RESULT(Counter(1, METRIC_local_catalog_floor_requests_sent));
+  ASSERT_OK(conn.Execute("CREATE TEMP TABLE tt (k INT PRIMARY KEY, v TEXT)"));
+  ASSERT_OK(conn.Execute("INSERT INTO tt VALUES (1, 't')"));
+  const auto served_before = ASSERT_RESULT(Counter(1, METRIC_local_catalog_reads_served));
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<std::string>("SELECT v FROM tt WHERE k = 1")), "t");
+  // The temporary relation's rows reach the copy with the next push cycle: the session's own-write
+  // wait asks for one unless an earlier push already carried them.
+  ASSERT_LE(ASSERT_RESULT(Counter(1, METRIC_local_catalog_floor_requests_sent)) - floors_before, 1);
+  ASSERT_GT(ASSERT_RESULT(Counter(1, METRIC_local_catalog_reads_served)), served_before)
+      << RoutingCounters(1);
+}
+
+// Nothing pulls, and with nothing written master has nothing to push.
+TEST_F(PgLocalCatalogPushTest, IdleClusterSendsNoPushes) {
+  ASSERT_OK(WarmUp());
+  // The DDL's own after-effects (master's DDL verification writes) settle first.
+  SleepFor(5s);
+  const auto rpcs_before = ASSERT_RESULT(MasterCounter(METRIC_local_catalog_push_rpcs_sent));
+  const auto cycles_before = ASSERT_RESULT(MasterCounter(METRIC_local_catalog_push_cycles));
+  SleepFor(15s);
+  const auto rpcs = ASSERT_RESULT(MasterCounter(METRIC_local_catalog_push_rpcs_sent)) - rpcs_before;
+  const auto cycles =
+      ASSERT_RESULT(MasterCounter(METRIC_local_catalog_push_cycles)) - cycles_before;
+  LOG(INFO) << "Over 15 s idle: " << rpcs << " push RPCs, " << cycles << " cycles";
+  ASSERT_EQ(rpcs, 0);
+  ASSERT_EQ(cycles, 0);
+}
+
+TEST_F(PgLocalCatalogPushTest, FallbackKnobZeroUsesMasterAtOnce) {
+  ASSERT_OK(WarmUp());
+  ASSERT_OK(cluster_->SetFlag(&TServer(1), "local_catalog_serve_wait_timeout_ms", "0"));
+  ASSERT_OK(cluster_->SetFlag(&TServer(1), "TEST_local_catalog_pause_applier", "true"));
+  auto conn = ASSERT_RESULT(ConnectTo(1));
+  const auto to_master_before =
+      ASSERT_RESULT(Counter(1, METRIC_local_catalog_reads_to_master_not_serving));
+  ASSERT_OK(conn.ExecuteFormat("SET yb_read_time = $0", GetCurrentTimeMicros()));
+  const auto start = MonoTime::Now();
+  ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM pg_catalog.pg_am"));
+  ASSERT_LT(MonoTime::Now() - start, 5s);
+  ASSERT_GT(
+      ASSERT_RESULT(Counter(1, METRIC_local_catalog_reads_to_master_not_serving)),
+      to_master_before);
+  ASSERT_OK(cluster_->SetFlag(&TServer(1), "TEST_local_catalog_pause_applier", "false"));
+}
+
+// Plan section 9.2, through the push RPC of a real tserver: hand-built pages with no records, so
+// that only the queue's position rules decide the outcome.
+class PgLocalCatalogApplierTest : public PgLocalCatalogPushTest {
+ protected:
+  Result<OpIdPB> SysCatalogCommittedOpId() {
+    auto proxy = cluster_->GetLeaderMasterProxy<consensus::ConsensusServiceProxy>();
+    consensus::GetLastOpIdRequestPB req;
+    consensus::GetLastOpIdResponsePB resp;
+    req.set_dest_uuid(cluster_->GetLeaderMaster()->uuid());
+    req.set_tablet_id(master::kSysCatalogTabletId);
+    req.set_opid_type(consensus::COMMITTED_OPID);
+    rpc::RpcController controller;
+    controller.set_timeout(10s);
+    RETURN_NOT_OK(proxy.GetLastOpId(req, &resp, &controller));
+    SCHECK(!resp.has_error(), IllegalState, resp.error().ShortDebugString());
+    return resp.opid();
+  }
+
+  // One push of record-less pages (from, end] to tserver idx.
+  Result<tserver::PushSysCatalogChangesResponsePB> Push(
+      size_t idx, const std::vector<std::pair<int64_t, int64_t>>& ranges, int64_t term,
+      const std::string& uuid = "") {
+    auto proxy = cluster_->GetTServerProxy<tserver::TabletServerServiceProxy>(idx);
+    tserver::PushSysCatalogChangesRequestPB req;
+    req.set_target_uuid(uuid.empty() ? TServer(idx).uuid() : uuid);
+    req.set_master_term(term);
+    for (const auto& [from, end] : ranges) {
+      auto* page = req.add_pages();
+      page->mutable_page_from()->set_term(term);
+      page->mutable_page_from()->set_index(from);
+      page->mutable_page_end()->set_term(term);
+      page->mutable_page_end()->set_index(end);
+    }
+    tserver::PushSysCatalogChangesResponsePB resp;
+    rpc::RpcController controller;
+    controller.set_timeout(30s);
+    RETURN_NOT_OK(proxy.PushSysCatalogChanges(req, &resp, &controller));
+    return resp;
+  }
+
+  // The copy's applied position, learned from a push that starts far above it.
+  Result<int64_t> AppliedIndex(size_t idx, int64_t term) {
+    auto resp = VERIFY_RESULT(Push(idx, {{1LL << 40, (1LL << 40) + 1}}, term));
+    SCHECK(resp.gap(), IllegalState, "A page far above the copy was not answered with a gap");
+    return resp.applied_op_id().index();
+  }
+};
+
+TEST_F(PgLocalCatalogApplierTest, GapIsAnsweredNotApplied) {
+  ASSERT_OK(WarmUp());
+  const auto term = ASSERT_RESULT(SysCatalogCommittedOpId()).term();
+  const auto applied = ASSERT_RESULT(AppliedIndex(1, term));
+  auto resp = ASSERT_RESULT(Push(1, {{applied + 10, applied + 11}}, term));
+  ASSERT_FALSE(resp.has_error()) << resp.ShortDebugString();
+  ASSERT_TRUE(resp.gap());
+  ASSERT_EQ(resp.applied_op_id().index(), applied);
+}
+
+TEST_F(PgLocalCatalogApplierTest, OverlapIsFiltered) {
+  ASSERT_OK(WarmUp());
+  const auto term = ASSERT_RESULT(SysCatalogCommittedOpId()).term();
+  const auto applied = ASSERT_RESULT(AppliedIndex(1, term));
+  const auto safe_time_before = ASSERT_RESULT(Counter(1, METRIC_local_catalog_safe_time_micros));
+  auto resp = ASSERT_RESULT(Push(1, {{applied - 3, applied - 1}, {applied - 1, applied}}, term));
+  ASSERT_FALSE(resp.has_error()) << resp.ShortDebugString();
+  ASSERT_FALSE(resp.gap());
+  ASSERT_EQ(resp.applied_op_id().index(), applied);
+  ASSERT_EQ(ASSERT_RESULT(Counter(1, METRIC_local_catalog_safe_time_micros)), safe_time_before);
+}
+
+TEST_F(PgLocalCatalogApplierTest, StaleTermAndWrongTargetAreRefused) {
+  ASSERT_OK(WarmUp());
+  const auto term = ASSERT_RESULT(SysCatalogCommittedOpId()).term();
+  const auto applied = ASSERT_RESULT(AppliedIndex(1, term));
+  auto stale = ASSERT_RESULT(Push(1, {{applied, applied}}, term - 1));
+  ASSERT_TRUE(stale.has_error()) << stale.ShortDebugString();
+  auto wrong = ASSERT_RESULT(Push(1, {{applied, applied}}, term, "not-this-tserver"));
+  ASSERT_TRUE(wrong.has_error()) << wrong.ShortDebugString();
+}
+
+// Two pushes queued out of order are applied in the order of their starting positions. Applied in
+// arrival order, the second would start above the copy and be answered with a gap.
+TEST_F(PgLocalCatalogApplierTest, QueueOrdersByPageFrom) {
+  ASSERT_OK(WarmUp());
+  const auto term = ASSERT_RESULT(SysCatalogCommittedOpId()).term();
+  const auto applied = ASSERT_RESULT(AppliedIndex(2, term));
+  ASSERT_OK(cluster_->SetFlag(&TServer(2), "TEST_local_catalog_pause_applier", "true"));
+  Result<tserver::PushSysCatalogChangesResponsePB> later{STATUS(Uninitialized, "")};
+  Result<tserver::PushSysCatalogChangesResponsePB> earlier{STATUS(Uninitialized, "")};
+  {
+    TestThreadHolder threads;
+    threads.AddThreadFunctor([this, &later, applied, term] {
+      later = Push(2, {{applied + 1, applied + 2}}, term);
+    });
+    SleepFor(500ms);
+    threads.AddThreadFunctor([this, &earlier, applied, term] {
+      earlier = Push(2, {{applied, applied + 1}}, term);
+    });
+    SleepFor(500ms);
+    ASSERT_OK(cluster_->SetFlag(&TServer(2), "TEST_local_catalog_pause_applier", "false"));
+  }
+  ASSERT_OK(earlier);
+  ASSERT_OK(later);
+  ASSERT_FALSE(earlier->gap()) << earlier->ShortDebugString();
+  ASSERT_FALSE(later->gap()) << later->ShortDebugString();
+  ASSERT_EQ(later->applied_op_id().index(), applied + 2);
+}
+
+// Plan section 9.3: a DDL whose records span pages, under the inline cap, is carried whole.
+TEST_F(PgLocalCatalogPushTest, DropSchemaCascadeIsInlineMultiPage) {
+  ASSERT_OK(WarmUp());
+  ASSERT_OK(cluster_->SetFlag(
+      cluster_->GetLeaderMaster(), "local_catalog_push_page_bytes", "65536"));
+  auto conn = ASSERT_RESULT(ConnectTo(0));
+  ASSERT_OK(conn.Execute("CREATE SCHEMA cascaded"));
+  for (int i = 0; i != 30; ++i) {
+    ASSERT_OK(conn.ExecuteFormat("CREATE TABLE cascaded.t_$0 (k INT PRIMARY KEY, v TEXT)", i));
+  }
+  const auto inline_before =
+      ASSERT_RESULT(MasterCounter(METRIC_local_catalog_release_inline_pages));
+  const auto skipped_before =
+      ASSERT_RESULT(MasterCounter(METRIC_local_catalog_release_inline_skipped));
+  ASSERT_OK(conn.Execute("DROP SCHEMA cascaded CASCADE"));
+  const auto inline_pages =
+      ASSERT_RESULT(MasterCounter(METRIC_local_catalog_release_inline_pages)) - inline_before;
+  LOG(INFO) << "Pages carried inline by the DROP SCHEMA release: " << inline_pages;
   ASSERT_EQ(
-      ASSERT_RESULT(conn.FetchRow<std::string>("SELECT v FROM past_the_straggler WHERE k = 1")),
-      "s");
+      ASSERT_RESULT(MasterCounter(METRIC_local_catalog_release_inline_skipped)), skipped_before);
+  ASSERT_GE(inline_pages, 2 * GetNumTabletServers());
+  auto reader = ASSERT_RESULT(ConnectTo(2));
+  ASSERT_EQ(ASSERT_RESULT(reader.FetchRow<int64_t>(
+      "SELECT count(*) FROM pg_namespace WHERE nspname = 'cascaded'")), 0);
+}
+
+// Plan section 9.5: a catalog read that went to master moves the session's floor, so the
+// session's next read from the copy is at or after what it saw on master.
+TEST_F(PgLocalCatalogPushTest, MasterSnapshotTimeIsFloorForNextLocalRead) {
+  ASSERT_OK(WarmUp());
+  auto conn = ASSERT_RESULT(ConnectTo(1));
+  ASSERT_OK(conn.Execute("CREATE TABLE floor_t (k INT PRIMARY KEY, v TEXT)"));
+  // A read time above C with the copy unable to move goes to master.
+  ASSERT_OK(cluster_->SetFlag(&TServer(1), "local_catalog_serve_wait_timeout_ms", "500"));
+  ASSERT_OK(cluster_->SetFlag(&TServer(1), "TEST_local_catalog_pause_applier", "true"));
+  const auto to_master_before =
+      ASSERT_RESULT(Counter(1, METRIC_local_catalog_reads_to_master_not_serving));
+  ASSERT_OK(conn.ExecuteFormat("SET yb_read_time = $0", GetCurrentTimeMicros()));
+  ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM pg_catalog.pg_am"));
+  ASSERT_OK(conn.Execute("RESET yb_read_time"));
+  ASSERT_GT(
+      ASSERT_RESULT(Counter(1, METRIC_local_catalog_reads_to_master_not_serving)),
+      to_master_before);
+  ASSERT_OK(cluster_->SetFlag(&TServer(1), "TEST_local_catalog_pause_applier", "false"));
+  ASSERT_OK(cluster_->SetFlag(&TServer(1), "local_catalog_serve_wait_timeout_ms", "300000"));
+  const auto master_read_micros = GetCurrentTimeMicros();
+  const auto floors_before = ASSERT_RESULT(Counter(1, METRIC_local_catalog_floor_requests_sent));
+  const auto served_before = ASSERT_RESULT(Counter(1, METRIC_local_catalog_reads_served));
+  auto fresh = ASSERT_RESULT(ConnectTo(1));
+  ASSERT_RESULT(fresh.FetchRow<int64_t>("SELECT count(*) FROM floor_t"));
+  ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM pg_catalog.pg_class"));
+  ASSERT_GT(ASSERT_RESULT(Counter(1, METRIC_local_catalog_reads_served)), served_before);
+  ASSERT_GT(ASSERT_RESULT(Counter(1, METRIC_local_catalog_floor_requests_sent)), floors_before);
+  ASSERT_GE(ASSERT_RESULT(Counter(1, METRIC_local_catalog_safe_time_micros)), master_read_micros);
+}
+
+// With no wait bound, a statement waits for the copy instead of going to master.
+TEST_F(PgLocalCatalogPushTest, FallbackKnobNeverHoldsTheStatement) {
+  ASSERT_OK(WarmUp());
+  ASSERT_OK(cluster_->SetFlag(&TServer(1), "local_catalog_serve_wait_timeout_ms", "-1"));
+  ASSERT_OK(cluster_->SetFlag(&TServer(1), "TEST_local_catalog_pause_applier", "true"));
+  auto conn = ASSERT_RESULT(ConnectTo(1));
+  const auto to_master_before =
+      ASSERT_RESULT(Counter(1, METRIC_local_catalog_reads_to_master_not_serving));
+  ASSERT_OK(conn.ExecuteFormat("SET yb_read_time = $0", GetCurrentTimeMicros()));
+  std::atomic<bool> done{false};
+  TestThreadHolder threads;
+  threads.AddThreadFunctor([&conn, &done] {
+    ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM pg_catalog.pg_am"));
+    done = true;
+  });
+  SleepFor(3s);
+  ASSERT_FALSE(done.load()) << "The statement did not wait for the copy";
+  ASSERT_OK(cluster_->SetFlag(&TServer(1), "TEST_local_catalog_pause_applier", "false"));
+  threads.JoinAll();
+  ASSERT_EQ(
+      ASSERT_RESULT(Counter(1, METRIC_local_catalog_reads_to_master_not_serving)),
+      to_master_before);
+}
+
+// An apply that outlasts master's push RPC timeout is retried by master; the retried page is
+// filtered as overlap and the copy ends where master is.
+TEST_F(PgLocalCatalogPushTest, StalledApplyTimesOutAndRecovers) {
+  ASSERT_OK(WarmUp());
+  ASSERT_OK(cluster_->SetFlag(
+      cluster_->GetLeaderMaster(), "local_catalog_push_rpc_timeout_ms", "2000"));
+  ASSERT_OK(cluster_->SetFlag(
+      &TServer(1), "TEST_local_catalog_pushed_batch_apply_delay_ms", "4000"));
+  {
+    auto conn = ASSERT_RESULT(ConnectTo(0));
+    ASSERT_OK(conn.Execute("CREATE TABLE stalled (k INT PRIMARY KEY, v TEXT)"));
+    ASSERT_OK(conn.Execute("INSERT INTO stalled VALUES (1, 's')"));
+  }
+  ASSERT_OK(cluster_->SetFlag(
+      &TServer(1), "TEST_local_catalog_pushed_batch_apply_delay_ms", "0"));
+  ASSERT_OK(ReadOn(1, "stalled", "s"));
+  ASSERT_OK(ReadOn(2, "stalled", "s"));
+  cluster_->AssertNoCrashes();
+}
+
+// A catalog write master makes outside any DDL reaches the copies on the timer cycle.
+class PgLocalCatalogPushTimerTest : public PgLocalCatalogPushTest {
+ protected:
+  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
+    PgLocalCatalogPushTest::UpdateMiniClusterOptions(options);
+    options->extra_master_flags.push_back("--local_catalog_push_interval_ms=2000");
+  }
+};
+
+TEST_F(PgLocalCatalogPushTimerTest, TimerCycleCarriesWritesOutsideDdl) {
+  ASSERT_OK(WarmUp());
+  auto conn = ASSERT_RESULT(ConnectTo(0));
+  ASSERT_OK(conn.Execute("CREATE TABLE timer_t (k INT PRIMARY KEY)"));
+  // A catalog write outside DDL: no release carries it and no version moves.
+  ASSERT_OK(conn.Execute("SET yb_non_ddl_txn_for_sys_tables_allowed = true"));
+  ASSERT_OK(conn.Execute(
+      "UPDATE pg_catalog.pg_class SET relhasindex = relhasindex WHERE relname = 'timer_t'"));
+  const auto written_micros = GetCurrentTimeMicros();
+  const auto floors_before = ASSERT_RESULT(Counter(2, METRIC_local_catalog_floor_requests_sent));
+  ASSERT_OK(LoggedWaitFor(
+      [this, written_micros]() -> Result<bool> {
+        return VERIFY_RESULT(Counter(2, METRIC_local_catalog_safe_time_micros)) > written_micros;
+      },
+      30s, "C on tserver 2 to pass the write without a DDL or a floor request"));
+  ASSERT_EQ(ASSERT_RESULT(Counter(2, METRIC_local_catalog_floor_requests_sent)), floors_before);
+}
+
+// Plan section 9.4: a tserver loses its YSQL lease, DDLs complete without it, and it regains the
+// lease. PG starts only once the copy holds everything up to the new lease's bound.
+class PgLocalCatalogRejoinTest : public PgLocalCatalogPushTest {
+ protected:
+  static constexpr size_t kJoiner = 2;
+
+  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
+    PgLocalCatalogPushTest::UpdateMiniClusterOptions(options);
+    options->extra_master_flags.push_back("--master_ysql_operation_lease_ttl_ms=5000");
+  }
+
+  Status LoseLease() {
+    RETURN_NOT_OK(cluster_->SetFlag(
+        &TServer(kJoiner), "TEST_tserver_enable_ysql_lease_refresh", "false"));
+    return LoggedWaitFor(
+        [this]() -> Result<bool> {
+          return VERIFY_RESULT(Counter(kJoiner, METRIC_local_catalog_serving_state)) ==
+                 kServingStateDisabledLease;
+        },
+        60s, "The joiner to lose its lease");
+  }
+
+  Status RegainLease() {
+    return cluster_->SetFlag(&TServer(kJoiner), "TEST_tserver_enable_ysql_lease_refresh", "true");
+  }
+
+  // PG on the joiner is restarted after the copy serves, so connections fail for a moment.
+  Result<PGConn> ConnectToJoiner() {
+    std::optional<PGConn> conn;
+    RETURN_NOT_OK(LoggedWaitFor(
+        [this, &conn]() -> Result<bool> {
+          auto result = ConnectTo(kJoiner);
+          if (!result.ok()) {
+            return false;
+          }
+          if (!result->FetchRow<int32_t>("SELECT 1").ok()) {
+            return false;
+          }
+          conn.emplace(std::move(*result));
+          return true;
+        },
+        120s, "PG on the joiner to accept connections"));
+    return std::move(*conn);
+  }
+
+  Result<int64_t> JoinerMasterReads() {
+    int64_t total = 0;
+    for (const auto* proto :
+         {&METRIC_local_catalog_reads_to_master_not_serving,
+          &METRIC_local_catalog_reads_to_master_in_ddl}) {
+      total += VERIFY_RESULT(Counter(kJoiner, *proto));
+    }
+    return total;
+  }
+};
+
+TEST_F(PgLocalCatalogRejoinTest, RejoinCatchesUpFromCache) {
+  ASSERT_OK(WarmUp());
+  {
+    auto conn = ASSERT_RESULT(ConnectTo(0));
+    ASSERT_OK(conn.Execute("CREATE TABLE rejoin_t (k INT PRIMARY KEY, a INT, v TEXT)"));
+    ASSERT_OK(conn.Execute("CREATE INDEX rejoin_i ON rejoin_t (a)"));
+    ASSERT_OK(conn.Execute("INSERT INTO rejoin_t VALUES (1, 1, 'r')"));
+  }
+  ASSERT_OK(LoseLease());
+  // No index build while the joiner has no lease: a backfill connects to the PG of every tserver
+  // that holds a tablet of the table, and the joiner's PG is stopped.
+  {
+    auto conn = ASSERT_RESULT(ConnectTo(0));
+    ASSERT_OK(conn.Execute("ALTER TABLE rejoin_t ADD COLUMN w TEXT DEFAULT 'added'"));
+    ASSERT_OK(conn.Execute("CREATE VIEW rejoin_v AS SELECT k, v, w FROM rejoin_t"));
+  }
+  const auto floors_before =
+      ASSERT_RESULT(Counter(kJoiner, METRIC_local_catalog_floor_requests_sent));
+  ASSERT_OK(RegainLease());
+  ASSERT_OK(WaitForServing(kJoiner));
+  auto conn = ASSERT_RESULT(ConnectToJoiner());
+  const auto master_reads_before = ASSERT_RESULT(JoinerMasterReads());
+  const auto plan = ASSERT_RESULT(conn.FetchAllAsString(
+      "EXPLAIN (COSTS OFF) SELECT v FROM rejoin_t WHERE a = 1"));
+  ASSERT_STR_CONTAINS(plan, "rejoin_i");
+  ASSERT_EQ(
+      ASSERT_RESULT(conn.FetchRow<std::string>("SELECT w FROM rejoin_v WHERE k = 1")), "added");
+  ASSERT_EQ(ASSERT_RESULT(JoinerMasterReads()), master_reads_before) << RoutingCounters(kJoiner);
+  ASSERT_GT(ASSERT_RESULT(Counter(kJoiner, METRIC_local_catalog_floor_requests_sent)),
+            floors_before);
+}
+
+TEST_F(PgLocalCatalogRejoinTest, RejoinWithNoDdlFlipsOnEmptyCycle) {
+  ASSERT_OK(WarmUp());
+  ASSERT_OK(LoseLease());
+  ASSERT_OK(RegainLease());
+  ASSERT_OK(WaitForServing(kJoiner));
+  auto conn = ASSERT_RESULT(ConnectToJoiner());
+}
+
+TEST_F(PgLocalCatalogRejoinTest, RejoinBelowCacheReadsWal) {
+  ASSERT_OK(WarmUp());
+  ASSERT_OK(cluster_->SetFlag(cluster_->GetLeaderMaster(), "local_catalog_push_cache_mb", "1"));
+  ASSERT_OK(LoseLease());
+  {
+    auto conn = ASSERT_RESULT(ConnectTo(0));
+    for (int i = 0; i < 100; ++i) {
+      ASSERT_OK(conn.ExecuteFormat("CREATE TABLE below_cache_$0 (k INT PRIMARY KEY, v TEXT)", i));
+    }
+    ASSERT_OK(conn.Execute("INSERT INTO below_cache_99 VALUES (1, 'b')"));
+  }
+  const auto transient_before =
+      ASSERT_RESULT(MasterCounter(METRIC_local_catalog_push_transient_pages_built));
+  ASSERT_OK(RegainLease());
+  ASSERT_OK(WaitForServing(kJoiner));
+  auto conn = ASSERT_RESULT(ConnectToJoiner());
+  ASSERT_EQ(
+      ASSERT_RESULT(conn.FetchRow<std::string>("SELECT v FROM below_cache_99 WHERE k = 1")), "b");
+  ASSERT_GT(
+      ASSERT_RESULT(MasterCounter(METRIC_local_catalog_push_transient_pages_built)),
+      transient_before);
+}
+
+TEST_F(PgLocalCatalogRejoinTest, RejoinPgStartHoldTimesOut) {
+  ASSERT_OK(WarmUp());
+  ASSERT_OK(cluster_->SetFlag(
+      &TServer(kJoiner), "local_catalog_serve_wait_timeout_ms", "3000"));
+  ASSERT_OK(LoseLease());
+  {
+    auto conn = ASSERT_RESULT(ConnectTo(0));
+    ASSERT_OK(conn.Execute("CREATE TABLE held (k INT PRIMARY KEY, v TEXT)"));
+    ASSERT_OK(conn.Execute("INSERT INTO held VALUES (1, 'h')"));
+  }
+  ASSERT_OK(cluster_->SetFlag(
+      cluster_->GetLeaderMaster(), "TEST_local_catalog_push_block_target",
+      TServer(kJoiner).uuid()));
+  ASSERT_OK(RegainLease());
+  {
+    auto conn = ASSERT_RESULT(ConnectToJoiner());
+    ASSERT_NE(
+        ASSERT_RESULT(Counter(kJoiner, METRIC_local_catalog_serving_state)),
+        kServingStateServing);
+    const auto master_reads_before = ASSERT_RESULT(JoinerMasterReads());
+    ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<std::string>("SELECT v FROM held WHERE k = 1")), "h");
+    ASSERT_GT(ASSERT_RESULT(JoinerMasterReads()), master_reads_before);
+  }
+  ASSERT_OK(cluster_->SetFlag(
+      cluster_->GetLeaderMaster(), "TEST_local_catalog_push_block_target", ""));
+  ASSERT_OK(WaitForServing(kJoiner));
+  auto conn = ASSERT_RESULT(ConnectTo(kJoiner));
+  const auto served_before = ASSERT_RESULT(Counter(kJoiner, METRIC_local_catalog_reads_served));
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<std::string>("SELECT v FROM held WHERE k = 1")), "h");
+  ASSERT_GT(ASSERT_RESULT(Counter(kJoiner, METRIC_local_catalog_reads_served)), served_before);
+}
+
+// The joiner's copy is below what master retains, so master tells it to fetch its copy again, and
+// it serves once the fresh copy has a page whose safe time passes the lease bound. The retention
+// loss is injected (TEST_local_catalog_push_reseed) as in CheckpointTooOldReseeds.
+TEST_F(PgLocalCatalogRejoinTest, RejoinBelowRetentionReseeds) {
+  ASSERT_OK(WarmUp());
+  ASSERT_OK(LoseLease());
+  {
+    auto conn = ASSERT_RESULT(ConnectTo(0));
+    ASSERT_OK(conn.Execute("CREATE TABLE reseeded (k INT PRIMARY KEY, v TEXT)"));
+    ASSERT_OK(conn.Execute("INSERT INTO reseeded VALUES (1, 'r')"));
+  }
+  ASSERT_OK(cluster_->SetFlag(&TServer(kJoiner), "TEST_local_catalog_push_reseed", "true"));
+  ASSERT_OK(RegainLease());
+  ASSERT_OK(LoggedWaitFor(
+      [this]() -> Result<bool> {
+        return VERIFY_RESULT(Counter(kJoiner, METRIC_local_catalog_reseeds)) > 0;
+      },
+      120s, "The joiner to re-seed"));
+  ASSERT_OK(cluster_->SetFlag(&TServer(kJoiner), "TEST_local_catalog_push_reseed", "false"));
+  ASSERT_OK(WaitForServing(kJoiner));
+  auto conn = ASSERT_RESULT(ConnectToJoiner());
+  const auto master_reads_before = ASSERT_RESULT(JoinerMasterReads());
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<std::string>("SELECT v FROM reseeded WHERE k = 1")), "r");
+  ASSERT_EQ(ASSERT_RESULT(JoinerMasterReads()), master_reads_before) << RoutingCounters(kJoiner);
+}
+
+// With no bound on the hold, PG does not start until the copy serves.
+TEST_F(PgLocalCatalogRejoinTest, RejoinPgStartHoldNever) {
+  ASSERT_OK(WarmUp());
+  ASSERT_OK(cluster_->SetFlag(&TServer(kJoiner), "local_catalog_serve_wait_timeout_ms", "-1"));
+  ASSERT_OK(LoseLease());
+  ASSERT_OK(cluster_->SetFlag(
+      cluster_->GetLeaderMaster(), "TEST_local_catalog_push_block_target",
+      TServer(kJoiner).uuid()));
+  ASSERT_OK(RegainLease());
+  const auto start = MonoTime::Now();
+  while (MonoTime::Now() - start < 5s) {
+    auto conn = ConnectTo(kJoiner);
+    ASSERT_FALSE(conn.ok() && conn->FetchRow<int32_t>("SELECT 1").ok())
+        << "PG on the joiner accepted a connection before its copy served";
+    SleepFor(500ms);
+  }
+  ASSERT_OK(cluster_->SetFlag(
+      cluster_->GetLeaderMaster(), "TEST_local_catalog_push_block_target", ""));
+  ASSERT_OK(WaitForServing(kJoiner));
+  auto conn = ASSERT_RESULT(ConnectToJoiner());
+  const auto served_before = ASSERT_RESULT(Counter(kJoiner, METRIC_local_catalog_reads_served));
+  ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM pg_class"));
+  ASSERT_GT(ASSERT_RESULT(Counter(kJoiner, METRIC_local_catalog_reads_served)), served_before);
+}
+
+// Two tservers lose and regain their leases while DDLs run on the third; the DDLs are not held by
+// the joiners' catch-up.
+TEST_F(PgLocalCatalogRejoinTest, RejoinWaveDoesNotHoldDdl) {
+  ASSERT_OK(WarmUp());
+  auto conn = ASSERT_RESULT(ConnectTo(0));
+  const auto run_ddls = [&conn](const std::string& tag, int count) -> Result<MonoDelta> {
+    std::vector<MonoDelta> latencies;
+    for (int i = 0; i != count; ++i) {
+      const auto start = MonoTime::Now();
+      RETURN_NOT_OK(conn.ExecuteFormat("CREATE TABLE wave_$0_$1 (k INT PRIMARY KEY)", tag, i));
+      latencies.push_back(MonoTime::Now() - start);
+    }
+    std::sort(latencies.begin(), latencies.end());
+    return latencies[latencies.size() / 2];
+  };
+  const auto baseline = ASSERT_RESULT(run_ddls("base", 10));
+  for (size_t ts : {1, 2}) {
+    ASSERT_OK(cluster_->SetFlag(&TServer(ts), "TEST_tserver_enable_ysql_lease_refresh", "false"));
+  }
+  ASSERT_OK(LoggedWaitFor(
+      [this]() -> Result<bool> {
+        return VERIFY_RESULT(Counter(1, METRIC_local_catalog_serving_state)) ==
+                   kServingStateDisabledLease &&
+               VERIFY_RESULT(Counter(2, METRIC_local_catalog_serving_state)) ==
+                   kServingStateDisabledLease;
+      },
+      60s, "Both joiners to lose their leases"));
+  ASSERT_RESULT(run_ddls("gap", 10));
+  for (size_t ts : {1, 2}) {
+    ASSERT_OK(cluster_->SetFlag(&TServer(ts), "TEST_tserver_enable_ysql_lease_refresh", "true"));
+  }
+  const auto during = ASSERT_RESULT(run_ddls("rejoin", 10));
+  LOG(INFO) << "DDL p50: baseline " << baseline << ", during the rejoin " << during;
+  ASSERT_LT(during, baseline * 3);
+  for (size_t ts : {1, 2}) {
+    ASSERT_OK(WaitForServing(ts));
+  }
+  auto reader = ASSERT_RESULT(ConnectTo(2));
+  ASSERT_RESULT(reader.FetchRow<int64_t>("SELECT count(*) FROM wave_rejoin_9"));
+}
+
+// A DDL that completes while the joiner catches up is acknowledged by the joiner at once, and the
+// joiner does not serve until its copy holds that DDL's version.
+TEST_F(PgLocalCatalogRejoinTest, ReleaseDuringCatchupGatesTheFlip) {
+  ASSERT_OK(WarmUp());
+  {
+    auto conn = ASSERT_RESULT(ConnectTo(0));
+    ASSERT_OK(conn.Execute("CREATE TABLE flip (k INT PRIMARY KEY, v TEXT)"));
+    ASSERT_OK(conn.Execute("INSERT INTO flip VALUES (1, 'before')"));
+  }
+  ASSERT_OK(LoseLease());
+  ASSERT_OK(cluster_->SetFlag(&TServer(kJoiner), "TEST_local_catalog_pause_applier", "true"));
+  ASSERT_OK(RegainLease());
+  // The lease is back once master targets the joiner's releases again; a DDL meanwhile must not
+  // wait for the paused copy.
+  SleepFor(5s * kTimeMultiplier);
+  {
+    auto conn = ASSERT_RESULT(ConnectTo(0));
+    const auto start = MonoTime::Now();
+    ASSERT_OK(conn.Execute("ALTER TABLE flip ADD COLUMN w TEXT DEFAULT 'after'"));
+    ASSERT_LT(MonoTime::Now() - start, 20s);
+  }
+  SleepFor(2s);
+  ASSERT_NE(
+      ASSERT_RESULT(Counter(kJoiner, METRIC_local_catalog_serving_state)), kServingStateServing);
+  ASSERT_OK(cluster_->SetFlag(&TServer(kJoiner), "TEST_local_catalog_pause_applier", "false"));
+  ASSERT_OK(WaitForServing(kJoiner));
+  auto conn = ASSERT_RESULT(ConnectToJoiner());
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<std::string>("SELECT w FROM flip WHERE k = 1")), "after");
 }
 
 }  // namespace yb::pgwrapper

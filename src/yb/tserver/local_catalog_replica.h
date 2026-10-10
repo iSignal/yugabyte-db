@@ -35,22 +35,22 @@
 #include "yb/util/monotime.h"
 #include "yb/util/status_fwd.h"
 
-namespace yb::cdc {
-class GetSysCatalogChangesResponsePB;
-}  // namespace yb::cdc
-
 namespace yb::tserver {
 
-class LocalCatalogPoller;
+class LocalCatalogApplier;
+class PushSysCatalogChangesRequestPB;
+class PushSysCatalogChangesResponsePB;
+class DBCatalogVersionDataPB;
+struct LocalCatalogPushOutcome;
 
 // Whether the tserver may serve catalog reads from its local copy of the master system catalog
 // tablet.
-//   kBootstrapping - the local tablet is being created, or the poller has not applied a response
-//                    yet, so C is not a certified value.
+//   kBootstrapping - the local tablet is being created, or no page carrying a safe time has been
+//                    applied yet, so C is not a certified value.
 //   kServing       - the local copy is complete up to C and reads may be routed to it.
 //   kDisabledLease - the YSQL lease lapsed, so master may have committed DDLs whose lock release
-//                    this tserver never acknowledged. The copy cannot be trusted until the poller
-//                    has applied a response at or after the new lease grant.
+//                    this tserver never acknowledged. The copy cannot be trusted until it has
+//                    applied pages whose safe time is at or after the new lease grant.
 //   kReseeding     - the local tablet is being replaced by a fresh copy of master's.
 YB_DEFINE_ENUM(LocalCatalogServingState, (kBootstrapping)(kServing)(kDisabledLease)(kReseeding));
 
@@ -63,8 +63,8 @@ std::string LocalCatalogHybridTimeForLog(HybridTime ht);
 // Tserver-local DocDB copy of the master system catalog tablet.
 //
 // The copy is a single-peer tablet holding the same table ids, schemas and row keys as the master
-// system catalog tablet. Master remains the only writer; the copy is advanced by pulling the
-// master system catalog tablet's WAL through a change stream and applying the records locally.
+// system catalog tablet. Master remains the only writer; the copy is advanced by applying the
+// pages of master's system catalog WAL that master pushes to it.
 //
 // Two published values drive every consumer:
 //   C          - the highest hybrid time for which the local regular store is complete for every
@@ -83,13 +83,13 @@ class LocalCatalogReplica {
   LocalCatalogReplica(TabletServer& server, const scoped_refptr<MetricEntity>& metric_entity);
   ~LocalCatalogReplica();
 
-  // Registers metrics and creates the poller. Does not touch master and does not create the local
+  // Registers metrics and creates the applier. Does not touch master and does not create the local
   // tablet.
   void Init();
 
-  // Starts the poller. Its first poll creates or reopens the local tablet, and serving begins
-  // once a response has been fully applied, so that C is a value master certified rather than a
-  // clock reading.
+  // Starts the applier. Its first run creates or reopens the local tablet, and serving begins once
+  // a page carrying a safe time has been applied, so that C is a value master certified rather
+  // than a clock reading.
   Status Start();
 
   void StartShutdown();
@@ -98,49 +98,59 @@ class LocalCatalogReplica {
   LocalCatalogServingState state() const { return state_.load(std::memory_order_acquire); }
   bool IsServing() const;
 
-  // C. Invalid until the poller has applied its first response.
+  // C. Invalid until the first page carrying a safe time has been applied.
   HybridTime safe_time() const { return HybridTime(c_.load(std::memory_order_acquire)); }
 
   // A[db_oid], or 0 when the local copy has no version row for that database yet.
   uint64_t applied_version(uint32_t db_oid) const EXCLUDES(mutex_);
 
-  // Blocks until A[db_oid] >= version, asking the poller to poll immediately. Returns TimedOut if
-  // the deadline passes first.
+  // Blocks until A[db_oid] >= version, asking master to push up to now. Returns TimedOut if the
+  // deadline passes first.
   Status WaitForAppliedVersion(uint32_t db_oid, uint64_t version, CoarseTimePoint deadline)
       EXCLUDES(mutex_);
 
-  // Blocks until C >= target, asking the poller to poll immediately. Returns TimedOut if the
-  // deadline passes first.
+  // Blocks until C >= target, asking master to push up to target. Returns TimedOut if the deadline
+  // passes first.
   Status WaitForSafeTime(HybridTime target, CoarseTimePoint deadline) EXCLUDES(mutex_);
 
   // Whether the copy already holds every catalog change committed at or below target. When it
-  // does not, an immediate poll is requested so that the caller's next attempt is likely to
+  // does not, a push up to target is requested so that the caller's next attempt is likely to
   // succeed. Used by the heartbeat path, which cannot block.
   bool HoldsCatalogStateAt(HybridTime target);
 
   // The local tablet peer, or nullptr while the copy is not open.
   tablet::TabletPeerPtr tablet_peer() const EXCLUDES(mutex_);
 
-  // Called by the poller after every fully applied response: publishes C and A[db] together and
+  // Called by the applier after every page carrying a safe time: publishes C and A[db] together and
   // wakes every waiter.
   void PublishAfterApply(
       HybridTime new_c, const std::unordered_map<uint32_t, uint64_t>& applied_versions)
       EXCLUDES(mutex_);
 
-  // Called by the poller when master has garbage collected WAL it had not consumed, or when the
-  // local tablet cannot be opened. Stops the poller and re-runs the bootstrap.
+  // Called by the applier when master no longer retains the WAL after the copy's position or the
+  // WAL holds a restore. The applier re-runs the bootstrap.
   void RequestReseed();
 
   // Lease hooks.
   void OnLeaseLost();
   void OnLeaseGained(HybridTime lease_grant_time);
 
+  // Whether PG's start after a new lease epoch waits for this copy to serve: push is on, the wait
+  // is not disabled, and a copy exists, in memory or on disk, so that serving is a catch-up away.
+  bool ShouldHoldPgStart();
+
+  // Called with every version report the tserver publishes to its backends. While the copy is not
+  // serving, it records the highest version published per database; the copy enters serving only
+  // once it holds every recorded version, so that no backend told a version can read a copy that
+  // lacks it. Each report is the full version map, so a database it lacks was dropped and its
+  // record is dropped too.
+  void NotePublishedVersions(const DBCatalogVersionDataPB& versions) EXCLUDES(mutex_);
+
   // Takes the copy out of the read path while master reports a YSQL major version upgrade in
   // progress. In that window master holds two catalog version tables and DDLs still run, and the
   // copy's read rule for that state has not been worked out, so every catalog read goes to master.
   void SetMajorVersionUpgradeInProgress(bool in_progress);
 
-  void IncPollFailures();
   void IncApplyFailures();
   void IncReadsServed();
   void IncReadsWaitedForVersion();
@@ -148,7 +158,6 @@ class LocalCatalogReplica {
   void IncReadsToMasterInDdl();
   void IncReadsToMasterSerializable();
   void IncReadsToMasterNotServing();
-  void RecordPollLatency(MonoDelta delta);
   void RecordApplyLatency(MonoDelta delta);
   void RecordGateWait(MonoDelta delta);
   void RecordLag(MonoDelta delta);
@@ -158,23 +167,33 @@ class LocalCatalogReplica {
   TabletServer& server() { return server_; }
 
   // The position in master's system catalog WAL that this copy has applied. Published by the
-  // poller after each batch, read by the heartbeat thread. Invalid until the copy exists.
+  // applier after each page, read by the heartbeat thread. Invalid until the copy exists.
   void SetAppliedOpId(const OpId& op_id);
   OpId applied_op_id() const;
 
-  // Applies change records that master carried on a lock release, so that this copy can reach the
-  // release's catalog version read time without waiting for a poll. Errors leave the copy
-  // untouched beyond what was applied and the caller waits for the poller as before.
-  Status ApplyPushedBatch(
-      const cdc::GetSysCatalogChangesResponsePB& batch, CoarseTimePoint deadline);
-  void RequestImmediatePoll();
+  // Applies pages that master pushed or carried on a lock release. With wait set, returns once
+  // they are applied or the deadline passed; without it, queues them and returns at once. Errors
+  // leave the copy untouched beyond what was applied, and the caller's wait asks master for a
+  // push.
+  Result<LocalCatalogPushOutcome> ApplyPushedPages(
+      std::shared_ptr<const PushSysCatalogChangesRequestPB> pages, CoarseTimePoint deadline,
+      bool wait);
 
+  // The PushSysCatalogChanges RPC.
+  Status HandlePush(
+      const PushSysCatalogChangesRequestPB& req, PushSysCatalogChangesResponsePB* resp,
+      CoarseTimePoint deadline);
+
+  // A caller needs the copy to be complete up to floor; see LocalCatalogApplier::RequestPush.
+  void RequestPush(HybridTime floor = HybridTime::kInvalid);
+
+  void IncFloorRequestsSent();
   void IncPushesReceived();
   void IncPushesApplied();
   void IncPushesRefused();
 
  private:
-  friend class LocalCatalogPoller;
+  friend class LocalCatalogApplier;
 
   void SetState(LocalCatalogServingState state);
 
@@ -197,6 +216,7 @@ class LocalCatalogReplica {
   scoped_refptr<Counter> pushes_received_;
   scoped_refptr<Counter> pushes_applied_;
   scoped_refptr<Counter> pushes_refused_;
+  scoped_refptr<Counter> floor_requests_sent_;
   const scoped_refptr<MetricEntity> metric_entity_;
   const std::string log_prefix_;
 
@@ -205,7 +225,7 @@ class LocalCatalogReplica {
   // C, held as a raw uint64 so that reads on the request path are lock free.
   std::atomic<uint64_t> c_{0};
 
-  // The hybrid time the poller must reach before versions may be published again after a lease
+  // The hybrid time C must reach before versions may be published again after a lease
   // regain. Zero when no lease gap is outstanding.
   std::atomic<uint64_t> lease_gap_floor_{0};
 
@@ -214,16 +234,16 @@ class LocalCatalogReplica {
   mutable std::mutex mutex_;
   mutable std::condition_variable cond_;
   std::unordered_map<uint32_t, uint64_t> applied_version_ GUARDED_BY(mutex_);
+  std::unordered_map<uint32_t, uint64_t> published_while_not_serving_ GUARDED_BY(mutex_);
   tablet::TabletPeerPtr tablet_peer_ GUARDED_BY(mutex_);
 
   std::atomic<bool> shutdown_{false};
   std::atomic<bool> reseed_requested_{false};
 
   // Created by Init(), before any request thread can reach this object, and destroyed by
-  // CompleteShutdown() after the poll thread has been joined, so readers need no lock.
-  std::unique_ptr<LocalCatalogPoller> poller_;
+  // CompleteShutdown() after the apply thread has been joined, so readers need no lock.
+  std::unique_ptr<LocalCatalogApplier> applier_;
 
-  scoped_refptr<Counter> poll_failures_;
   scoped_refptr<Counter> apply_failures_;
   scoped_refptr<Counter> reseeds_;
   scoped_refptr<Counter> serving_disabled_lease_;
@@ -235,7 +255,6 @@ class LocalCatalogReplica {
   scoped_refptr<Counter> reads_to_master_not_serving_;
   scoped_refptr<AtomicGauge<uint32_t>> serving_state_;
   scoped_refptr<AtomicGauge<uint64_t>> safe_time_micros_;
-  scoped_refptr<EventStats> poll_latency_;
   scoped_refptr<EventStats> apply_latency_;
   scoped_refptr<EventStats> lag_;
   scoped_refptr<EventStats> gate_wait_;

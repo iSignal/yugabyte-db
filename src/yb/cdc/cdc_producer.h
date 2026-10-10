@@ -110,5 +110,12 @@ Status GetChangesForCDCSDK(
     CDCThroughputMetrics* throughput_metrics = nullptr);
 
 Status GetChangesForXCluster(const XClusterGetChangesContext& context);
+
+// Appends the records one replicated operation produces to context.resp, as GetChangesForXCluster
+// does for each operation it reads. Returns true when the operation must be the last of its batch:
+// a CHANGE_METADATA record was added, or update_on_snapshot_op_func asked to stop at it. Only
+// stream_metadata, tablet_id, tablet_peer, resp and the two callbacks of the context are used.
+Result<bool> PopulateXClusterRecords(
+    const XClusterGetChangesContext& context, const consensus::LWReplicateMsg& msg);
 }  // namespace cdc
 }  // namespace yb

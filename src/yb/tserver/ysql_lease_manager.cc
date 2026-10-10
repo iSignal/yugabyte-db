@@ -33,6 +33,7 @@
 #include "yb/util/locks.h"
 #include "yb/util/mutex.h"
 #include "yb/util/status_log.h"
+#include "yb/util/thread.h"
 
 using namespace std::literals;
 using namespace std::placeholders;
@@ -48,6 +49,7 @@ DEFINE_test_flag(uint64, delay_ysql_lease_expiry_pg_kill_ms, 0,
     "Delay between a tserver detecting YSQL lease expiry and killing hosted PG sessions.");
 
 DECLARE_bool(enable_object_locking_for_table_locks);
+DECLARE_int32(local_catalog_serve_wait_timeout_ms);
 DECLARE_bool(enable_ysql);
 
 namespace yb::tserver {
@@ -73,6 +75,13 @@ class YSQLLeaseManager::Impl {
   TSLocalLockManagerPtr ts_local_lock_manager() const EXCLUDES(lock_);
 
  private:
+  // Starts PG once the local catalog copy serves at the bound of the new lease epoch, or once
+  // local_catalog_serve_wait_timeout_ms passed, whichever is first. Gives up when a newer epoch
+  // arrived meanwhile, since that epoch restarts PG itself.
+  void DeferredPgRestart(uint64_t epoch, TSLocalLockManagerPtr lock_manager)
+      EXCLUDES(lock_);
+  void RestartPGAndEnableLockState(const TSLocalLockManagerPtr& lock_manager);
+
   tserver::TSLocalLockManagerPtr ResetAndGetTSLocalLockManager() EXCLUDES(lock_);
   void StartTSLocalLockManagerUnlocked() REQUIRES(lock_);
 
@@ -106,6 +115,11 @@ class YSQLLeaseManager::Impl {
   CoarseTimePoint lease_expiry_time_ GUARDED_BY(lease_toggle_lock_);
   bool lease_is_live_ GUARDED_BY(lock_){false};
   uint64_t lease_epoch_ GUARDED_BY(lock_){0};
+
+  // The thread holding PG's start for the latest lease epoch. Only the lease refresher thread
+  // replaces it.
+  scoped_refptr<Thread> deferred_pg_restart_;
+  std::atomic<bool> shutting_down_{false};
 };
 
 // ============================================================================
@@ -185,15 +199,81 @@ Status YSQLLeaseManager::Impl::ProcessLeaseUpdate(
     RETURN_NOT_OK(lock_manager->BootstrapDdlObjectLocks(lease_refresh_info.ddl_lock_entries()));
   }
   if (restart_pg) {
-    WARN_NOT_OK(server_.RestartPG(), "Failed to restart PG postmaster.");
-    if (lock_manager) {
-      // Re-enable shared memory object lock state as it gets disabled as part of shutdown
-      // of the old lock manager. Disabling shared object lock state during switch of lock
-      // manager instances is necessary so as to prevent lock leaks.
-      lock_manager->EnableSharedLockState();
+    auto* local_catalog = server_.local_catalog_replica();
+    if (local_catalog && local_catalog->ShouldHoldPgStart()) {
+      // The refresher thread has to keep refreshing the lease, so the wait runs elsewhere. A wait
+      // for an older epoch notices the newer epoch and ends; it is joined before the new one
+      // starts so that only one exists.
+      if (deferred_pg_restart_) {
+        WARN_NOT_OK(
+            ThreadJoiner(deferred_pg_restart_.get()).Join(),
+            "Failed to join the previous deferred PG restart");
+        deferred_pg_restart_.reset();
+      }
+      const auto epoch = lease_refresh_info.lease_epoch();
+      auto status = Thread::Create(
+          "ysql_lease", "deferred_pg_restart",
+          [this, epoch, lock_manager] { DeferredPgRestart(epoch, lock_manager); },
+          &deferred_pg_restart_);
+      if (status.ok()) {
+        return Status::OK();
+      }
+      LOG(WARNING) << "Could not hold PG's start for the local catalog copy: " << status;
     }
+    RestartPGAndEnableLockState(lock_manager);
   }
   return Status::OK();
+}
+
+void YSQLLeaseManager::Impl::RestartPGAndEnableLockState(
+    const TSLocalLockManagerPtr& lock_manager) {
+  WARN_NOT_OK(server_.RestartPG(), "Failed to restart PG postmaster.");
+  if (lock_manager) {
+    // Re-enable shared memory object lock state as it gets disabled as part of shutdown
+    // of the old lock manager. Disabling shared object lock state during switch of lock
+    // manager instances is necessary so as to prevent lock leaks.
+    lock_manager->EnableSharedLockState();
+  }
+}
+
+void YSQLLeaseManager::Impl::DeferredPgRestart(
+    uint64_t epoch, TSLocalLockManagerPtr lock_manager) {
+  auto* local_catalog = server_.local_catalog_replica();
+  const auto timeout_ms = FLAGS_local_catalog_serve_wait_timeout_ms;
+  const auto deadline = timeout_ms < 0
+                            ? CoarseTimePoint::max()
+                            : CoarseMonoClock::Now() + MonoDelta::FromMilliseconds(timeout_ms);
+  const auto start = CoarseMonoClock::Now();
+  LOG(INFO) << "Holding PG's start until the local catalog copy serves at the bound of lease epoch "
+            << epoch;
+  for (;;) {
+    if (shutting_down_.load(std::memory_order_acquire)) {
+      return;
+    }
+    {
+      SharedLock lock(lock_);
+      if (lease_epoch_ != epoch || !lease_is_live_) {
+        LOG(INFO) << "Lease epoch " << epoch << " was replaced or lost before the local catalog "
+                  << "copy served; not starting PG for it";
+        return;
+      }
+    }
+    // The copy's state, not IsServing(): a major version upgrade in progress keeps the copy out of
+    // the read path without making PG's start wait for anything.
+    if (local_catalog->state() == LocalCatalogServingState::kServing) {
+      LOG(INFO) << "Local catalog copy serves after " << MonoDelta(CoarseMonoClock::Now() - start)
+                << "; starting PG for lease epoch " << epoch;
+      break;
+    }
+    if (CoarseMonoClock::Now() >= deadline) {
+      LOG(WARNING) << "Local catalog copy did not serve within " << timeout_ms << " ms of lease "
+                   << "epoch " << epoch << "; starting PG, whose catalog reads go to master "
+                   << "until it does";
+      break;
+    }
+    SleepFor(50ms);
+  }
+  RestartPGAndEnableLockState(lock_manager);
 }
 
 Status YSQLLeaseManager::Impl::StartYSQLLeaseRefresher() { return lease_client_.Start(); }
@@ -209,6 +289,12 @@ void YSQLLeaseManager::Impl::UpdateMasterAddresses(
 }
 
 void YSQLLeaseManager::Impl::Shutdown() {
+  shutting_down_.store(true, std::memory_order_release);
+  if (deferred_pg_restart_) {
+    WARN_NOT_OK(
+        ThreadJoiner(deferred_pg_restart_.get()).Join(),
+        "Failed to join the deferred PG restart");
+  }
   check_lease_.StartShutdown();
   check_lease_.CompleteShutdown();
   auto lock_manager = ts_local_lock_manager();

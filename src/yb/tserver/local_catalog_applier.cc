@@ -10,7 +10,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 
-#include "yb/tserver/local_catalog_poller.h"
+#include "yb/tserver/local_catalog_applier.h"
 
 #include "yb/cdc/cdc_service.pb.h"
 
@@ -57,16 +57,14 @@
 #include "yb/util/logging.h"
 #include "yb/util/path_util.h"
 #include "yb/util/pb_util.h"
+#include "yb/util/scope_exit.h"
 #include "yb/util/status_format.h"
 #include "yb/util/unique_lock.h"
 #include "yb/util/status_log.h"
 
-DEFINE_RUNTIME_uint32(local_catalog_poll_interval_ms, 100,
-    "Interval between polls of the master system catalog tablet's WAL by the tserver-local copy "
-    "of that tablet, when the previous poll had nothing left to fetch.");
-
-DEFINE_RUNTIME_uint32(local_catalog_poll_rpc_timeout_ms, 30000,
-    "Timeout for one change request to the master system catalog tablet.");
+DEFINE_RUNTIME_uint32(local_catalog_master_rpc_timeout_ms, 30000,
+    "Timeout for one RPC of the tserver-local catalog copy to master: a push request, or a step "
+    "of fetching the copy.");
 
 DEFINE_RUNTIME_uint32(local_catalog_checkpoint_flush_interval_ms, 1000,
     "Minimum interval between writes of the tserver-local catalog copy's WAL position to disk. "
@@ -74,26 +72,31 @@ DEFINE_RUNTIME_uint32(local_catalog_checkpoint_flush_interval_ms, 1000,
     "writes the same keys at the same hybrid times and is therefore harmless.");
 
 DEFINE_RUNTIME_uint32(local_catalog_apply_write_timeout_ms, 60000,
-    "Timeout for one write of polled records into the tserver-local catalog copy.");
+    "Timeout for one write of pushed records into the tserver-local catalog copy.");
+
+DEFINE_RUNTIME_uint32(local_catalog_floor_request_interval_ms, 1000,
+    "While a wait on the tserver-local catalog copy is open, how often the tserver repeats its "
+    "request that master push the copy up to the waited-for hybrid time. A repeat repairs a lost "
+    "request and reaches a new master leader.");
 
 DECLARE_uint32(local_catalog_bootstrap_retry_delay_ms);
 
-DEFINE_test_flag(bool, local_catalog_pause_poller, false,
-    "Stop the tserver-local catalog copy from fetching from master. C stops advancing on its own, "
-    "so the version gate blocks and reads that carry a newer version wait. Records that arrive on "
-    "a lock release are still applied, which is how the push path is tested without pulls.");
-
 DEFINE_test_flag(uint32, local_catalog_pushed_batch_apply_delay_ms, 0,
-    "Sleep this long inside the apply of a batch that arrived on a lock release, so that the "
-    "release handler waiting on it gives up first and the handoff outlives its caller.");
+    "Sleep this long inside the apply of pages that master pushed or carried on a lock release, so "
+    "that the handler waiting on them gives up first and the handoff outlives its caller.");
 
-DEFINE_test_flag(bool, local_catalog_fail_poll, false,
-    "Make every change request to the master system catalog tablet fail.");
+DEFINE_test_flag(bool, local_catalog_pause_applier, false,
+    "Leave pages that master pushes or carries on lock releases queued and unapplied. C stops "
+    "advancing, so the version gate blocks and reads that carry a newer version wait. Floor "
+    "requests are still sent.");
 
-DEFINE_test_flag(bool, local_catalog_poll_checkpoint_too_old, false,
-    "Answer every change request to the master system catalog tablet with CHECKPOINT_TOO_OLD, the "
-    "error master returns once it has garbage collected WAL the copy never consumed. Exercises the "
-    "re-seed path without having to drive master's WAL retention.");
+DEFINE_test_flag(bool, local_catalog_fail_push, false,
+    "Make every push of pages from master fail to apply.");
+
+DEFINE_test_flag(bool, local_catalog_push_reseed, false,
+    "Treat every push of pages as one telling the copy that master no longer retains the WAL "
+    "after its position, so the copy fetches master's tablet again. Exercises the re-seed path "
+    "without having to drive master's WAL retention.");
 
 namespace yb::tserver {
 
@@ -101,20 +104,54 @@ namespace {
 
 const char* const kCheckpointFileName = "local_catalog_checkpoint";
 
+// The records of changes whose operation is above the applied position. A page may start below
+// the position the copy holds, and re-applying the operations in between is
+// avoided rather than relied on to be harmless.
+cdc::GetChangesResponsePB RecordsAbove(const cdc::GetChangesResponsePB& changes, int64_t index) {
+  cdc::GetChangesResponsePB retained;
+  for (const auto& record : changes.records()) {
+    if (OpId::FromPB(record.op_id()).index > index) {
+      *retained.add_records() = record;
+    }
+  }
+  return retained;
+}
+
 }  // namespace
 
-LocalCatalogPoller::LocalCatalogPoller(LocalCatalogReplica& replica, TabletServer& server)
+struct LocalCatalogApplier::FloorRequest {
+  cdc::RequestSysCatalogPushRequestPB req;
+  cdc::RequestSysCatalogPushResponsePB resp;
+  rpc::RpcController controller;
+  std::atomic<bool> done{false};
+  std::atomic<bool> failed{false};
+};
+
+LocalCatalogApplier::LocalCatalogApplier(LocalCatalogReplica& replica, TabletServer& server)
     : replica_(replica),
       server_(server),
-      log_prefix_(Format("LocalCatalogPoller [$0]: ", server.permanent_uuid())),
+      log_prefix_(Format("LocalCatalogApplier [$0]: ", server.permanent_uuid())),
       finder_(server.messenger(), server.proxy_cache(), server.options().GetMasterAddresses()),
       scheduler_(finder_, *this) {}
 
-LocalCatalogPoller::~LocalCatalogPoller() = default;
+LocalCatalogApplier::~LocalCatalogApplier() = default;
 
-Status LocalCatalogPoller::Start() { return scheduler_.Start(); }
+Status LocalCatalogApplier::Start() { return scheduler_.Start(); }
 
-void LocalCatalogPoller::Shutdown() {
+void LocalCatalogApplier::Shutdown() {
+  {
+    UniqueLock lock(push_mutex_);
+    push_shutdown_ = true;
+    for (auto& [_, push] : pending_pushes_) {
+      push->result = STATUS(ShutdownInProgress, "The local catalog copy is shutting down");
+      push->done = true;
+    }
+    pending_pushes_.clear();
+    push_cond_.notify_all();
+    push_cond_.wait(GetLockForCondition(lock), [this]() NO_THREAD_SAFETY_ANALYSIS {
+      return push_callers_ == 0;
+    });
+  }
   scheduler_.Shutdown();
   if (tablet_peer_) {
     WARN_NOT_OK(PersistCheckpoint(/* force= */ true), "Failed to persist the local catalog copy's "
@@ -122,17 +159,24 @@ void LocalCatalogPoller::Shutdown() {
   }
 }
 
-void LocalCatalogPoller::RequestImmediatePoll() { scheduler_.TriggerASAP(); }
+void LocalCatalogApplier::RequestPush(HybridTime floor) {
+  if (floor.is_valid()) {
+    auto current = wait_target_.load(std::memory_order_acquire);
+    while (current < floor.ToUint64() &&
+           !wait_target_.compare_exchange_weak(current, floor.ToUint64())) {}
+  }
+  scheduler_.TriggerASAP();
+}
 
-void LocalCatalogPoller::Init() {}
+void LocalCatalogApplier::Init() {}
 
-void LocalCatalogPoller::ResetProxy() { proxy_.reset(); }
+void LocalCatalogApplier::ResetProxy() { proxy_.reset(); }
 
-std::string LocalCatalogPoller::name() { return "local_catalog_poller"; }
+std::string LocalCatalogApplier::name() { return "local_catalog_applier"; }
 
-const std::string& LocalCatalogPoller::LogPrefix() const { return log_prefix_; }
+const std::string& LocalCatalogApplier::LogPrefix() const { return log_prefix_; }
 
-MonoDelta LocalCatalogPoller::IntervalToNextPoll(int32_t consecutive_failures) {
+MonoDelta LocalCatalogApplier::IntervalToNextPoll(int32_t consecutive_failures) {
   if (!tablet_peer_ && !setup_attempted_) {
     // The delay below is a retry interval, so it must not precede the first attempt: a tserver
     // that already has a copy would otherwise answer nothing for that interval after every
@@ -143,7 +187,7 @@ MonoDelta LocalCatalogPoller::IntervalToNextPoll(int32_t consecutive_failures) {
   if (!tablet_peer_) {
     // Still creating the copy, which can take a while: master's initdb has to finish first, and
     // the remote bootstrap sessions of the cluster's tservers serialize on the source tablet's
-    // checkpoint lock. Retrying at the poll interval would only add log noise.
+    // checkpoint lock. Retrying at the floor request interval would only add log noise.
     return MonoDelta::FromMilliseconds(FLAGS_local_catalog_bootstrap_retry_delay_ms);
   }
   if (consecutive_failures > 0) {
@@ -152,40 +196,99 @@ MonoDelta LocalCatalogPoller::IntervalToNextPoll(int32_t consecutive_failures) {
     return MonoDelta::FromMilliseconds(
         std::min<int64_t>(1000, static_cast<int64_t>(1) << shift));
   }
-  if (have_more_messages_) {
-    return MonoDelta::FromMilliseconds(0);
+  {
+    std::lock_guard lock(push_mutex_);
+    if (!pending_pushes_.empty() && !FLAGS_TEST_local_catalog_pause_applier) {
+      return MonoDelta::FromMilliseconds(0);
+    }
   }
-  return MonoDelta::FromMilliseconds(FLAGS_local_catalog_poll_interval_ms);
+  // The thread wakes for pushed pages and floors, and otherwise only to repeat an open floor
+  // request and to write the applied position to disk.
+  return MonoDelta::FromMilliseconds(std::max<uint32_t>(
+      FLAGS_local_catalog_floor_request_interval_ms, 1));
 }
 
-Status LocalCatalogPoller::Poll() {
-  // First, so that a release waiting on a pushed batch is answered as early as possible, and so
-  // that pushed and pulled batches never interleave. A pushed batch is applied even while pulling
-  // is paused: the pause exists to stop this copy fetching, and a release that carried records
-  // has a caller of its own waiting on it.
-  ApplyPendingPush();
-  if (PREDICT_FALSE(FLAGS_TEST_local_catalog_pause_poller)) {
-    return Status::OK();
-  }
+Status LocalCatalogApplier::Poll() {
+  // First, so that a release or a push waiting on its pages is answered as early as possible.
+  ApplyPendingPushes();
   RETURN_NOT_OK(EnsureLocalTablet());
   // Nothing can be applied until this copy leads its own single-peer group, and winning that
   // election is asynchronous: the term is only established once the new term's no-op commits. A
-  // cycle that runs before then would fetch records it must reject, so it ends here instead.
+  // push that arrives before then is refused, and master re-sends it.
   if (tablet_peer_->LeaderTerm() <= 0) {
     VLOG_WITH_PREFIX(1) << "Waiting to lead the local catalog copy's own group before applying";
     return STATUS(TryAgain, "The local catalog copy does not yet lead its own group");
   }
-  return FetchAndApplyOnce();
+  MaybeSendFloorRequest();
+  return PersistCheckpoint(/* force= */ false);
 }
 
-Result<std::string> LocalCatalogPoller::CheckpointPath() const {
+void LocalCatalogApplier::MaybeSendFloorRequest() {
+  if (floor_request_) {
+    if (!floor_request_->done.load(std::memory_order_acquire)) {
+      return;
+    }
+    if (floor_request_->failed.load(std::memory_order_acquire)) {
+      // Most likely the master leader moved; the next request resolves it again.
+      proxy_.reset();
+    }
+    floor_request_.reset();
+  }
+  auto target = wait_target_.load(std::memory_order_acquire);
+  if (target == 0) {
+    return;
+  }
+  if (replica_.safe_time() >= HybridTime(target)) {
+    wait_target_.compare_exchange_strong(target, 0);
+    return;
+  }
+  const auto now = MonoTime::Now();
+  if (target == last_floor_sent_ && last_floor_sent_at_.Initialized() &&
+      now - last_floor_sent_at_ <
+          MonoDelta::FromMilliseconds(FLAGS_local_catalog_floor_request_interval_ms)) {
+    return;
+  }
+  const auto timeout = MonoDelta::FromMilliseconds(FLAGS_local_catalog_master_rpc_timeout_ms);
+  if (!proxy_) {
+    auto proxy = finder_.CreateProxy<cdc::SysCatalogChangeServiceProxy>(timeout);
+    if (!proxy.ok()) {
+      VLOG_WITH_PREFIX(1) << "No master leader to ask for a push: " << proxy.status();
+      return;
+    }
+    proxy_ = std::move(*proxy);
+  }
+  auto request = std::make_shared<FloorRequest>();
+  request->req.set_requestor_uuid(server_.permanent_uuid());
+  if (!checkpoint_.empty()) {
+    checkpoint_.ToPB(request->req.mutable_applied_op_id());
+  }
+  request->req.set_floor(target);
+  request->controller.set_timeout(timeout);
+  last_floor_sent_ = target;
+  last_floor_sent_at_ = now;
+  replica_.IncFloorRequestsSent();
+  VLOG_WITH_PREFIX(1) << "Asking master to push up to " << LocalCatalogHybridTimeForLog(
+                             HybridTime(target))
+                      << " from " << checkpoint_ << "; the copy holds "
+                      << LocalCatalogHybridTimeForLog(replica_.safe_time());
+  floor_request_ = request;
+  proxy_->RequestSysCatalogPushAsync(
+      request->req, &request->resp, &request->controller, [request] {
+        request->failed.store(
+            !request->controller.status().ok() || request->resp.has_error(),
+            std::memory_order_release);
+        request->done.store(true, std::memory_order_release);
+      });
+}
+
+Result<std::string> LocalCatalogApplier::CheckpointPath() const {
   // Deliberately not in the tablet metadata directory: FsManager::ListTabletIds treats every file
   // there as a tablet id, and on restart the tablet manager would try to parse this file as a
   // tablet superblock and fail to start.
   return JoinPathSegments(server_.fs_manager()->GetDefaultRootDir(), kCheckpointFileName);
 }
 
-Status LocalCatalogPoller::LoadCheckpoint() {
+Status LocalCatalogApplier::LoadCheckpoint() {
   auto path = VERIFY_RESULT(CheckpointPath());
   auto* env = server_.fs_manager()->env();
   if (!env->FileExists(path)) {
@@ -206,11 +309,11 @@ Status LocalCatalogPoller::LoadCheckpoint() {
   checkpoint_ = OpId::FromPB(pb.checkpoint());
   persisted_checkpoint_ = checkpoint_;
   replica_.SetAppliedOpId(checkpoint_);
-  LOG_WITH_PREFIX(INFO) << "Resuming the poll from WAL position " << checkpoint_;
+  LOG_WITH_PREFIX(INFO) << "Resuming from WAL position " << checkpoint_;
   return Status::OK();
 }
 
-Status LocalCatalogPoller::PersistCheckpoint(bool force) {
+Status LocalCatalogApplier::PersistCheckpoint(bool force) {
   if (checkpoint_ == persisted_checkpoint_) {
     return Status::OK();
   }
@@ -235,7 +338,7 @@ Status LocalCatalogPoller::PersistCheckpoint(bool force) {
   return Status::OK();
 }
 
-Result<std::string> LocalCatalogPoller::GetPeerUuid(const HostPort& host_port, MonoDelta timeout) {
+Result<std::string> LocalCatalogApplier::GetPeerUuid(const HostPort& host_port, MonoDelta timeout) {
   server::GenericServiceProxy proxy(&finder_.get_proxy_cache(), host_port);
   server::GetStatusRequestPB req;
   server::GetStatusResponsePB resp;
@@ -245,7 +348,7 @@ Result<std::string> LocalCatalogPoller::GetPeerUuid(const HostPort& host_port, M
   return resp.status().node_instance().permanent_uuid();
 }
 
-Result<bool> LocalCatalogPoller::IsInitDbDone(const HostPort& master_leader, MonoDelta timeout) {
+Result<bool> LocalCatalogApplier::IsInitDbDone(const HostPort& master_leader, MonoDelta timeout) {
   master::MasterAdminProxy proxy(&finder_.get_proxy_cache(), master_leader);
   master::IsInitDbDoneRequestPB req;
   master::IsInitDbDoneResponsePB resp;
@@ -258,7 +361,7 @@ Result<bool> LocalCatalogPoller::IsInitDbDone(const HostPort& master_leader, Mon
   return resp.done();
 }
 
-Status LocalCatalogPoller::EnsureLocalTablet() {
+Status LocalCatalogApplier::EnsureLocalTablet() {
   const bool reseed = replica_.TakeReseedRequest();
   if (tablet_peer_ && !reseed) {
     return Status::OK();
@@ -282,7 +385,7 @@ Status LocalCatalogPoller::EnsureLocalTablet() {
     replica_.SetState(LocalCatalogServingState::kBootstrapping);
   }
 
-  const auto timeout = MonoDelta::FromMilliseconds(FLAGS_local_catalog_poll_rpc_timeout_ms);
+  const auto timeout = MonoDelta::FromMilliseconds(FLAGS_local_catalog_master_rpc_timeout_ms);
 
   // A copy already on disk is reopened without asking master anything. Its existence is itself
   // proof that initdb had finished, since the fresh-copy path below refuses to run before that,
@@ -294,7 +397,7 @@ Status LocalCatalogPoller::EnsureLocalTablet() {
   HostPort master_leader;
   PeerId master_uuid;
   if (!reuse) {
-    // The copy is fetched from the master leader, which is the peer whose WAL the poll then reads.
+    // The copy is fetched from the master leader, which is the peer whose WAL master then pushes.
     master_leader = VERIFY_RESULT(finder_.UpdateMasterLeaderHostPort(timeout));
 
     // initdb writes the system catalog from master's own embedded PG, and the initial system
@@ -315,107 +418,21 @@ Status LocalCatalogPoller::EnsureLocalTablet() {
       /* force_reseed= */ reseed));
   replica_.SetTabletPeer(tablet_peer_);
   RETURN_NOT_OK(LoadCheckpoint());
-  return server_.tablet_manager()->MakeLocalCatalogTabletLeader(tablet_peer_);
-}
-
-Status LocalCatalogPoller::FetchAndApplyOnce() {
-  if (PREDICT_FALSE(FLAGS_TEST_local_catalog_fail_poll)) {
-    replica_.IncPollFailures();
-    return STATUS(IOError, "TEST_local_catalog_fail_poll is set");
-  }
-
-  const auto timeout = MonoDelta::FromMilliseconds(FLAGS_local_catalog_poll_rpc_timeout_ms);
-  if (!proxy_) {
-    proxy_ = VERIFY_RESULT(finder_.CreateProxy<cdc::SysCatalogChangeServiceProxy>(timeout));
-  }
-
-  cdc::GetSysCatalogChangesRequestPB req;
-  req.set_requestor_uuid(server_.permanent_uuid());
-  if (!checkpoint_.empty()) {
-    checkpoint_.ToPB(req.mutable_from_checkpoint()->mutable_op_id());
-  }
-
-  cdc::GetSysCatalogChangesResponsePB resp;
-  rpc::RpcController rpc;
-  rpc.set_timeout(timeout);
-  const auto poll_start = MonoTime::Now();
-  auto status = proxy_->GetSysCatalogChanges(req, &resp, &rpc);
-  replica_.RecordPollLatency(MonoTime::Now() - poll_start);
-  if (PREDICT_FALSE(FLAGS_TEST_local_catalog_poll_checkpoint_too_old) && status.ok() &&
-      !resp.has_error()) {
-    resp.mutable_error()->set_code(cdc::CDCErrorPB::CHECKPOINT_TOO_OLD);
-    StatusToPB(
-        STATUS(NotFound, "TEST_local_catalog_poll_checkpoint_too_old is set"),
-        resp.mutable_error()->mutable_status());
-  }
-  if (!status.ok()) {
-    replica_.IncPollFailures();
-    return status;
-  }
-  if (resp.has_error()) {
-    replica_.IncPollFailures();
-    auto error = StatusFromPB(resp.error().status());
-    if (resp.error().code() == cdc::CDCErrorPB::CHECKPOINT_TOO_OLD) {
-      // Master has garbage collected WAL this copy had not consumed, so it cannot catch up
-      // incrementally. Only a fresh copy of master's tablet can make it current again.
-      LOG_WITH_PREFIX(WARNING) << "Master no longer retains the WAL at " << checkpoint_
-                               << "; re-seeding the local catalog copy: " << error;
-      replica_.RequestReseed();
-    }
-    return error;
-  }
-
-  if (resp.reseed_required()) {
-    // Master restored its system catalog at or above this copy's position. The restore wrote the
-    // restored rows straight into master's RocksDB while master applied the restore operation, so
-    // no WAL record carries them and no batch can bring this copy up to date. Only a fresh copy
-    // of master's tablet can.
-    LOG_WITH_PREFIX(WARNING) << "Master restored its system catalog at or after " << checkpoint_
-                             << "; re-seeding the local catalog copy";
-    have_more_messages_ = false;
-    replica_.RequestReseed();
-    return Status::OK();
-  }
-
-  const auto apply_start = MonoTime::Now();
-  AppliedRecordStats stats;
-  auto apply_status = ApplyRecords(resp, &stats);
-  if (!apply_status.ok()) {
-    replica_.IncApplyFailures();
-    return apply_status;
-  }
-
-  const auto& changes = resp.changes();
-  have_more_messages_ = resp.have_more_messages();
-
-  HybridTime new_c;
-  std::unordered_map<uint32_t, uint64_t> applied_versions;
-  RETURN_NOT_OK(PublishAppliedBatch(changes, stats, &new_c, &applied_versions));
-  if (!changes.records().empty()) {
-    VLOG_WITH_PREFIX(1) << "Applied " << changes.records().size() << " records ("
-                        << stats.ToString() << ") up to WAL position " << checkpoint_
-                        << "; C is now " << LocalCatalogHybridTimeForLog(new_c) << ", versions "
-                        << AsString(applied_versions)
-                        << (have_more_messages_ ? ", master has more to send" : "");
-  }
-  replica_.RecordApplyLatency(MonoTime::Now() - apply_start);
-  if (new_c.is_valid()) {
-    replica_.RecordLag(server_.Clock()->Now().PhysicalDiff(new_c));
-    replica_.OnSafeTimePublished(new_c);
-  }
-
-  RETURN_NOT_OK(PersistCheckpoint(/* force= */ false));
+  RETURN_NOT_OK(server_.tablet_manager()->MakeLocalCatalogTabletLeader(tablet_peer_));
+  // The copy serves only once a page carrying a safe time has been applied, and master pushes to a
+  // copy it does not know about only when asked.
+  RequestPush(server_.Clock()->Now());
   return Status::OK();
 }
 
-std::string LocalCatalogPoller::AppliedRecordStats::ToString() const {
+std::string LocalCatalogApplier::AppliedRecordStats::ToString() const {
   return Format(
       "writes: $0, deletes: $1, of which provisional (into the intents db): $2, "
       "transaction records: $3, metadata records: $4, by table: $5",
       writes, deletes, provisional, transaction_records, metadata_records, by_table);
 }
 
-std::string LocalCatalogPoller::RecordTableName(const cdc::CDCRecordPB& record) const {
+std::string LocalCatalogApplier::RecordTableName(const cdc::CDCRecordPB& record) const {
   if (record.key().empty()) {
     return "unknown";
   }
@@ -440,171 +457,211 @@ std::string LocalCatalogPoller::RecordTableName(const cdc::CDCRecordPB& record) 
   return table_id;
 }
 
-Status LocalCatalogPoller::PublishAppliedBatch(
-    const cdc::GetChangesResponsePB& changes, const AppliedRecordStats& stats, HybridTime* new_c,
-    std::unordered_map<uint32_t, uint64_t>* applied_versions) {
-  if (changes.has_checkpoint() && changes.checkpoint().has_op_id()) {
-    auto batch_end = OpId::FromPB(changes.checkpoint().op_id());
-    // Compared by index alone. This is a position in master's WAL, whose term changes on a master
-    // leader election, and an OpId comparison would then reject a newer position carrying a lower
-    // term and leave the poll re-requesting the same records forever.
-    if (batch_end.index > checkpoint_.index) {
-      checkpoint_ = batch_end;
-      replica_.SetAppliedOpId(checkpoint_);
-    }
+Status LocalCatalogApplier::PublishSafeTime(HybridTime safe_time) {
+  if (!safe_time.is_valid() || safe_time.is_special()) {
+    return Status::OK();
   }
-
   // Everything master certified as present at this safe time is now in the local regular store,
   // so C may advance to it. A[db] is read from the copy at the same time, so the two are published
   // together and a backend can never be told a version whose rows the copy does not hold.
-  if (changes.has_safe_hybrid_time()) {
-    auto safe_time = HybridTime(changes.safe_hybrid_time());
-    if (safe_time.is_valid() && !safe_time.is_special()) {
-      *new_c = safe_time;
-      *applied_versions = VERIFY_RESULT(ReadLocalCatalogVersions(*new_c));
-    }
-  }
-  replica_.PublishAfterApply(*new_c, *applied_versions);
-  if (new_c->is_valid()) {
-    replica_.RecordLag(server_.Clock()->Now().PhysicalDiff(*new_c));
-    replica_.OnSafeTimePublished(*new_c);
-  }
-  return PersistCheckpoint(/* force= */ false);
+  auto applied_versions = VERIFY_RESULT(ReadLocalCatalogVersions(safe_time));
+  replica_.PublishAfterApply(safe_time, applied_versions);
+  replica_.RecordLag(server_.Clock()->Now().PhysicalDiff(safe_time));
+  replica_.OnSafeTimePublished(safe_time);
+  VLOG_WITH_PREFIX(2) << "Published C " << LocalCatalogHybridTimeForLog(safe_time) << " at "
+                      << checkpoint_ << ", versions " << AsString(applied_versions);
+  return Status::OK();
 }
 
-Status LocalCatalogPoller::ApplyPushedBatch(
-    const cdc::GetSysCatalogChangesResponsePB& batch, CoarseTimePoint deadline) {
+void LocalCatalogApplier::AdvanceTo(const OpId& end) {
+  // Compared by index alone. This is a position in master's WAL, whose term changes on a master
+  // leader election, and an OpId comparison would then reject a newer position carrying a lower
+  // term and leave the copy re-requesting the same records forever.
+  if (end.index > checkpoint_.index) {
+    checkpoint_ = end;
+    replica_.SetAppliedOpId(checkpoint_);
+  }
+}
+
+Result<LocalCatalogPushOutcome> LocalCatalogApplier::ApplyPushedPages(
+    std::shared_ptr<const PushSysCatalogChangesRequestPB> pages, CoarseTimePoint deadline,
+    bool wait) {
+  int64_t first_from = 0;
+  if (!pages->pages().empty() && pages->pages(0).has_page_from()) {
+    first_from = pages->pages(0).page_from().index();
+  }
   auto push = std::make_shared<PendingPush>();
-  push->batch = batch;
+  push->pages = std::move(pages);
   {
     std::lock_guard lock(push_mutex_);
-    if (pending_push_) {
-      // One pushed batch at a time. A second release's records are of no use to this copy until
-      // the first has been applied, and its sender can wait for the poller instead.
-      return STATUS(TryAgain, "Another pushed system catalog batch is already being applied");
+    if (push_shutdown_) {
+      return STATUS(ShutdownInProgress, "The local catalog copy is shutting down");
     }
-    pending_push_ = push;
+    pending_pushes_.emplace(first_from, push);
+    ++push_callers_;
   }
-  RequestImmediatePoll();
+  auto leave = ScopeExit([this] {
+    {
+      std::lock_guard lock(push_mutex_);
+      --push_callers_;
+    }
+    push_cond_.notify_all();
+  });
+  scheduler_.TriggerASAP();
+  if (!wait) {
+    return LocalCatalogPushOutcome{.applied = replica_.applied_op_id(),
+                                   .safe_time = replica_.safe_time()};
+  }
   UniqueLock lock(push_mutex_);
   while (!push->done) {
+    if (push_shutdown_) {
+      return STATUS(ShutdownInProgress, "The local catalog copy is shutting down");
+    }
     if (push_cond_.wait_until(GetLockForCondition(lock), deadline) == std::cv_status::timeout) {
-      // Withdraw it if the poll thread has not taken it yet; if it has, it owns a reference of
-      // its own and completes into the shared state, which this reference keeps alive. Either way
-      // this caller stops waiting and falls back to the gate wait.
-      if (pending_push_ == push) {
-        pending_push_.reset();
+      // Withdraw it if the apply thread has not taken it yet; if it has, it owns a reference of
+      // its own and completes into the shared state, which this reference keeps alive.
+      for (auto it = pending_pushes_.begin(); it != pending_pushes_.end(); ++it) {
+        if (it->second == push) {
+          pending_pushes_.erase(it);
+          break;
+        }
       }
-      return STATUS(TimedOut, "Timed out waiting for a pushed system catalog batch to apply");
+      return STATUS(TimedOut, "Timed out waiting for pushed system catalog pages to apply");
     }
   }
   return push->result;
 }
 
-void LocalCatalogPoller::CompletePendingPush(
-    const std::shared_ptr<PendingPush>& push, const Status& status) {
+void LocalCatalogApplier::CompletePendingPush(
+    const std::shared_ptr<PendingPush>& push, Result<LocalCatalogPushOutcome> result) {
   {
     std::lock_guard lock(push_mutex_);
-    push->result = status;
+    push->result = std::move(result);
     push->done = true;
   }
   push_cond_.notify_all();
 }
 
-void LocalCatalogPoller::ApplyPendingPush() {
-  std::shared_ptr<PendingPush> push;
-  {
-    std::lock_guard lock(push_mutex_);
-    // Moved out of the slot, so it is empty for the whole apply and a second release does not
-    // wait behind this one only to find its own batch stale.
-    push = std::move(pending_push_);
-    pending_push_.reset();
-  }
-  if (!push) {
+void LocalCatalogApplier::ApplyPendingPushes() {
+  if (PREDICT_FALSE(FLAGS_TEST_local_catalog_pause_applier)) {
     return;
   }
-  if (!tablet_peer_) {
-    // A re-seed took the tablet away between the handoff and now. There is nothing to apply into,
-    // and making the caller wait out its deadline for that would be pointless.
-    CompletePendingPush(
-        push, STATUS(IllegalState, "The local catalog copy has no tablet to apply a pushed batch"));
-    return;
+  for (;;) {
+    std::shared_ptr<PendingPush> push;
+    {
+      std::lock_guard lock(push_mutex_);
+      if (pending_pushes_.empty()) {
+        return;
+      }
+      push = std::move(pending_pushes_.begin()->second);
+      pending_pushes_.erase(pending_pushes_.begin());
+    }
+    if (!tablet_peer_) {
+      // A re-seed took the tablet away, or the copy is still being created. There is nothing to
+      // apply into, and making the caller wait out its deadline for that would be pointless.
+      CompletePendingPush(
+          push, STATUS(IllegalState, "The local catalog copy has no tablet to apply pages to"));
+      continue;
+    }
+    if (tablet_peer_->LeaderTerm() <= 0) {
+      CompletePendingPush(
+          push, STATUS(IllegalState, "The local catalog copy does not yet lead its own group"));
+      continue;
+    }
+    auto result = DoApplyPages(*push->pages);
+    if (!result.ok()) {
+      VLOG_WITH_PREFIX(1) << "Could not apply pushed pages: " << result.status();
+    }
+    CompletePendingPush(push, std::move(result));
   }
-  if (tablet_peer_->LeaderTerm() <= 0) {
-    // Same condition the poll path checks, answered rather than attempted: the release that pushed
-    // this batch waits for the poll instead, and a rejection here is not a failure to apply.
-    CompletePendingPush(
-        push, STATUS(IllegalState, "The local catalog copy does not yet lead its own group"));
-    return;
-  }
-  CompletePendingPush(push, DoApplyPushedBatch(push->batch));
 }
 
-Status LocalCatalogPoller::DoApplyPushedBatch(const cdc::GetSysCatalogChangesResponsePB& batch) {
+Result<LocalCatalogPushOutcome> LocalCatalogApplier::DoApplyPages(
+    const PushSysCatalogChangesRequestPB& pages) {
   if (PREDICT_FALSE(FLAGS_TEST_local_catalog_pushed_batch_apply_delay_ms > 0)) {
     SleepFor(MonoDelta::FromMilliseconds(FLAGS_TEST_local_catalog_pushed_batch_apply_delay_ms));
   }
-  if (batch.reseed_required()) {
-    LOG_WITH_PREFIX(WARNING) << "A pushed system catalog batch crossed a restore of master's "
-                             << "system catalog; re-seeding the local catalog copy";
+  if (PREDICT_FALSE(FLAGS_TEST_local_catalog_fail_push)) {
+    replica_.IncApplyFailures();
+    return STATUS(IOError, "TEST_local_catalog_fail_push is set");
+  }
+  if (PREDICT_FALSE(FLAGS_TEST_local_catalog_push_reseed)) {
+    LOG_WITH_PREFIX(WARNING) << "TEST_local_catalog_push_reseed is set; re-seeding";
     replica_.RequestReseed();
-    return STATUS(
-        IllegalState, "A pushed system catalog batch crossed a restore of master's system catalog");
+    return STATUS(IllegalState, "The local catalog copy must be fetched again from master");
   }
-  const auto& changes = batch.changes();
+  SCHECK_GE(
+      pages.master_term(), highest_master_term_, IllegalState,
+      Format("Pages from master term $0 are older than the term $1 pages were applied from",
+             pages.master_term(), highest_master_term_));
+  highest_master_term_ = pages.master_term();
 
-  // What establishes that nothing is missing is where master sliced from, not where the first
-  // record sits. Master fetched everything above that position, so every record between it and
-  // the batch's end is in the slice; but plenty of WAL operations produce no record at all -- a
-  // history cutoff, the no-op of an election, a transaction status update that is not an apply --
-  // so the first record's position can be well above this copy's own and nothing be absent.
-  SCHECK(
-      batch.has_slice_from(), IllegalState,
-      "A pushed system catalog batch did not say which position it was sliced from");
-  const auto slice_from = OpId::FromPB(batch.slice_from());
-  SCHECK_LE(
-      slice_from.index, checkpoint_.index, IllegalState,
-      Format(
-          "A pushed system catalog batch was sliced from $0, above the applied position $1, so "
-          "records between them would be missing",
-          slice_from, checkpoint_));
-
-  // Master slices from a position it learned by heartbeat, which is up to one heartbeat old, so a
-  // slice normally repeats records this copy already has. Records carry the position of the
-  // operation that produced them and one operation's records all share it, so dropping on the
-  // index never splits an operation.
-  cdc::GetSysCatalogChangesResponsePB retained;
-  auto* retained_changes = retained.mutable_changes();
-  *retained_changes->mutable_checkpoint() = changes.checkpoint();
-  if (changes.has_safe_hybrid_time()) {
-    retained_changes->set_safe_hybrid_time(changes.safe_hybrid_time());
-  }
-  for (const auto& record : changes.records()) {
-    if (OpId::FromPB(record.op_id()).index > checkpoint_.index) {
-      *retained_changes->add_records() = record;
+  const auto apply_start = MonoTime::Now();
+  LocalCatalogPushOutcome outcome;
+  HybridTime publish;
+  AppliedRecordStats stats;
+  size_t applied_records = 0;
+  for (const auto& page : pages.pages()) {
+    const auto from = OpId::FromPB(page.page_from());
+    const auto end = OpId::FromPB(page.page_end());
+    if (from.index > checkpoint_.index) {
+      // Not every operation produces a record, so what establishes that nothing is missing is
+      // where the page starts, not where its first record sits.
+      VLOG_WITH_PREFIX(1) << "A pushed page starts at " << from << ", above the applied position "
+                          << checkpoint_ << "; asking master to re-send from there";
+      outcome.gap = true;
+      break;
+    }
+    if (page.reseed_required()) {
+      if (end.index <= checkpoint_.index && end.index > 0) {
+        continue;
+      }
+      LOG_WITH_PREFIX(WARNING) << "Master's system catalog WAL after " << checkpoint_
+                               << " holds a restore or is no longer retained; re-seeding the "
+                               << "local catalog copy";
+      replica_.RequestReseed();
+      return STATUS(IllegalState, "The local catalog copy must be fetched again from master");
+    }
+    if (end.index > checkpoint_.index) {
+      cdc::GetChangesResponsePB changes;
+      if (!page.records().empty() && !changes.ParseFromString(page.records())) {
+        return STATUS(Corruption, "Could not parse a pushed system catalog page");
+      }
+      auto status = from.index < checkpoint_.index
+                        ? ApplyRecords(RecordsAbove(changes, checkpoint_.index), &stats)
+                        : ApplyRecords(changes, &stats);
+      if (!status.ok()) {
+        replica_.IncApplyFailures();
+        return status;
+      }
+      applied_records += changes.records_size();
+      AdvanceTo(end);
+    }
+    if (page.has_safe_time() && checkpoint_.index >= end.index) {
+      const HybridTime safe_time(page.safe_time());
+      if (!publish.is_valid() || safe_time > publish) {
+        publish = safe_time;
+      }
     }
   }
-
-  AppliedRecordStats stats;
-  auto apply_status = ApplyRecords(retained, &stats);
-  if (!apply_status.ok()) {
-    replica_.IncApplyFailures();
-    return apply_status;
+  if (publish.is_valid() && publish > replica_.safe_time()) {
+    RETURN_NOT_OK(PublishSafeTime(publish));
   }
-
-  HybridTime new_c;
-  std::unordered_map<uint32_t, uint64_t> applied_versions;
-  RETURN_NOT_OK(PublishAppliedBatch(*retained_changes, stats, &new_c, &applied_versions));
-  VLOG_WITH_PREFIX(1) << "Applied a pushed batch of " << retained_changes->records().size()
-                      << " records (" << stats.ToString() << ") up to WAL position " << checkpoint_
-                      << "; C is now " << LocalCatalogHybridTimeForLog(new_c) << ", versions "
-                      << AsString(applied_versions);
-  return Status::OK();
+  replica_.RecordApplyLatency(MonoTime::Now() - apply_start);
+  if (applied_records > 0) {
+    VLOG_WITH_PREFIX(1) << "Applied " << pages.pages_size() << " pushed pages, "
+                        << applied_records << " records (" << stats.ToString()
+                        << ") up to WAL position " << checkpoint_ << "; C is now "
+                        << LocalCatalogHybridTimeForLog(replica_.safe_time());
+  }
+  RETURN_NOT_OK(PersistCheckpoint(/* force= */ false));
+  outcome.applied = checkpoint_;
+  outcome.safe_time = replica_.safe_time();
+  return outcome;
 }
 
-Status LocalCatalogPoller::ApplyRecords(
-    const cdc::GetSysCatalogChangesResponsePB& resp, AppliedRecordStats* stats) {
-  const auto& changes = resp.changes();
+Status LocalCatalogApplier::ApplyRecords(
+    const cdc::GetChangesResponsePB& changes, AppliedRecordStats* stats) {
   if (changes.records().empty()) {
     return Status::OK();
   }
@@ -703,7 +760,7 @@ Status LocalCatalogPoller::ApplyRecords(
   return flush();
 }
 
-Status LocalCatalogPoller::WriteBatchToLocalTablet(
+Status LocalCatalogApplier::WriteBatchToLocalTablet(
     const std::shared_ptr<WriteRequestMsg>& write_request) {
   auto tablet = VERIFY_RESULT(tablet_peer_->shared_tablet());
   auto leader_term = tablet_peer_->LeaderTerm();
@@ -729,7 +786,7 @@ Status LocalCatalogPoller::WriteBatchToLocalTablet(
   return Status::OK();
 }
 
-Status LocalCatalogPoller::ApplyChangeMetadataRecord(const cdc::CDCRecordPB& record) {
+Status LocalCatalogApplier::ApplyChangeMetadataRecord(const cdc::CDCRecordPB& record) {
   SCHECK(
       record.has_change_metadata_request(), InvalidArgument,
       "A CHANGE_METADATA record must carry a change metadata request");
@@ -752,7 +809,7 @@ Status LocalCatalogPoller::ApplyChangeMetadataRecord(const cdc::CDCRecordPB& rec
   return synchronizer.Wait();
 }
 
-Result<std::unordered_map<uint32_t, uint64_t>> LocalCatalogPoller::ReadLocalCatalogVersions(
+Result<std::unordered_map<uint32_t, uint64_t>> LocalCatalogApplier::ReadLocalCatalogVersions(
     HybridTime read_time) {
   std::unordered_map<uint32_t, uint64_t> versions;
   auto tablet = VERIFY_RESULT(tablet_peer_->shared_tablet());

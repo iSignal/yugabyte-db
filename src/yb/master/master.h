@@ -58,10 +58,6 @@
 
 namespace yb {
 
-namespace cdc {
-class SysCatalogChangeServiceImpl;
-}  // namespace cdc
-
 class MaintenanceManager;
 class RpcServer;
 class ServerEntryPB;
@@ -113,12 +109,9 @@ class Master : public tserver::DbServerBase {
 
   MasterTabletServer* tablet_server() const { return master_tablet_server_.get(); }
 
-  // The service that ships the system catalog tablet's WAL to the tserver-local copies of it,
-  // kept here so the lock release path can fetch a batch in process rather than over RPC. Null
-  // when enable_local_tserver_catalog is off, because the service is not registered then.
-  cdc::SysCatalogChangeServiceImpl* sys_catalog_change_service() const {
-    return sys_catalog_change_service_.get();
-  }
+  // Pushes the system catalog tablet's WAL to the tserver-local copies of it. Null when
+  // enable_local_tserver_catalog is off.
+  SysCatalogPusher* sys_catalog_pusher() const { return sys_catalog_pusher_.get(); }
 
   CatalogManagerIf* catalog_manager() const;
 
@@ -299,8 +292,7 @@ class Master : public tserver::DbServerBase {
   // Master's tablet server implementation used to host virtual tables like system.peers.
   std::unique_ptr<MasterTabletServer> master_tablet_server_;
 
-  // Registered as an RPC service and held here for the in-process release path.
-  std::shared_ptr<cdc::SysCatalogChangeServiceImpl> sys_catalog_change_service_;
+  std::shared_ptr<SysCatalogPusher> sys_catalog_pusher_;
 
   std::unique_ptr<SysCatalogTable> sys_catalog_;
   std::unique_ptr<TSManager> ts_manager_;

@@ -267,6 +267,14 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
 
   size_t LogCacheSize();
   size_t EvictLogCache(size_t bytes_to_evict);
+  void SetEvictLogCacheOnlyForMemory(bool value);
+
+  // See PeerMessageQueue::ReadCommittedMessages.
+  Result<ReadOpsResult> ReadCommittedMessages(
+      const OpId& from, int64_t to_index, size_t max_size_bytes, CoarseTimePoint deadline);
+
+  // The leader's committed and majority-replicated indexes, read together.
+  std::pair<int64_t, int64_t> GetCommittedAndMajorityReplicatedIndex();
 
   const scoped_refptr<log::Log>& log() { return log_; }
 

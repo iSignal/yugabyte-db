@@ -270,6 +270,50 @@ Result<bool> PopulateChangeMetadataRecord(
   return true;
 }
 
+}  // namespace
+
+Result<bool> PopulateXClusterRecords(
+    const XClusterGetChangesContext& context, const consensus::LWReplicateMsg& msg) {
+  const auto records_before = context.resp->records_size();
+  bool ends_batch = false;
+  switch (msg.op_type()) {
+    case consensus::OperationType::UPDATE_TRANSACTION_OP:
+      RETURN_NOT_OK(PopulateTransactionRecord(context, msg));
+      break;
+    case consensus::OperationType::WRITE_OP:
+      RETURN_NOT_OK(PopulateWriteRecord(context, msg));
+      break;
+    case consensus::OperationType::SPLIT_OP:
+      RETURN_NOT_OK(PopulateSplitOpRecord(context, msg));
+      break;
+    case consensus::OperationType::CHANGE_METADATA_OP:
+      // Change metadata should be the last record in the batch.
+      ends_batch = VERIFY_RESULT(PopulateChangeMetadataRecord(context, msg));
+      break;
+    case consensus::OperationType::SNAPSHOT_OP:
+      ends_batch = context.update_on_snapshot_op_func &&
+                   VERIFY_RESULT(context.update_on_snapshot_op_func(msg.ToGoogleProtobuf()));
+      break;
+    default:
+      // Nothing to do for other operation types.
+      break;
+  }
+  // The system catalog change stream's consumers need to know which operation each record came
+  // from, because they drop the records of operations they have already applied. Other streams
+  // have one consumer that always reads from its own position, so they pay nothing for it.
+  if (context.stream_metadata->IsSysCatalogChangeStream()) {
+    // One message can produce several records, one per row it wrote, and they all share its
+    // position.
+    const auto op_id = OpId::FromPB(msg.id());
+    for (auto i = records_before; i < context.resp->records_size(); ++i) {
+      op_id.ToPB(context.resp->mutable_records(i)->mutable_op_id());
+    }
+  }
+  return ends_batch;
+}
+
+namespace {
+
 HybridTime GetSafeTimeForTarget(
     const HybridTime leader_safe_time,
     HybridTime ht_of_last_returned_message,
@@ -394,48 +438,10 @@ Status GetChangesForXCluster(const XClusterGetChangesContext& context) {
   OpId previous_checkpoint = context.from_op_id;
 
   bool exit_early = false;
-  // The system catalog change stream's consumers need to know which operation each record came
-  // from, because master slices one batch across tservers sitting at different positions. Other
-  // streams have one consumer that always reads from its own position, so they pay nothing for it.
-  const bool stamp_record_op_ids = context.stream_metadata->IsSysCatalogChangeStream();
-
   for (const auto& msg_ptr : messages) {
     const auto& msg = *msg_ptr;
     checkpoint = OpId::FromPB(msg.id());
-    const auto records_before = context.resp->records_size();
-    switch (msg.op_type()) {
-      case consensus::OperationType::UPDATE_TRANSACTION_OP:
-        RETURN_NOT_OK(PopulateTransactionRecord(context, msg));
-        break;
-      case consensus::OperationType::WRITE_OP:
-        RETURN_NOT_OK(PopulateWriteRecord(context, msg));
-        break;
-      case consensus::OperationType::SPLIT_OP:
-        RETURN_NOT_OK(PopulateSplitOpRecord(context, msg));
-        break;
-      case consensus::OperationType::CHANGE_METADATA_OP:
-        if (VERIFY_RESULT(PopulateChangeMetadataRecord(context, msg))) {
-          // Change metadata should be the last record in the batch.
-          exit_early = true;
-        }
-        break;
-      case consensus::OperationType::SNAPSHOT_OP:
-        if (context.update_on_snapshot_op_func &&
-            VERIFY_RESULT(context.update_on_snapshot_op_func(msg.ToGoogleProtobuf()))) {
-          exit_early = true;
-        }
-        break;
-      default:
-        // Nothing to do for other operation types.
-        break;
-    }
-    if (stamp_record_op_ids) {
-      // One message can produce several records, one per row it wrote, and they all share its
-      // position.
-      for (auto i = records_before; i < context.resp->records_size(); ++i) {
-        checkpoint.ToPB(context.resp->mutable_records(i)->mutable_op_id());
-      }
-    }
+    exit_early = VERIFY_RESULT(PopulateXClusterRecords(context, msg));
     ht_of_last_returned_message = HybridTime(msg.hybrid_time());
 
     if (exit_early) {

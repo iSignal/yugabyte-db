@@ -3986,6 +3986,19 @@ size_t RaftConsensus::EvictLogCache(size_t bytes_to_evict) {
   return queue_->EvictLogCache(bytes_to_evict);
 }
 
+void RaftConsensus::SetEvictLogCacheOnlyForMemory(bool value) {
+  queue_->SetEvictLogCacheOnlyForMemory(value);
+}
+
+Result<ReadOpsResult> RaftConsensus::ReadCommittedMessages(
+    const OpId& from, int64_t to_index, size_t max_size_bytes, CoarseTimePoint deadline) {
+  return queue_->ReadCommittedMessages(from, to_index, max_size_bytes, deadline);
+}
+
+std::pair<int64_t, int64_t> RaftConsensus::GetCommittedAndMajorityReplicatedIndex() {
+  return queue_->GetCommittedAndMajorityReplicatedIndex();
+}
+
 Result<RetryableRequests> RaftConsensus::GetRetryableRequests() const {
   auto lock = state_->LockForRead();
   if(state_->state() != ReplicaState::kRunning) {

@@ -32,6 +32,8 @@
 
 #include "yb/tserver/heartbeater.h"
 
+#include <optional>
+
 #include <cstdint>
 #include <iosfwd>
 #include <memory>
@@ -135,14 +137,21 @@ class HeartbeatPoller : public MasterLeaderPollerInterface {
   // catalog change committed at or below the time master read the heartbeat's versions at. True
   // when the feature is off or the copy is not serving, because then catalog reads go to master.
   bool LocalCatalogCopyHoldsHeartbeatVersions() {
+    return LocalCatalogCopyHoldsVersionsOf(last_hb_response_);
+  }
+
+  bool LocalCatalogCopyHoldsVersionsOf(const master::TSHeartbeatResponsePB& response) {
     auto* local_catalog = server_.local_catalog_replica();
     if (!local_catalog || !local_catalog->IsServing() ||
-        !last_hb_response_.has_db_catalog_versions_read_time()) {
+        !response.has_db_catalog_versions_read_time()) {
       return true;
     }
     return local_catalog->HoldsCatalogStateAt(
-        HybridTime(last_hb_response_.db_catalog_versions_read_time()));
+        HybridTime(response.db_catalog_versions_read_time()));
   }
+
+  // Publishes the catalog versions of a heartbeat response to this tserver's backends.
+  void PublishCatalogVersions(const master::TSHeartbeatResponsePB& response);
 
   TabletServer& server_;
   MasterLeaderFinder& finder_;
@@ -153,6 +162,12 @@ class HeartbeatPoller : public MasterLeaderPollerInterface {
 
   // The most recent response from a heartbeat.
   master::TSHeartbeatResponsePB last_hb_response_;
+
+  // A version report the gate held back because the local catalog copy did not yet hold the state
+  // master read it at. Published as soon as the copy holds that state, even if later reports were
+  // read later still: each report is read at a newer time than the copy reached for the previous
+  // one, so comparing only the latest report against the copy can skip every report.
+  std::optional<master::TSHeartbeatResponsePB> held_version_report_;
 
   // Full reports can take multiple heartbeats.
   // This field has value of the sequence number of the first heartbeat in this scenario.
@@ -332,6 +347,30 @@ std::string HeartbeatPoller::name() {
 }
 
 const std::string& HeartbeatPoller::LogPrefix() const { return server_.LogPrefix(); }
+
+void HeartbeatPoller::PublishCatalogVersions(const master::TSHeartbeatResponsePB& response) {
+  if (FLAGS_log_ysql_catalog_versions) {
+    VLOG_WITH_FUNC(1) << "got master db catalog version data: "
+                      << response.db_catalog_version_data().ShortDebugString()
+                      << " db inval messages: "
+                      << tserver::CatalogInvalMessagesDataDebugString(response);
+  }
+  if (FLAGS_ysql_yb_enable_invalidation_messages) {
+    if (response.has_db_catalog_inval_messages_data()) {
+      server_.SetYsqlDBCatalogVersionsWithInvalMessages(
+          response.db_catalog_version_data(), response.db_catalog_inval_messages_data());
+    } else {
+      server_.SetYsqlDBCatalogVersions(response.db_catalog_version_data());
+      // If we only have catalog versions but not invalidation messages, it means that the last
+      // heartbeat response was only able to read pg_yb_catalog_version, but the reading of
+      // pg_yb_invalidation_messages failed. Clear the fingerprint so that next heartbeat
+      // can read pg_yb_invalidation_messages again.
+      server_.ResetCatalogVersionsFingerprint();
+    }
+  } else {
+    server_.SetYsqlDBCatalogVersions(response.db_catalog_version_data());
+  }
+}
 
 Status HeartbeatPoller::TryHeartbeat() {
   master::TSHeartbeatRequestPB req;
@@ -557,42 +596,31 @@ Status HeartbeatPoller::TryHeartbeat() {
       PREDICT_TRUE(!FLAGS_TEST_tserver_disable_catalog_refresh_on_heartbeat)) {
     // In per-db catalog version mode (the only supported mode) we never use ysql_catalog_version.
     DCHECK(!last_hb_response_.has_ysql_catalog_version());
+    if (held_version_report_ && LocalCatalogCopyHoldsVersionsOf(*held_version_report_)) {
+      VLOG_WITH_FUNC(1) << "Publishing the held master db catalog version data read at "
+                        << held_version_report_->db_catalog_versions_read_time();
+      PublishCatalogVersions(*held_version_report_);
+      held_version_report_.reset();
+    }
     if (last_hb_response_.has_db_catalog_version_data() &&
         !LocalCatalogCopyHoldsHeartbeatVersions()) {
       // The exposure gate on the heartbeat path. Master read these versions at
       // db_catalog_versions_read_time, so publishing them now would tell a backend a version
       // whose catalog rows the local copy does not yet hold, and the backend's next catalog read
-      // would be served from a copy that lacks them. The versions are a full report, so skipping
-      // this response loses nothing: the next heartbeat after the poller catches up publishes
-      // them. Lowering the versions instead is not an option here, because a version below the
-      // one already published is treated as a stale master report and eventually crashes the
-      // tserver.
-      VLOG_WITH_FUNC(1) << "Skipping master db catalog version data until the local catalog copy "
+      // would be served from a copy that lacks them. The report is held, and published by a later
+      // heartbeat once the copy holds its read time; the first report held is kept until then,
+      // since a later one was read later still. Lowering the versions instead is not an option
+      // here, because a version below the one already published is treated as a stale master
+      // report and eventually crashes the tserver.
+      VLOG_WITH_FUNC(1) << "Holding master db catalog version data until the local catalog copy "
                         << "holds the state it was read at: "
                         << last_hb_response_.db_catalog_versions_read_time();
+      if (!held_version_report_) {
+        held_version_report_ = last_hb_response_;
+      }
     } else if (last_hb_response_.has_db_catalog_version_data()) {
-      if (FLAGS_log_ysql_catalog_versions) {
-        VLOG_WITH_FUNC(1) << "got master db catalog version data: "
-                          << last_hb_response_.db_catalog_version_data().ShortDebugString()
-                          << " db inval messages: "
-                          << tserver::CatalogInvalMessagesDataDebugString(last_hb_response_);
-      }
-      if (FLAGS_ysql_yb_enable_invalidation_messages) {
-        if (last_hb_response_.has_db_catalog_inval_messages_data()) {
-          server_.SetYsqlDBCatalogVersionsWithInvalMessages(
-              last_hb_response_.db_catalog_version_data(),
-              last_hb_response_.db_catalog_inval_messages_data());
-        } else {
-          server_.SetYsqlDBCatalogVersions(last_hb_response_.db_catalog_version_data());
-          // If we only have catalog versions but not invalidation messages, it means that the last
-          // heartbeat response was only able to read pg_yb_catalog_version, but the reading of
-          // pg_yb_invalidation_messages failed. Clear the fingerprint so that next heartbeat
-          // can read pg_yb_invalidation_messages again.
-          server_.ResetCatalogVersionsFingerprint();
-        }
-      } else {
-        server_.SetYsqlDBCatalogVersions(last_hb_response_.db_catalog_version_data());
-      }
+      held_version_report_.reset();
+      PublishCatalogVersions(last_hb_response_);
     } else {
       // The master does not pass back any catalog versions. This can happen in
       // several cases:

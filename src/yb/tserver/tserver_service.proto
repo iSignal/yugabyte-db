@@ -160,6 +160,9 @@ service TabletServerService {
       returns (WaitForLockersMultipleResponsePB) {
     option (yb.rpc.send_metadata) = true;
   }
+  // Master pushes pages of its system catalog WAL to the tserver-local copy of that tablet.
+  rpc PushSysCatalogChanges(PushSysCatalogChangesRequestPB)
+      returns (PushSysCatalogChangesResponsePB);
   rpc GetYSQLLeaseInfo(GetYSQLLeaseInfoRequestPB) returns (GetYSQLLeaseInfoResponsePB) {
     option (yb.rpc.trivial) = true;
   };

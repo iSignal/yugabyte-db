@@ -505,7 +505,10 @@ Result<ReadOpsResult> LogCache::ReadOps(
           continue;
         }
 
-        auto current_message_size = TotalByteSizeForMessage(*msg);
+        if (iter->second.read_size == 0) {
+          iter->second.read_size = TotalByteSizeForMessage(*msg);
+        }
+        auto current_message_size = iter->second.read_size;
         remaining_space -= current_message_size;
         if (remaining_space < 0 && !result.messages.empty()) {
           break;

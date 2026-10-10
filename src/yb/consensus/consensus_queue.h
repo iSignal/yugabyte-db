@@ -399,6 +399,14 @@ class PeerMessageQueue {
   Result<XClusterReadOpsResult> ReadReplicatedMessagesForXCluster(
       const yb::OpId& last_op_id, const CoarseTimePoint deadline, bool fetch_single_entry);
 
+  // Reads committed operations in (last_op_id.index, min(to_index, committed index)], at most
+  // max_size_bytes of them but always at least one when any is in range. Returns no operations when
+  // nothing in that range is committed yet. Operations below the log cache are read from disk; a
+  // range that is no longer retained returns NotFound with CDCErrorPB::CHECKPOINT_TOO_OLD.
+  Result<ReadOpsResult> ReadCommittedMessages(
+      const yb::OpId& last_op_id, int64_t to_index, size_t max_size_bytes,
+      CoarseTimePoint deadline);
+
   // Read replicated log records starting from the OpId immediately after last_op_id.
   Result<ReadOpsResult> ReadReplicatedMessagesForCDC(
       const yb::OpId& last_op_id, int64_t* last_replicated_opid_index = nullptr,
@@ -422,6 +430,14 @@ class PeerMessageQueue {
 
   size_t LogCacheSize();
   size_t EvictLogCache(size_t bytes_to_evict);
+
+  std::pair<int64_t, int64_t> GetCommittedAndMajorityReplicatedIndex();
+
+  // When set, operations stay in the log cache after every peer has received them, and leave it
+  // only when the cache's per-tablet or server-wide memory limit requires it.
+  void SetEvictLogCacheOnlyForMemory(bool value) {
+    evict_log_cache_only_for_memory_.store(value, std::memory_order_release);
+  }
 
   // Start memory tracking of following operations in case they are still present in our caches.
   void TrackOperationsMemory(const OpIds& op_ids);
@@ -604,8 +620,6 @@ class PeerMessageQueue {
       const yb::OpId& last_op_id, int64_t to_index, log::ObeyMemoryLimit obey_memory_limit,
       CoarseTimePoint deadline = CoarseTimePoint::max(), bool fetch_single_entry = false);
 
-  std::pair<int64_t, int64_t> GetCommittedAndMajorityReplicatedIndex();
-
   Result<int64_t> GetStartOpIdIndex(int64_t start_index);
 
   void TEST_WaitForNotificationToFinish();
@@ -636,6 +650,8 @@ class PeerMessageQueue {
   DFAKE_MUTEX(append_fake_lock_);
 
   LogCache log_cache_;
+
+  std::atomic<bool> evict_log_cache_only_for_memory_{false};
 
   std::shared_ptr<MemTracker> operations_mem_tracker_;
 

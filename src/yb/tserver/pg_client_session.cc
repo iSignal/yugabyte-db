@@ -173,11 +173,11 @@ DEFINE_test_flag(uint64, local_catalog_master_read_delay_ms, 0,
     "catalog snapshot and the legacy catalog session -- and not to a request the local copy "
     "answered.");
 
-DEFINE_RUNTIME_uint32(local_catalog_serve_wait_timeout_ms, 5000,
-    "How long a catalog read waits for the local system catalog copy to hold what the backend "
-    "was told before the read goes to master instead. The copy polls every "
-    "local_catalog_poll_interval_ms, so this is a bound on how far behind the copy may fall "
-    "before reads stop using it, not a bound on a healthy wait.");
+DEFINE_RUNTIME_int32(local_catalog_serve_wait_timeout_ms, 300000,
+    "How long a wait for the local system catalog copy lasts before master is used instead: a "
+    "catalog read waiting for a version or a hybrid time the copy does not hold yet, and the start "
+    "of PG after a new YSQL lease, which is held until the copy serves. 0 uses master at once; -1 "
+    "waits until the copy serves, bounded only by the request's own deadline.");
 
 #ifdef __linux__
 DECLARE_bool(enable_qos);
@@ -234,10 +234,12 @@ void SetFollowerReadTime(ConsistentReadPoint& read_point, uint32_t staleness_ms)
 // The request's own deadline is the fallback, so a request whose deadline is nearer than the
 // bound keeps its deadline.
 CoarseTimePoint LocalCatalogWaitDeadline(CoarseTimePoint request_deadline) {
+  const auto timeout_ms = FLAGS_local_catalog_serve_wait_timeout_ms;
+  if (timeout_ms < 0) {
+    return request_deadline;
+  }
   return std::min(
-      request_deadline,
-      CoarseMonoClock::Now() +
-          MonoDelta::FromMilliseconds(FLAGS_local_catalog_serve_wait_timeout_ms));
+      request_deadline, CoarseMonoClock::Now() + MonoDelta::FromMilliseconds(timeout_ms));
 }
 
 constexpr const size_t kPgSequenceLastValueColIdx = 2;
@@ -3563,7 +3565,7 @@ class PgClientSession::Impl {
   // The backend was told a catalog version, so the copy must already hold every catalog change up
   // to it before it may answer a read. Two paths reach here without the exposure gate having done
   // the work: a version this backend advanced itself at its own DDL commit before this tserver's
-  // poller had the commit, and a version published while the copy was not serving. This wait is
+  // copy had the commit, and a version published while the copy was not serving. This wait is
   // where both are closed.
   //
   // The version comes from the request rather than from each operation's ysql_db_catalog_version,
@@ -3588,7 +3590,7 @@ class PgClientSession::Impl {
                             << backend_version << " of database " << db_oid << "; it has applied "
                             << replica->applied_version(db_oid);
         const auto wait_start = MonoTime::Now();
-        // A wait that runs out of time means the poller is not making progress, which is a
+        // A wait that runs out of time means the copy is not making progress, which is a
         // serving outage rather than a request error. Master can answer the read.
         auto status =
             replica->WaitForAppliedVersion(
@@ -3612,7 +3614,7 @@ class PgClientSession::Impl {
     // Skipped once the backend's version has moved past what it was when that transaction
     // committed: the transaction did increment a version, so the wait above covers it, and the
     // release gate has already pushed C past that version's read time. Waiting for the recorded
-    // clock reading as well would cost this session a poll interval after every DDL.
+    // clock reading as well would cost this session a floor request after every DDL.
     const auto own_write_floor =
         HybridTime(own_catalog_write_floor_.load(std::memory_order_acquire));
     if (own_write_floor.is_valid() &&
@@ -3631,6 +3633,24 @@ class PgClientSession::Impl {
                             << "own catalog writes at " << own_write_floor << ": " << status;
         replica->IncReadsToMasterNotServing();
         return HybridTime::kInvalid;
+      }
+    }
+
+    if (catalog_read_from_master_.exchange(false, std::memory_order_acq_rel)) {
+      const auto master_read_floor = clock()->Now();
+      if (replica->safe_time() < master_read_floor) {
+        VLOG_WITH_PREFIX(1) << "Waiting for the local catalog copy to reach "
+                            << LocalCatalogHybridTimeForLog(master_read_floor)
+                            << ", past this session's last catalog read from master; it holds "
+                            << LocalCatalogHybridTimeForLog(replica->safe_time());
+        auto status =
+            replica->WaitForSafeTime(master_read_floor, LocalCatalogWaitDeadline(deadline));
+        if (!status.ok()) {
+          VLOG_WITH_PREFIX(1) << "Routing a catalog read to master after waiting for the copy to "
+                              << "pass the session's last master read: " << status;
+          replica->IncReadsToMasterNotServing();
+          return HybridTime::kInvalid;
+        }
       }
     }
 
@@ -3733,6 +3753,12 @@ class PgClientSession::Impl {
     // --vmodule=pg_client_session=1, so that a slow query on a live cluster can be explained
     // without a rebuild.
     std::string routing_reason;
+    bool copy_servable = false;
+    auto note_master_read = ScopeExit([this, &routing_reason, &copy_servable] {
+      if (copy_servable && routing_reason.starts_with("to master")) {
+        catalog_read_from_master_.store(true, std::memory_order_release);
+      }
+    });
     auto report = ScopeExit(
         [this, data, &routing_reason] {
           if (routing_reason.empty() ||
@@ -3778,6 +3804,7 @@ class PgClientSession::Impl {
           options.use_legacy_catalog_session());
       return false;
     }
+    copy_servable = true;
     const auto& transaction = setup_session_result.session_data.transaction;
     if (transaction && transaction->isolation() == IsolationLevel::SERIALIZABLE_ISOLATION) {
       routing_reason =
@@ -3826,16 +3853,29 @@ class PgClientSession::Impl {
       replica->IncReadsToMasterNotServing();
       return false;
     }
-    if (snapshot_read_time.read > safe_time) {
+    auto complete_time = safe_time;
+    if (snapshot_read_time.read > complete_time) {
       // The snapshot's time came from the tserver clock because the copy could not answer its
       // first read, or the caller asked for an explicit time above what the copy holds
-      // (yb_read_time, ysql_dump --read-time). Reading the copy at C instead would move the
-      // snapshot backwards in the first case and answer a different question in the second.
+      // (yb_read_time, ysql_dump --read-time). That time is at or below the clock, so master can
+      // certify it: the copy asks for a push up to it and serves once it holds it.
+      auto status = replica->WaitForSafeTime(
+          snapshot_read_time.read, LocalCatalogWaitDeadline(deadline));
+      VLOG_WITH_PREFIX(1) << "Wait for the local catalog copy to reach the request's read time "
+                          << LocalCatalogHybridTimeForLog(snapshot_read_time.read) << ": "
+                          << status;
+      if (status.ok()) {
+        complete_time = replica->safe_time();
+      }
+    }
+    if (snapshot_read_time.read > complete_time) {
+      // Reading the copy at C instead would move the snapshot backwards in the first case above
+      // and answer a different question in the second.
       routing_reason = Format(
           "to master: the request's read time $0 is above the copy's complete time $1, by $2 us",
           LocalCatalogHybridTimeForLog(snapshot_read_time.read),
-          LocalCatalogHybridTimeForLog(safe_time),
-          snapshot_read_time.read.PhysicalDiff(safe_time).ToMicroseconds());
+          LocalCatalogHybridTimeForLog(complete_time),
+          snapshot_read_time.read.PhysicalDiff(complete_time).ToMicroseconds());
       replica->IncReadsToMasterNotServing();
       return false;
     }
@@ -4994,6 +5034,13 @@ class PgClientSession::Impl {
   // gate already cover, from one that did not.
   std::atomic<uint64_t> backend_catalog_version_{0};
   std::atomic<uint64_t> own_catalog_write_floor_version_{0};
+
+  // Set when a catalog read of this session that the copy could serve in principle went to master
+  // instead (copy not serving, a wait ran out, a SERIALIZABLE transaction, a read time above C).
+  // Master read at a time the copy may not hold yet, so the session's next read from the copy
+  // waits until C reaches this server's clock, which the master response has moved past master's
+  // read time. Otherwise the session could see a change on master and then lose it on the copy.
+  std::atomic<bool> catalog_read_from_master_{false};
 
   // Set by UpdateReadTime when it takes the catalog snapshot's read time from this server's clock,
   // which it does only on the snapshot's first read. Single-threaded per session: written and read

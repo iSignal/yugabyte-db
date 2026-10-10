@@ -128,6 +128,7 @@ set(MASTER_SRCS
   snapshot_transfer_manager.cc
   state_with_tablets.cc
   sys_catalog.cc
+  sys_catalog_pusher.cc
   sys_catalog_initialization.cc
   sys_catalog_writer.cc
   system_tablet.cc
@@ -277,6 +278,7 @@ ADD_YB_TEST(restore_sys_catalog_state_test)
 ADD_YB_TEST(stateful_service-test)
 ADD_YB_TEST(sys_catalog-test)
 ADD_YB_TEST(sys_catalog_xrepl-test)
+ADD_YB_TEST(sys_catalog_pusher-test)
 ADD_YB_TEST(table_index_test)
 ADD_YB_TEST(tablet_creation_limits_test)
 ADD_YB_TEST(xcluster/xcluster_outbound_replication_group-test)

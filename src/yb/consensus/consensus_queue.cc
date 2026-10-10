@@ -419,7 +419,7 @@ void PeerMessageQueue::LocalPeerAppendFinished(const OpId& id, const Status& sta
 
   if (is_leader) {
     ResponseFromPeer(local_peer_uuid_, fake_response);
-  } else {
+  } else if (!evict_log_cache_only_for_memory_.load(std::memory_order_acquire)) {
     log_cache_.EvictThroughOp(evict_index);
   }
 }
@@ -814,6 +814,24 @@ Result<XClusterReadOpsResult> PeerMessageQueue::ReadReplicatedMessagesForXCluste
       HaveMoreMessages(xcluster_result.result.have_more_messages.get() || pending_messages);
 
   return xcluster_result;
+}
+
+Result<ReadOpsResult> PeerMessageQueue::ReadCommittedMessages(
+    const yb::OpId& last_op_id, int64_t to_index, size_t max_size_bytes,
+    CoarseTimePoint deadline) {
+  to_index = std::min(to_index, GetCommittedAndMajorityReplicatedIndex().first);
+  if (last_op_id.index >= to_index) {
+    return ReadOpsResult();
+  }
+  int64_t after_op_index = VERIFY_RESULT(GetStartOpIdIndex(last_op_id.index));
+  auto result = ReadFromLogCache(
+      after_op_index, to_index, max_size_bytes, local_peer_uuid_, log::ObeyMemoryLimit::kFalse,
+      deadline, /* fetch_single_entry= */ false, last_op_id.empty() ? nullptr : &last_op_id);
+  if (PREDICT_FALSE(!result.ok()) && result.status().IsNotFound()) {
+    return result.status().CloneAndAddErrorCode(
+        cdc::CDCError(cdc::CDCErrorPB::CHECKPOINT_TOO_OLD));
+  }
+  return result;
 }
 
 // Read majority replicated messages from cache for CDC.
@@ -1657,7 +1675,7 @@ bool PeerMessageQueue::ResponseFromPeer(const std::string& peer_uuid,
     UpdateMetrics();
   }
 
-  if (evict_index != -1) {
+  if (evict_index != -1 && !evict_log_cache_only_for_memory_.load(std::memory_order_acquire)) {
     log_cache_.EvictThroughOp(evict_index);
   }
 

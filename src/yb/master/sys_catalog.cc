@@ -58,6 +58,7 @@
 #include "yb/consensus/multi_raft_batcher.h"
 #include "yb/consensus/opid_util.h"
 #include "yb/consensus/quorum_util.h"
+#include "yb/consensus/raft_consensus.h"
 #include "yb/consensus/retryable_requests.h"
 #include "yb/consensus/state_change_context.h"
 
@@ -95,6 +96,7 @@
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tablet/write_query.h"
 
+#include "yb/tserver/local_catalog_replica.h"
 #include "yb/tserver/tablet_memory_manager.h"
 #include "yb/tserver/ts_tablet_manager.h"
 #include "yb/tserver/tserver.messages.h"
@@ -145,6 +147,7 @@ METRIC_DEFINE_counter(
   "Number of writes to disk handled by the system catalog.");
 
 DECLARE_bool(create_initial_sys_catalog_snapshot);
+DECLARE_bool(enable_local_tserver_catalog);
 DECLARE_int32(master_discovery_timeout_ms);
 DECLARE_int32(retryable_request_timeout_secs);
 DECLARE_int32(snapshot_cleanup_pool_size);
@@ -718,6 +721,10 @@ Status SysCatalogTable::OpenTablet(const scoped_refptr<tablet::RaftGroupMetadata
       "Failed to Init() TabletPeer");
 
   RETURN_NOT_OK_PREPEND(tablet_peer()->Start(consensus_info), "Failed to Start() TabletPeer");
+
+  if (FLAGS_enable_local_tserver_catalog && tserver::LocalCatalogPrerequisitesMet()) {
+    VERIFY_RESULT(tablet_peer()->GetRaftConsensus())->SetEvictLogCacheOnlyForMemory(true);
+  }
 
   tablet_peer()->RegisterMaintenanceOps(master_->maintenance_manager());
 

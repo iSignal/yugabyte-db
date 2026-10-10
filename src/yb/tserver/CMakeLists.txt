@@ -258,7 +258,7 @@ set(TSERVER_SRCS
   full_compaction_manager.cc
   heartbeater.cc
   heartbeater_factory.cc
-  local_catalog_poller.cc
+  local_catalog_applier.cc
   local_catalog_read.cc
   local_catalog_replica.cc
   master_leader_poller.cc

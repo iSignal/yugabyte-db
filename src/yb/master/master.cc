@@ -42,7 +42,6 @@
 #include "yb/common/pg_catversions.h"
 #include "yb/common/wire_protocol.h"
 
-#include "yb/cdc/sys_catalog_change_service.h"
 
 #include "yb/consensus/consensus_meta.h"
 
@@ -65,6 +64,7 @@
 #include "yb/master/master-path-handlers.h"
 #include "yb/master/scoped_leader_shared_lock.h"
 #include "yb/master/sys_catalog_constants.h"
+#include "yb/master/sys_catalog_pusher.h"
 #include "yb/master/tablet_split_manager.h"
 #include "yb/master/test_async_rpc_manager.h"
 #include "yb/master/ts_manager.h"
@@ -337,19 +337,17 @@ Status Master::RegisterServices() {
   }
 
   if (FLAGS_enable_local_tserver_catalog && tserver::LocalCatalogPrerequisitesMet()) {
-    // Tservers pull the system catalog tablet's WAL through this service to keep their local
-    // copies of it current. It is high priority for the same reason the ysql lease service is: a
-    // DDL's client is not told the DDL succeeded until every tserver has acknowledged the lock
-    // release, and that acknowledgement waits for this service to have shipped the DDL's records.
-    sys_catalog_change_service_ = std::make_shared<cdc::SysCatalogChangeServiceImpl>(
-        metric_entity(),
+    // Master pushes the system catalog tablet's WAL to the tservers' local copies of it; the
+    // service takes the tservers' requests for a push.
+    sys_catalog_pusher_ = std::make_shared<SysCatalogPusher>(
+        *this,
         [this]() -> Result<tablet::TabletPeerPtr> {
           return master_tablet_server_->GetServingTablet(TabletId(kSysCatalogTabletId));
         },
-        mem_tracker());
+        mem_tracker(), metric_entity());
     RETURN_NOT_OK(RegisterService(
-        FLAGS_master_xrepl_svc_queue_length, sys_catalog_change_service_,
-        rpc::ServicePriority::kHigh));
+        FLAGS_master_svc_queue_length,
+        std::make_shared<SysCatalogChangeService>(metric_entity(), sys_catalog_pusher_)));
   }
 
   RETURN_NOT_OK(RegisterService(
@@ -389,6 +387,9 @@ Status Master::StartAsync() {
   RETURN_NOT_OK(maintenance_manager_->Init());
   RETURN_NOT_OK(RegisterServices());
   RETURN_NOT_OK(DbServerBase::Start());
+  if (sys_catalog_pusher_) {
+    RETURN_NOT_OK(sys_catalog_pusher_->Start());
+  }
 
   // Now that we've bound, construct our ServerRegistrationPB.
   RETURN_NOT_OK(InitMasterRegistration());
@@ -449,6 +450,9 @@ void Master::Shutdown() {
     string name = ToString();
     LOG(INFO) << name << " shutting down...";
     maintenance_manager_->Shutdown();
+    if (sys_catalog_pusher_) {
+      sys_catalog_pusher_->Shutdown();
+    }
     // We shutdown RpcAndWebServerBase here in order to shutdown messenger and reactor threads
     // before shutting down catalog manager. This is needed to prevent async calls callbacks
     // (running on reactor threads) from trying to use catalog manager thread pool which would be

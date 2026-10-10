@@ -216,6 +216,10 @@ class LogCache {
     // to compute, so we compute it only once upon insertion.
     size_t mem_usage = 0;
 
+    // The message's size in a ReadOps result, computed on the first read that needs it; 0 until
+    // then.
+    int64_t read_size = 0;
+
     // Did we start memory tracking for this entry.
     bool tracked = false;
   };

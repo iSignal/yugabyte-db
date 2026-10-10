@@ -249,6 +249,10 @@ class TabletServiceImpl : public TabletServerServiceIf, public ReadTabletProvide
       const ReleaseObjectLockRequestPB* req, ReleaseObjectLockResponsePB* resp,
       rpc::RpcContext context) override;
 
+  void PushSysCatalogChanges(
+      const PushSysCatalogChangesRequestPB* req, PushSysCatalogChangesResponsePB* resp,
+      rpc::RpcContext context) override;
+
   void WaitForLockersMultiple(
       const WaitForLockersMultipleRequestPB* req, WaitForLockersMultipleResponsePB* resp,
       rpc::RpcContext context) override;
