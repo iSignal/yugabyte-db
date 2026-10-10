@@ -979,6 +979,12 @@ TEST_F(PgLocalCatalogTest, DISABLED_DdlOpenAcrossReseedIsVisibleAfterCommit) {
 
   const auto reseeds_before = ASSERT_RESULT(Counter(0, METRIC_local_catalog_reseeds));
   ASSERT_OK(cluster_->SetFlag(&TServer(0), "TEST_local_catalog_push_reseed", "true"));
+  // The next pages master sends tserver 0 are treated as a re-seed answer; a DDL elsewhere sends
+  // some.
+  {
+    auto conn = ASSERT_RESULT(ConnectTo(2));
+    ASSERT_OK(conn.Execute("CREATE TABLE triggers_a_push (k INT PRIMARY KEY)"));
+  }
   ASSERT_OK(LoggedWaitFor(
       [this, reseeds_before]() -> Result<bool> {
         auto reseeds = Counter(0, METRIC_local_catalog_reseeds);
