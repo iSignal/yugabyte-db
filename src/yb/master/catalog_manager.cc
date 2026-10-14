@@ -3307,7 +3307,9 @@ class SplitScope {
     auto& child = temp_tablet_info_[idx];
     CHECK(child);
     SetupTabletInfo(*child, *source_table(), partition, SysTabletsEntryPB::CREATING);
-    return std::move(child);
+    // The child stays in temp_tablet_info_ until it is committed, so ~SplitScope aborts its
+    // mutation on any failure path.
+    return child;
   }
 
   Status RegisterNewTabletsForSplit(
@@ -3351,6 +3353,7 @@ class SplitScope {
                 << AsString(table_infos)
                 << ", new partition_list_version: " << new_partition_list_version;
     }
+    temp_tablet_info_.clear();
     return Status::OK();
   }
 

@@ -93,6 +93,7 @@
 #include "yb/util/async_util.h"
 #include "yb/util/atomic.h"
 #include "yb/util/backoff_waiter.h"
+#include "yb/util/cow_object.h"
 #include "yb/util/format.h"
 #include "yb/util/logging_test_util.h"
 #include "yb/util/metrics.h"
@@ -2905,6 +2906,20 @@ TEST_F(TabletSplitSingleServerITest, TestSplitDuringBackfill) {
   ASSERT_OK(catalog_mgr->TEST_SplitTablet(source_tablet_info, split_hash_code));
   ASSERT_OK(WaitForTabletSplitCompletion(2));
   ASSERT_OK(CheckPostSplitTabletReplicasData(kNumRows));
+}
+
+// TEST_SplitTablet runs DoSplitTablet on the calling thread, so a child tablet mutation that is
+// never ended shows up in this thread's held-tablet-write-lock count. A leaked count trips the
+// #10304 check on the next table commit made by the same thread.
+TEST_F(TabletSplitSingleServerITest, FailedSplitRegistrationEndsChildMutations) {
+  CreateSingleTablet();
+  const auto split_hash_code = ASSERT_RESULT(WriteRowsAndGetMiddleHashCode(kDefaultNumRows));
+  auto* catalog_mgr = ASSERT_RESULT(catalog_manager());
+  auto source_tablet_info = ASSERT_RESULT(GetSingleTestTabletInfo(catalog_mgr));
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_error_after_registering_split_tablets) = true;
+  ASSERT_NOK(catalog_mgr->TEST_SplitTablet(source_tablet_info, split_hash_code));
+  ASSERT_EQ(MutableHeldTabletWriteLockCount(), 0);
 }
 
 TEST_P(TabletNSplitSingleServerITest, ComputeSplitKeys) {
