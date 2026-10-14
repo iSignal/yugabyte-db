@@ -90,6 +90,7 @@ class JsonWriter;
 class Cgroup;
 class MemTracker;
 class MetricEntity;
+class MetricRegistry;
 class ThreadPool;
 class ThreadPoolToken;
 
@@ -251,6 +252,9 @@ class YBClientBuilder {
 
   // Sets metric entity to be used for emitting metrics. Optional.
   YBClientBuilder& set_metric_entity(const scoped_refptr<MetricEntity>& metric_entity);
+
+  // Registry used to look up/create per-table metric entities for client RPC metrics. Optional.
+  YBClientBuilder& set_metric_registry(MetricRegistry* metric_registry);
 
   // Sets client name to be used for naming the client's messenger/reactors.
   YBClientBuilder& set_client_name(const std::string& name);
@@ -1181,6 +1185,7 @@ class YBClient {
   friend class internal::RemoteTablet;
   friend class internal::RemoteTabletServer;
   friend class internal::AsyncRpc;
+  friend class internal::WaitForAsyncWriteRpc;
   friend class internal::TabletInvoker;
   friend class internal::ClientMasterRpcBase;
   friend class PlacementInfoTest;

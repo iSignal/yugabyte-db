@@ -396,6 +396,7 @@
 // We have to do this here below the forward declarations, but not
 // in the yb namespace.
 METRIC_DECLARE_entity(server);
+METRIC_DECLARE_entity(table);
 
 namespace yb {
 
@@ -518,6 +519,10 @@ class MetricRegistry {
                                                  const MetricEntity::AttributeMap& initial_attrs,
                                                  std::shared_ptr<MemTracker> mem_tracker = nullptr);
 
+  // Returns nullptr if no entity with this id is registered. Unlike FindOrCreateEntity, does not
+  // create an entity or overwrite attributes of an existing one.
+  scoped_refptr<MetricEntity> FindEntity(const std::string& id) const;
+
   // Writes metrics in this registry to 'writer'.
   //
   // 'requested_metrics' is a set of substrings to match metric names against,
@@ -602,7 +607,10 @@ class MetricRegistry {
 enum PrototypeFlags {
   // Flag which causes a Gauge prototype to expose itself as if it
   // were a counter.
-  EXPOSE_AS_COUNTER = 1 << 0
+  EXPOSE_AS_COUNTER = 1 << 0,
+  // Table-entity copies of metrics that are also instantiated on the server entity. Server-level
+  // scrape aggregation would double-count counters and sum histogram quantiles (wrong p99).
+  kExcludeFromServerLevelAggregation = 1 << 1
 };
 
 class MetricPrototype {
@@ -654,6 +662,7 @@ class MetricPrototype {
   MetricUnit::Type unit() const { return args_.unit_; }
   const char* description() const { return args_.description_; }
   MetricLevel level() const { return args_.level_; }
+  uint32_t flags() const { return args_.flags_; }
   AggregationFunction aggregation_function() const { return args_.aggregation_function_; }
   virtual MetricType::Type type() const = 0;
 
@@ -671,6 +680,14 @@ class MetricPrototype {
  private:
   DISALLOW_COPY_AND_ASSIGN(MetricPrototype);
 };
+
+inline AggregationLevels AggregationLevelsForExport(
+    const MetricPrototype& prototype, AggregationLevels default_levels) {
+  if (prototype.flags() & kExcludeFromServerLevelAggregation) {
+    return default_levels & ~kServerLevel;
+  }
+  return default_levels;
+}
 
 // A description of a Gauge.
 template<typename T>
@@ -1252,6 +1269,12 @@ class Histogram : public BaseStats<Histogram> {
 };
 
 using HistogramPtr = scoped_refptr<Histogram>;
+
+inline void IncrementHistogram(const HistogramPtr& hist, int64_t value) {
+  if (hist) {
+    hist->Increment(value);
+  }
+}
 
 class EventStats : public BaseStats<EventStats> {
  public:

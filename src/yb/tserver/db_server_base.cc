@@ -55,7 +55,7 @@ Status DbServerBase::Init() {
 
   async_client_init_ = std::make_unique<client::AsyncClientInitializer>(
       "server_client", default_client_timeout(), permanent_uuid(), &options(), metric_entity(),
-      mem_tracker(), messenger());
+      metric_registry(), mem_tracker(), messenger());
   SetupAsyncClientInit(async_client_init_.get());
 
   RETURN_NOT_OK(shared_mem_manager_->InitializeTServer(permanent_uuid()));

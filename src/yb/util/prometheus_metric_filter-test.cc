@@ -44,7 +44,7 @@
 
 METRIC_DEFINE_entity(tablet);
 
-METRIC_DEFINE_entity(table);
+METRIC_DECLARE_entity(table);
 
 METRIC_DEFINE_counter(server, server_metric, "server_metric_label",
     yb::MetricUnit::kMilliseconds, "server_metric description");
