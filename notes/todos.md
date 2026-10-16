@@ -31,6 +31,7 @@ approach is fixed, not coded), **closed** (in the code and tested, or dropped).
 | T8 | User catalog reads: the standalone-statement guard (step 1) | [§14.2](plan2.md#142-proposal) | [2.8](#28-t8-user-catalog-reads-guard) |
 | T9 | A failed read from the copy becomes a query error, no fallback, no trace | [§8](plan2.md#8-observability) | [2.9](#29-t9-failed-local-read-fallback) |
 | T38 | Schema-change records: re-apply after a restart from an older checkpoint, ordering with the checkpoint, the xCluster forced-checkpoint rule (design review 2026-10, Hari, Mark) | [§4.2](plan2.md#42-applier) | [2.38](#238-t38-schema-change-records-re-apply-and-ordering) |
+| T43 | PITR: a new connection reads the catalog from before the restore until the copy gets the restore page (fails 10 of 15 local runs of `PgsqlSequencePartialCleanupAfterRestore`); every restore re-seeds every copy. Plan: apply the restore in place on the copy, keep master's catalog history on the copy, master waits for the copies before RESTORED (2026-10-10) | [§6.2](plan2.md#62-re-seed) | [2.43](#243-t43-pitr-restore-reaches-the-copies-in-place) |
 
 ### 1.2 Open, Medium
 
@@ -1235,3 +1236,31 @@ List each tserver-side consumer and the tracker it is charged to, and add a
 - parsed pages during apply and the external-intent batches;
 - read-path buffers of locally served reads;
 - the copy's share of the block cache.
+
+### 2.43 T43. PITR restore reaches the copies in place
+
+Plan: [pitr-handling.md](pitr-handling.md). Found in the CI triage of diff
+320164 (2026-10-10).
+
+Mechanism: master marks a restoration complete without waiting for the
+copies. The restore raises the database's catalog version on master only;
+the tserver learns the new version from its next heartbeat. A connection
+opened in between starts at the old version, the version wait passes, and
+it reads the copy at a C below the restore. Without the copy the same
+connection reads master and sees the restored rows. Separately, the restore
+page makes every copy re-seed by remote bootstrap, for a restore of one
+database.
+
+Change (pitr-handling.md §3):
+
+1. The restore page carries the database oid, restore time, write time and
+   new version; the copy sets the same hybrid-time filter on its own files
+   and writes the version row, with no re-seed.
+2. Master sends its catalog history bound to the copies; each copy keeps
+   history back to it.
+3. `FinishRestoration` reports the restore complete only after every lease
+   holder's copy has acknowledged the restore page.
+4. A restore time older than the copy's history, or a failed in-place apply,
+   falls back to a re-seed.
+
+Open items: pitr-handling.md §5.
