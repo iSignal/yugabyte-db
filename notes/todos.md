@@ -30,7 +30,7 @@ approach is fixed, not coded), **closed** (in the code and tested, or dropped).
 | T7 | Checkpoint file durable before the WAL it covers | [§4.2](plan2.md#42-applier) | [2.7](#27-t7-checkpoint-durable-before-the-wal) |
 | T8 | User catalog reads: the standalone-statement guard (step 1) | [§14.2](plan2.md#142-proposal) | [2.8](#28-t8-user-catalog-reads-guard) |
 | T9 | A failed read from the copy becomes a query error, no fallback, no trace | [§8](plan2.md#8-observability) | [2.9](#29-t9-failed-local-read-fallback) |
-| T38 | Schema-change records: re-apply after a restart from an older checkpoint, ordering with the checkpoint, the xCluster forced-checkpoint rule (design review 2026-10, Hari, Mark) | [§4.2](plan2.md#42-applier) | [2.38](#238-t38-schema-change-records-re-apply-and-ordering) |
+| T38 | Schema-change records: re-apply is safe except a table-schema record for a removed table (T45 skips it); decided 2026-10-18: persist the checkpoint just before and just after each schema-change record, so no replay crosses a schema change | [§4.2](plan2.md#42-applier) | [2.38](#238-t38-schema-change-records-re-apply-and-ordering) |
 | T43 | PITR: a new connection reads the catalog from before the restore until the copy gets the restore page (fails 10 of 15 local runs of `PgsqlSequencePartialCleanupAfterRestore`); every restore re-seeds every copy. Plan: apply the restore in place on the copy, keep master's catalog history on the copy, master waits for the copies before RESTORED (2026-10-10) | [§6.2](plan2.md#62-re-seed) | [2.43](#243-t43-pitr-restore-reaches-the-copies-in-place) |
 
 ### 1.2 Open, Medium
@@ -55,10 +55,16 @@ approach is fixed, not coded), **closed** (in the code and tested, or dropped).
 | T22 | A stale checkpoint file outlives its tablet | [§6.2](plan2.md#62-re-seed) | [2.20](#220-t22-stale-checkpoint-file) |
 | T23 | The copy's memtables are outside the global memstore flusher | — | [2.21](#221-t23-memstore-flusher) |
 | T24 | Master WAL retention policy per stream and automatic re-seed | [§7.3](plan2.md#73-master-wal-retention) | [2.22](#222-t24-master-wal-retention) |
-| T25 | Major version upgrade support | [§10](plan2.md#10-modes-in-which-the-local-tablet-is-not-used) | [2.23](#223-t25-major-version-upgrade) |
+| T25 | Major version upgrade: decided 2026-10-17, no special case; the copy keeps serving and the guard is removed; open: table removal records, a faster periodic push while the upgrade runs, PG start before `MONITORING` | [§10](plan2.md#10-modes-in-which-the-local-tablet-is-not-used) | [2.23](#223-t25-major-version-upgrade) |
 | T26 | Observability holes and additions | [§8](plan2.md#8-observability) | [2.24](#224-t26-observability) |
 | T27 | Java regress schedules with the feature on; two CI items not yet explained | — | [2.25](#225-t27-test-coverage-and-open-ci-items) |
 | T36 | Wait latency: the own-write wait applies to every read of the session; wait timeouts counted as "not serving" (items 1-2 closed by floor requests) | [§4.1](plan2.md#41-master-push-service) | [2.34](#234-t36-wait-latency) |
+| T35 | Filter master's own records (tablet metadata, leader changes, OID allocation) out of the push stream and the remote-bootstrap snapshot: the copy cannot read them and they are pushed to every tserver on every change (design review 2026-10-24, Mark, Nita); raised from Low | [§12](plan2.md#12-follow-up-items) | [2.33](#233-t35-non-pg-rows) |
+| T47 | xCluster DDL queue handler: check its catalog reads (the consistency GUC and the read path it uses when applying replicated DDLs) against the copy; nothing is special about `CREATE EXTENSION` itself (design review 2026-10-24, Mark) | — | [2.47](#247-t47-xcluster-ddl-queue-handler) |
+| T48 | Release timeout: the DDL's tserver today responds success when the synchronous release times out (`ts_local_lock_manager.cc:985-991`); the design returns an error (effect unknown) and exposes each in-progress release per lease holder in master's UI and metrics so the user can follow it to completion (design review 2026-10-24) | [design §7.4](local_catalog_docdb_design.md) | [2.48](#248-t48-release-timeout) |
+| T44 | The release's floor moves on every retry that master processes again, so a tserver slower than one attempt never completes the release; fix: a floor that does not change between attempts, preferably the newest commit time among the versions in the release (2026-10-17) | [simplified §4.1](simplified_with_object_locks.md#41-lock-release) | [2.44](#244-t44-the-release-floor-moves-on-every-retry) |
+| T45 | The applier applies the CDC retention fields of logical-replication stream records to the copy, setting retention barriers that nothing on the copy moves; fix: clear those fields, skip records left with nothing to apply (2026-10-18) | [§4.2](plan2.md#42-applier) | [2.45](#245-t45-cdc-retention-fields-in-schema-change-records) |
+| T46 | Drop the page seal after a schema-change record: inherited from the xCluster producer's `ends_batch` (`xcluster_producer.cc:289-291`, honoured at `sys_catalog_pusher.cc:407-409`); the applier applies a schema-change record in place and nothing reads `ends_with_metadata`. Keep the size, restore and certified-position seals (2026-10-18) | [simplified §4.1](simplified_with_object_locks.md#41-lock-release) | — |
 
 ### 1.3 Open, Low
 
@@ -66,11 +72,10 @@ approach is fixed, not coded), **closed** (in the code and tested, or dropped).
 |---|---|---|---|
 | T28 | Cluster-wide catalog lock, reader half | [§14.4](plan2.md#144-long-term-a-cluster-wide-catalog-lock) | [2.26](#226-t28-cluster-wide-catalog-lock) |
 | T29 | External intents of a DDL open longer than a day are deleted on the copy | — | [2.27](#227-t29-external-intent-cleanup) |
-| T30 | Explicit read times below master's compacted history | [§4.3](plan2.md#43-freshness-guarantee) | [2.28](#228-t30-explicit-read-time-below-the-cutoff) |
+| T30 | Explicit read times below master's compacted history; decided 2026-10-18: a serving cutoff at or after the seed time minus the system catalog retention interval | [§4.3](plan2.md#43-freshness-guarantee) | [2.28](#228-t30-explicit-read-time-below-the-cutoff) |
 | T31 | A restore inside the WAL tail copied by remote bootstrap | [§6.2](plan2.md#62-re-seed) | [2.29](#229-t31-restore-inside-the-copied-wal-tail) |
 | T32 | Tablet-wide flags and assertions reach the copy | — | [2.30](#230-t32-tablet-wide-flags) |
 | T33 | Hot-path formatting; applied-version mutex on the read path (the poll and stream items went with the pull path) | — | [2.31](#231-t33-small-poller-and-service-items) |
-| T35 | Filter non-PG rows of the system catalog out of the stream and the snapshot | [§12](plan2.md#12-follow-up-items) | [2.33](#233-t35-non-pg-rows) |
 | T42 | Memory accounting of the copy on the tserver (design review 2026-10, Mark) | — | [2.42](#242-t42-memory-accounting-of-the-copy) |
 
 ### 1.4 Accepted (no change planned)
@@ -823,14 +828,132 @@ automatic re-seed on eviction.
 ### 2.23 T25. Major version upgrade
 
 Design: [plan2 §10](plan2.md#10-modes-in-which-the-local-tablet-is-not-used).
-Guard only: `TSHeartbeatResponsePB.ysql_major_version_upgrade_in_progress`
+
+Decision 2026-10-17: no special case. The copy keeps serving through a YSQL
+major version upgrade, and the guard that takes it out of the read path is
+removed. Code pointers below are against `5886f97e64e`.
+
+Today's guard: `TSHeartbeatResponsePB.ysql_major_version_upgrade_in_progress`
 (field 35, from `YsqlManagerIf::IsMajorUpgradeInProgress()`), consumed by
-`SetMajorVersionUpgradeInProgress` (`heartbeater.cc:550-552`), makes
-`IsServing()` false while set (`local_catalog_replica.cc:216-228`). Open:
-which version table gates which sessions, how cotables created by the
-upgrade become eligible, rollback (removal records). Related (review O4):
-the serving gauge reports serving while `IsServing()` is false in this
-state.
+`SetMajorVersionUpgradeInProgress` (`heartbeater.cc:590-591`,
+`local_catalog_replica.cc:220`), makes `IsServing()` false while set
+(`local_catalog_replica.cc:216-228`). It was not added because of a test
+failure. It went in with the first commit of the feature, 25f011a795f, on the
+user's instruction, for two reasons: the upgrade window has two catalog
+version tables in play, and DDLs such as `REFRESH MATERIALIZED VIEW
+CONCURRENTLY` run inside it (worklog2 "Addendum handling: initdb, YSQL
+upgrade, major version upgrade, explicit read times"; "What is not done").
+No upgrade behavior was designed or tested. The only later change it caused:
+`FirstQueryLatencyAfterRestart` showed that holding PG's start on
+`IsServing()` would hold PG until the timeout during an upgrade, so the hold
+checks `state()` instead.
+
+What a major upgrade does (`master/ysql/ysql_initdb_major_upgrade_handler.cc`):
+
+| Phase | What happens | Catalog writes allowed |
+|---|---|---|
+| Masters on the new binary | The upgrade is in progress while master's persisted catalog version differs from its build's version (`:156`), until finalize. | forced updates only (`IsWriteToCatalogTableAllowed`, `:295-320`) |
+| `PERFORMING_INIT_DB` | Master aborts the open transactions on its system catalog tablet (`:431`). The new PG's initdb creates the new-version catalog tables in the same system catalog tablet; their table ids carry a version byte (`common/entity_ids.cc:126-140`). | same |
+| `PERFORMING_PG_UPGRADE` | pg_upgrade fills the new tables. `UpdateCatalogVersions` copies the version rows from the old-version version table into the new one and deletes the new-version invalidation messages (`:441-457`). | same |
+| `MONITORING` | Tservers restart one by one on the new binary. New PG reads the new-version tables; old PG reads the old-version tables. | writes to either version table are rejected (`:300-308`) |
+| Finalize (`DONE`) | Requires every tserver on the new version (`:234-236`). Master starts reading the new-version version table. A cleanup deletes the old-version tables (`:760-762`, `DeleteYsqlDBTables` with `kMajorUpgradeCleanup`). | normal |
+| Rollback | Requires every tserver back on the old version (`:245-247`). The new-version tables are deleted. | — |
+
+During the upgrade, DDLs increment no catalog version by default
+(`pg_yb_utils.c:3646-3655`).
+
+Why the copy needs no special case:
+
+1. Both catalogs are in master's system catalog tablet, so the copy holds both.
+   Every upgrade write reaches the copy through master's WAL as pushed pages:
+   PG's writes go through the normal write path, and `CopyPgsqlTables` and
+   `DeleteAllYsqlCatalogTableRows` write through `SysCatalogWriter`
+   (`sys_catalog.cc:2016`, `:2059`).
+2. Every catalog that a running backend reads is frozen during the upgrade.
+   - The old-version tables accept only forced updates from the start.
+   - The new-version tables are written only while the catalog is built,
+     before any backend reads them.
+   - Writes to both version tables are rejected during `MONITORING`.
+3. Building the new catalog (`PERFORMING_INIT_DB`, `PERFORMING_PG_UPGRADE`)
+   changes only the new-version tables, which no running backend reads yet.
+   The copy keeps serving the old-version tables to old-binary backends.
+4. A backend switches catalogs only when its tserver restarts on the new
+   binary, which happens during `MONITORING`, after the new catalog was
+   written. The restart rule holds PG's start until C ≥ B, where B is the
+   clock reading at the new process's first lease. So when PG starts, the copy
+   holds the whole new catalog and the copied version rows.
+   - For the PG11 to PG15 upgrade, the old binary has no copy, so this restart
+     is a first bootstrap, and PG is held until the copy is seeded.
+   - T3(b) (open catalog transactions copied by remote bootstrap) cannot occur
+     here: master aborted them when the upgrade started, and catalog writes
+     stay blocked afterwards.
+5. The two version tables hold the same values for the whole window:
+   `UpdateCatalogVersions` copied them, and no version write is allowed
+   afterwards. At finalize, master switches the table it reads versions from,
+   and no tserver sees a version change. With a gate that compares hybrid
+   times (C against the bound a release or report carries), which table master
+   reads the versions from does not matter.
+6. Rollback restarts the tservers on the old binary, so the restart rule
+   applies again. The old-version tables were never changed.
+7. `REFRESH MATERIALIZED VIEW`: only the in-place refresh is allowed during
+   the upgrade (user, 2026-10-17). It turns on forced catalog modification only
+   for its temp-table operations (`matview.c:317-332`). Those rows belong to
+   the refreshing session, which runs the refresh in DDL mode and reads master.
+   No other session can see them.
+8. Forced catalog updates (`yb_force_catalog_update_on_next_ddl`) change rows
+   without a version increment. Cached entries are not invalidated, the same
+   as without the copy. A new catalog cache miss sees the change after the
+   next push. This is an operator-only tool.
+
+Change: remove `major_version_upgrade_in_progress_` from `IsServing()` and
+the `SetMajorVersionUpgradeInProgress` call in the heartbeater; remove field
+35 from `TSHeartbeatResponsePB` if nothing else reads it. Review item O4 (the
+serving gauge disagrees with `IsServing()`) then applies only to
+`TEST_local_catalog_disable_serving`.
+
+Lock releases and push during the upgrade (checked 2026-10-17): no release RPC
+is sent per DDL or at the end, so nothing moves C on any tserver during the
+upgrade except the timer and floor requests.
+
+| Phase | Writer | Object locks | Release RPC |
+|---|---|---|---|
+| initdb of the new catalog, pg_upgrade | PG processes started by master, connected to master's own `PgClientServiceImpl` (`master.cc:366`) | none: `ShouldEnableTableLocks()` is false under `YBCIsInitDbModeEnvVarSet()` and `YBCIsBinaryUpgrade()` (`pggate.cc:507-510`), so `PgSession::AcquireObjectLock` returns at once (`pg_session.cc:1394-1403`); no version-table lock because `IsBinaryUpgrade` gives `YB_DDL_MODE_NO_ALTERING` (`pg_yb_utils.c:3682`) | none: `MasterTabletServer::ts_local_lock_manager()` is `nullptr` (`master_tserver.cc:133-135`), so `IsObjectLockingEnabled()` is false (`pg_client_session.cc:4864-4868`) and `ReleaseObjectLocksIfNecessary` returns before building a request (`:4774-4776`) |
+| `UpdateCatalogVersions` | master, `SysCatalogWriter` (`:441-457`) | — | none |
+| finalize cleanup, rollback deletions | master, `DeleteYsqlDBTables` | — | none |
+
+What makes a new-binary tserver see the new tables is the restart hold, not a
+release: the restarted process's first lease refresh runs `OnLeaseGained(MaxGlobalNow)`
+(`ysql_lease_manager.cc:160-186`); B is a clock reading taken after every upgrade
+write committed (the restart happens in `MONITORING`); master pushes the pages
+from the copy's position, or answers "re-seed" when the upgrade's volume exceeded
+its WAL retention (15 min), and the RBS copies everything; PG starts only when
+C ≥ B. The cost lands on the rolling restart: each tserver's PG start waits for
+the whole upgrade volume at that moment. Optional: a push cycle triggered by the
+upgrade handler after `UpdateCatalogVersions`, before `MONITORING`, pre-loads
+every copy while the old binaries keep serving.
+
+Open:
+
+- Table removal records. The finalize cleanup and the rollback delete catalog
+  tables on master. On the copy those deletions arrive as table removal
+  records. Not checked: that the applier removes the tables from the copy's
+  metadata. Worst case after a rollback and a later retry: the create records
+  for the same table ids fail on the copy, N apply failures, re-seed.
+- Faster periodic push during the upgrade: the new-version catalog (initdb plus
+  pg_upgrade of every database) reaches the copies only through the timer and
+  floor requests, so the rolling restart pays the whole volume at each PG start.
+  Run the timer cycle more often while the upgrade is in progress, or trigger a
+  push cycle from the upgrade handler after `UpdateCatalogVersions`, before
+  `MONITORING`, so every copy is pre-loaded while the old binaries still serve.
+- Not checked: whether a tserver on the new binary can start PG before the
+  upgrade reaches `MONITORING`. If it can, master's own new-version tables are
+  incomplete too: an upgrade-orchestration property, not a copy one.
+
+Test: the `ysql_major_upgrade_*-test.cc` suites under
+`src/yb/integration-tests/upgrade-tests/` with the copy on, including
+rollback (`ysql_major_upgrade_matview-test.cc` covers the refresh case); add
+a check that catalog reads are served by the copy during `MONITORING` and
+after finalize (`local_catalog_reads_served` grows, no re-seed).
 
 ### 2.24 T26. Observability
 
@@ -966,8 +1089,25 @@ compacted files but its own history cutoff starts low
 `ts_tablet_manager.cc:4004`). A `yb_read_time`, `ysql_dump --read-time` or
 walsender read below master's cutoff can return the state as of the cutoff
 with no error where master would return SnapshotTooOld. Not checked whether
-the superblock carries a cutoff. Fix: seed the copy's cutoff from master's
-at bootstrap and refuse reads below it.
+the superblock carries a cutoff; implementation2 §4 says the committed cutoff
+is seeded from the SST frontiers copied from master.
+
+Decided 2026-10-18: give the copy a serving cutoff that can be later than
+master's. Any cutoff at or above every cutoff master used when it compacted the
+copied files is correct; a later one only sends more old explicit-time reads to
+master, which serves them or fails with SnapshotTooOld as today.
+
+- Value at seed (and at every re-seed): the maximum of the seed time minus
+  `timestamp_syscatalog_history_retention_interval_sec` and the value seeded
+  today. Master's system catalog cutoff is now minus that interval, or earlier
+  when a snapshot schedule or CDC needs more history, so every compaction
+  cutoff master used before the seed is at or below the seed time minus the
+  interval. This assumes the interval was never lowered and master and tserver
+  use the same value.
+- Reads below the serving cutoff go to master (plan2 §5.3 rule 6).
+- The serving cutoff decides only which reads the copy serves. What compaction
+  on the copy keeps is separate: PITR in place (pitr-handling.md §3.2) needs the
+  copy to keep history back to master's schedule bound.
 
 ### 2.29 T31. Restore inside the copied WAL tail
 
@@ -1035,8 +1175,26 @@ ability to reconnect, and an assertion on where reads went.
 
 ### 2.33 T35. Non-PG rows
 
-Filter non-PG rows of the system catalog (master's own metadata entries) out
-of the stream and the snapshot if space matters. Not measured.
+Raised to Medium 2026-10-24 (design review: Mark, Nita). The system catalog
+tablet also holds master's own records: tablet and table metadata, Raft
+configuration and leader changes, OID allocation, tablespace and placement.
+They are written by master directly, have no MVCC read-as-of semantics, and
+nothing on the copy reads them, yet every change is pushed to every tserver
+(and copied by every remote bootstrap). Under a leader-election storm or
+load-balancer moves this is continuous traffic unrelated to PG.
+
+Work:
+
+1. Measure the volume: bytes pushed per minute during a leader-election storm
+   and during a load-balancer rebalance, with no DDL running.
+2. Filter in the page builder (skip records of master's own tables) and in the
+   remote-bootstrap snapshot (or delete those tables from the copy after the
+   transfer).
+3. Keep what the copy does need, if anything: today the tserver's table cache
+   fetches DocDB schemas from master (todos T17), not from the copy.
+4. Interaction with PITR (T43): the restore's master-entries step is already not
+   repeated on the copy; filtering removes the question of what later writes to
+   those entries do on the copy.
 
 ### 2.34 T36. Wait latency
 
@@ -1105,45 +1263,93 @@ version arrives by heartbeat. Accepted.
 
 ### 2.38 T38. Schema-change records: re-apply and ordering
 
-Source: design review 2026-10 (Hari, Mark). Design: [plan2 §4.2](plan2.md#42-applier).
+Source: design review 2026-10 (Hari, Mark); reviewed against the code 2026-10-18 (`5886f97e64e`).
+Design: [plan2 §4.2](plan2.md#42-applier). Related: T45 (CDC retention fields in the same kind of
+record).
+
+**What the records are.** A schema-change record (`CHANGE_METADATA_OP`) is a Raft operation on a
+tablet that changes the tablet's metadata (its superblock): the DocDB tables it contains, their
+schemas and schema versions, and tablet-wide settings such as WAL retention and CDC retention
+barriers. Master's system catalog tablet is colocated: it holds master's own `sys.catalog` table
+and every PG catalog relation of every database as a separate DocDB table. On it, the records come
+from:
+
+| Source | Record | Code |
+|---|---|---|
+| `CREATE DATABASE` | one record adding the template's catalog tables (about 90) when `batch_ysql_system_tables_metadata` is on | `catalog_manager.cc:4224-4290` |
+| A YSQL migration that creates a catalog table or index (e.g. V68 creates `pg_yb_invalidation_messages`), initdb, a major upgrade's new-version catalog | one record per table added | `CreateYsqlSysTable`, `catalog_manager.cc:4007-4070` |
+| `DROP DATABASE`, `DeleteYsqlSystemTable`, major-upgrade cleanup and rollback | one record per table removed | `catalog_manager.cc:7495-7516`, `sys_catalog.cc:2088-2093`, `DeleteYsqlDBTables` |
+| Logical replication stream creation | one record per table re-sending the current schema unchanged, with CDC retention fields (T45) | `xrepl_catalog_manager.cc:1868-1900` |
+
+Ordinary DDL changes catalog rows, not this tablet's metadata. No migration changes an existing
+catalog table's schema: no migration file contains `ALTER TABLE`.
 
 What exists:
 
-- Master seals a page after every schema-change (`CHANGE_METADATA`) record,
-  the producer's rule that such a record is the last of a batch
-  (`xcluster_producer.cc:412-416`, push-plan §2.2). Each page therefore holds
+- Master seals a page after every schema-change record, the producer's rule that such a record is
+  the last of a batch (`xcluster_producer.cc:286-289`, push-plan §2.2). Each page therefore holds
   at most one schema-change record, at its end.
-- The applier writes out the row batch it has accumulated before it applies
-  the schema-change record as a `ChangeMetadataOperation` retargeted at the
-  copy's tablet id (worklog2 Phase 3 step 3).
+- The applier writes out the row batch it has accumulated, then submits the schema-change record
+  as a `ChangeMetadataOperation` with the tablet id rewritten to the copy's
+  (`local_catalog_applier.cc:671-743`, `:789-812`).
 
-What is not shown:
+Items:
 
-1. Re-apply after a restart. The checkpoint file is written once per second
-   and can be older than what the copy applied, so master pushes some records
-   again. The argument that a re-apply is harmless (plan2 §4.2, worklog2
-   Phase 2) covers row records and apply records only. Unverified: a re-pushed
-   schema-change record that adds tables already present in the copy's
-   metadata, or that sets a schema version the copy already has. A failed
-   check on a `kChangeMetadata` operation is a glog FATAL
-   (`operation_driver.cc:425`, the T32 instance), so a record that cannot be
-   applied twice puts the tserver into a crash loop.
-2. Ordering of durability. The copy's superblock (where the schema change
-   lands) and the checkpoint file are written independently. Not written
-   down: which states a crash can leave (superblock ahead of the checkpoint,
-   or behind it) and that each one converges.
-3. The xCluster rule. In xCluster, two schema-change records in one batch
-   caused ordering problems and a checkpoint is forced between them (Mark).
-   Hari to confirm that the page-seal rule above is the same guarantee.
-4. Catalog version bumps must not be skipped (Hari). Holds by construction:
-   A[db] is read from the copy's version table at C and compared with `≥`,
-   so several bumps inside one page are safe. Record this in plan2 §4.2.
+1. **Re-apply after a restart** (resolved by code reading). The checkpoint file is written about
+   once a second, so after a restart master pushes again the records the copy applied after it.
+   `ChangeMetadataOperation::Apply` is the same code tablet bootstrap uses to replay these records
+   (`tablet_bootstrap.cc:1853-1871`):
 
-Test: restart a tserver with its checkpoint older than the copy's metadata
-(`TEST_` flag that skips `PersistCheckpoint`), in the middle of `CREATE
-DATABASE` (about 90 new cotables, `NewDatabaseCotablesReachTheCopy` shape)
-and in the middle of `ALTER TABLE ... ADD COLUMN`; expect the copy to serve
-and to match master.
+   | Record | Second apply | Code |
+   |---|---|---|
+   | Add table(s) | the existing entry is kept, after a check that the colocation id is unchanged | `tablet_metadata.cc:1693-1724` |
+   | Remove table | does nothing when the table is absent | `tablet_metadata.cc:1733-1748` |
+   | Table schema, table present | skipped when the table's schema version is already at or above the record's ("Already running schema version") | `change_metadata_operation.cc:166-190`, `:233-239` |
+   | Table schema, table already removed | fails: the schema-version lookup returns an error (`:174-180`), and a failed apply is a glog FATAL (`operation_driver.cc:425-427`), so the copy crash-loops | — |
+
+   The last case is closed by T45 item 3: the applier skips a table-schema record whose table is
+   absent from the copy's metadata, as tablet bootstrap did before D19063
+   (`tablet_bootstrap.cc:1820-1826`).
+2. **Durability ordering** (decided). The superblock flush on apply is normal durability: it
+   records `last_flushed_change_metadata_op_id`, bootstrap replays only the schema-change records
+   after it (`tablet_bootstrap.cc:1171-1175`), and a WAL segment holding a metadata change can be
+   deleted only after the flush (`:849-853`). Rule for the copy, around each schema-change record:
+   1. apply the page's row records and write them out;
+   2. persist the checkpoint at the position just before the schema-change record (records carry
+      op ids);
+   3. apply the schema-change record;
+   4. persist the checkpoint at the record's position.
+
+   A crash between steps 2 and 4 replays only the schema-change record, which item 1 shows is
+   safe. A crash after step 4 replays nothing from before the change. No replay crosses a schema
+   change, so:
+   - rows of a removed table are never replayed after the table left the copy's metadata;
+   - rows packed under a schema version older than the change are never replayed. The copy runs
+     old-packing cleanup after compaction (`enable_schema_packing_gc`, `OldSchemaGC`,
+     `tablet.cc:651-666`) without xCluster's minimum-version floor
+     (`FillMinXClusterSchemaVersion`). Without this rule, a compaction that repacked a table's rows
+     could let that cleanup drop a packing that replayed rows still need.
+
+   Both persists happen only after the copy's own WAL is durable (T7). Cost: two synchronous
+   checkpoint writes per schema change; schema changes come only with `CREATE DATABASE`,
+   `DROP DATABASE`, migrations and upgrades.
+3. **The xCluster rule** (resolved). xCluster forces the stream checkpoint to be stored after a
+   batch that ended with a schema change (`xcluster_poller.cc:403-408`, `cdc_service.cc:2115`), so
+   a restarted poller replays at most one schema version back. Its reason: replayed rows are packed
+   under the source's schema version and need a producer-to-consumer mapping for it ("Schema
+   version mapping for $0 not found", `xcluster_write_implementations.cc:91`) and the matching old
+   packing on the target. The page-seal rule plus item 2 gives the copy a stronger guarantee: no
+   replay crosses a schema change.
+4. **Catalog version bumps must not be skipped** (Hari). Holds by construction where versions are
+   read from the copy (legacy mode, support_object_locking_off.md §3 item 4): versions are read at
+   C and published only forward, so several bumps inside one page are safe. Under object locking
+   no version is read from the copy (simplified_with_object_locks.md).
+
+Test: restart a tserver with its checkpoint older than the copy's metadata (`TEST_` flag that skips
+`PersistCheckpoint`) in the middle of `CREATE DATABASE` (about 90 new tables,
+`NewDatabaseCotablesReachTheCopy` shape), in the middle of `DROP DATABASE`, and after a
+logical replication stream creation followed by a `DROP DATABASE` of the stream's database; expect
+the copy to serve and to match master. Inject a crash between steps 2 and 4 of item 2.
 
 ### 2.39 T39. Re-seed storms and peer seeding
 
@@ -1264,3 +1470,206 @@ Change (pitr-handling.md §3):
    falls back to a re-seed.
 
 Open items: pitr-handling.md §5.
+
+### 2.47 T47. xCluster DDL queue handler
+
+Source: design review 2026-10-24 (Mark). `CREATE EXTENSION` and the DDLs the
+xCluster DDL queue handler replays on the target are ordinary DDLs: their
+releases reach every lease holder before the DDL returns, and a backend that
+starts after a lease loss waits for the copy. Nothing about the extension needs
+a master read. What has to be checked is the handler's own catalog read path:
+it applies replicated DDLs through a PG connection with a consistency GUC and
+may depend on reading the catalog at a particular time or at master's latest;
+document which reads it issues and whether any of them must bypass the copy.
+
+### 2.48 T48. Release timeout
+
+Source: design review 2026-10-24. Today, when the synchronous release does not
+complete within `tserver_yb_client_default_timeout_ms` (60 s), the DDL's tserver
+ignores the error and responds success (`ts_local_lock_manager.cc:985-991`,
+"falling back to async release"). The design (local_catalog_docdb_design.md
+§5.6, §7.4) returns an error instead: the DDL may have committed, but its effect
+is not in force on every tserver, the same situation as a lost commit response.
+Master keeps completing the release in the background.
+
+The user then has no way to know when the DDL is in force everywhere, and
+running it again does not help (`CREATE ROLE` fails with "already exists").
+Change:
+
+1. Return an error from the DDL after the timeout; wording that says the effect
+   is unknown and propagation continues.
+2. Master UI and metrics: list in-progress releases with the DDL's transaction,
+   start time, and per lease holder whether it has acknowledged (design §11.1
+   item 4), so a DDL that timed out can be followed to completion.
+
+### 2.44 T44. The release floor moves on every retry
+
+Source: discussion 2026-10-17. Design: [simplified_with_object_locks.md §4.1](simplified_with_object_locks.md#41-lock-release).
+Code pointers are against `5886f97e64e`.
+
+The floor a tserver waits for before it publishes a release's versions and releases the DDL's
+locks is today `catalog_versions_read_time`. Master sets it when it reads the version map for the
+release (`PopulateDbCatalogVersionCache`, `object_lock_info_manager.cc:1133-1160`, with
+`use_cache=false`). That read starts at the system catalog tablet's current safe time, about
+master's "now" (`SysCatalogTable::ReadWithRestarts`, `sys_catalog.cc:978`), and restarts at any
+write it meets inside its uncertainty window (`:980-994`). The read time is therefore at or above
+the commit of every version in the map, by the clock skew bound (C19). It is not a commit time:
+each new read gives a later time.
+
+Which retries read again:
+
+| Retry | Same floor? |
+|---|---|
+| Master resends to one tserver after an RPC transport failure (`UpdateTServer::SendRequest`, `:1902-1908`) | yes: the request was filled once before the fan-out (`:1275`) |
+| A tserver answers with an error, for example its wait for the floor timed out (`ts_local_lock_manager.cc:577-595`, `tablet_service.cc:4013-4014`) | master does not retry this attempt: the task fails (`HandleResponse`, `:1920-1945`) and master returns the error to the DDL's tserver |
+| The DDL's tserver resends the global release after any failure, at once, without backoff (`ReleaseWithRetriesGlobalNow`, `ts_local_lock_manager.cc:111-122`) | **no**: master reads the versions again, runs a new push cycle and sends to every lease holder again |
+| Master leader failover (`RelaunchInProgressRequests`, `:1490-1507`) | **no**, same as above |
+| Lost-message re-release after the transaction's deadline (`ScheduleReleaseForLostMessages`, `ts_local_lock_manager.cc:321-334`) | **no**, same as above |
+
+Effect:
+
+- A healthy tserver passes each attempt after one apply: the attempt carries pages up to its own
+  push cycle's S, which is at or above its own read time. A tserver that already handled an
+  earlier attempt waits again before it acknowledges.
+- A tserver that is slow but catching up chases a target that moves with every attempt. If it
+  needs longer than one attempt's deadline to reach "now", every attempt fails on it and the
+  release never completes there. With a floor that stays fixed, it would pass as soon as it
+  caught up.
+- Every attempt costs master a version read, a push cycle and a fan-out to every lease holder.
+
+Fix candidates:
+
+1. **Master keeps the floor in memory.** On the first processing of a release, master keeps the
+   version map and its floor in memory, keyed by the release, until the release completes. A
+   resend from the DDL's tserver and a lost-message re-release reuse them. A master failover
+   computes them once more on the new leader. Reusing an older map later is safe because a
+   release sets `ignore_catalog_version_staleness_check` (`object_lock_info_manager.cc:1158`).
+   Not checked: whether master recognizes the DDL tserver's resent request as the release it
+   already has in progress.
+2. **The floor is the newest commit time among the versions in the map** (preferred). Each
+   version was written by its DDL's transaction, so the hybrid time at which its row was written
+   is that DDL's commit time. The maximum over the versions in the map is the highest commit time
+   the tserver needs, and nothing more. It does not change between attempts while the map is
+   unchanged, and it needs nothing kept or recomputed.
+   - Source: the version's row in `pg_yb_invalidation_messages`. Each PG-side increment runs
+     `yb_increment_db_catalog_version_with_inval_messages` or
+     `yb_increment_all_db_catalog_versions_with_inval_messages` (`pg_proc.dat:8145-8155`):
+     one statement that deletes rows older than the expiration (only this database's rows, or
+     every database's rows for the all-database variant), updates the version row, and inserts one
+     messages row per new version, with NULL messages when there are none. That row is inserted
+     once, inside the DDL's transaction, and never updated, so its write time is exactly the DDL's
+     commit time. The row of a database's current version is never deleted by that cleanup: a
+     row is deleted only by a later increment of the same database (all databases for the
+     all-database variant), which inserts a newer current row in the same statement.
+   - `pg_yb_catalog_version` cannot be the source: its row is updated in place by every
+     increment, and with packed rows its last update time cannot be read exactly.
+   - Cases where the current version of a database has no messages row:
+     1. The database's initial version. `YbCreateMasterDBCatalogVersionTableEntry`
+        (`yb_catalog_version.c:743`, called from `yb_cmds.c:161` for `CREATE DATABASE`) inserts
+        the version row as a single-shard write with no messages row; initdb's databases are the
+        same. This lasts until the first DDL in that database.
+     2. A PITR restore. Master writes the restored database's version as current + 1
+        (`PgCatalogRestorePatch::Finish`, `restore_sys_catalog_state.cc:196-210`) and writes no
+        messages row (pitr-handling.md §2).
+     3. A major version upgrade. `UpdateCatalogVersions` deletes every row of the new-version
+        messages table after copying the version rows
+        (`ysql_initdb_major_upgrade_handler.cc:441-457`). This lasts until the next DDL in each
+        database.
+     4. Clone (T40): not checked.
+     5. Out of scope while the copy is on: increments when invalidation messages are disabled or
+        the messages function or table does not exist yet (the update-only path,
+        `yb_catalog_version.c:563-600`), and manual writes to the version row (T6, disabled).
+
+     A dropped database's rows are deleted (`YbDeleteMasterDBInvalidationMessagesTableEntries`,
+     `yb_catalog_version.c:798`), but the database also leaves the version map, so it needs no
+     floor.
+   - Fix for the missing rows: make "every current version has a messages row" an invariant by
+     inserting a row with NULL messages at the three writers above: database creation (in the
+     same write as the version row), the PITR restore (in the restore's own write), and
+     `UpdateCatalogVersions` (one row per database's current version, instead of an empty
+     table). PG already inserts NULL-message rows when it has no message list
+     (`GetInvalidationMessages`, `yb_catalog_version.c:133-141`). Not checked: how the tserver's
+     message queue and the backends treat a NULL list after a restore or an upgrade; a full
+     catalog refresh is what a backend needs there anyway (pitr-handling.md §5 item 2).
+   - Fallback when a row is still missing: use master's read time for that database. It is a
+     valid upper bound, but it moves on every attempt.
+   - A release whose transaction changed no version gets the commit time of the newest version
+     already published, which the copy normally holds already, so tservers pass at once. This
+     also removes the push cycle such releases cost today (simplified_with_object_locks.md §7
+     item 5).
+   - If another DDL committed between two attempts, the map of the later attempt includes its
+     version and the floor moves to that DDL's commit time. The tserver needs that DDL's rows
+     anyway before it can publish its version.
+   - A row of a committed transaction is applied at the transaction's commit hybrid time, so its
+     write time is the commit time. Not checked: which time a read reports for a value that is
+     still an intent of a committed transaction not yet applied on master.
+   - Today's read path does not return write times for these tables. `DocRowwiseIterator` fills
+     `QLTableColumn::write_time` only outside flat document mode (`doc_rowwise_iterator.cc:900-917`),
+     and master reads its catalog tables with that iterator (`sys_catalog.cc:1055-1078`). This
+     needs a change for the messages table.
+   - The heartbeat can carry the same floor, for the cases where the copy does not serve
+     (simplified_with_object_locks.md §4.3).
+
+Test: slow one tserver's apply (`TEST_local_catalog_pushed_batch_apply_delay_ms`) to longer than
+one attempt's deadline, run a DDL elsewhere, and assert that the release completes on that tserver
+once its copy catches up. Count master's version reads and push cycles per DDL before and after.
+
+### 2.45 T45. CDC retention fields in schema-change records
+
+Source: discussion 2026-10-18. Code pointers are against `5886f97e64e`.
+
+When a logical replication (CDCSDK) stream is created, master writes one schema-change record
+(`CHANGE_METADATA_OP`) on its system catalog tablet for each of `pg_class`, `pg_publication_rel`
+and `pg_replication_origin` (`SetAllInitialCDCSDKRetentionBarriersOnCatalogTable`,
+`xrepl_catalog_manager.cc:1868-1900`). The record re-sends the table's current schema at its
+current version, so it changes no schema. It also carries `retention_requester_id` (the stream id),
+`cdc_sdk_require_history_cutoff` and, when set on the table, `wal_retention_secs`.
+
+The copy's applier submits every schema-change record unchanged, with only the tablet id rewritten
+(`LocalCatalogApplier::ApplyChangeMetadataRecord`, `local_catalog_applier.cc:789-812`).
+`ChangeMetadataOperation::Apply` acts on the retention fields before it looks at the schema
+(`change_metadata_operation.cc:141-155`), so on every tserver the copy gets:
+
+- a WAL barrier at the record's position (`log->set_cdc_min_replicated_index`,
+  `change_metadata_operation.cc:300-301`). WAL cleanup resets a barrier that has not been
+  refreshed within the stale threshold (`TabletPeer::RunLogGC` →
+  `reset_cdc_min_replicated_index_if_stale`, `tablet_peer.cc:899-905`, `:1314-1322`;
+  `cdc_min_replicated_index_considered_stale_secs`, 1800 s, or 4 h for the system catalog tablet),
+  so the copy keeps up to that much extra WAL;
+- an intent-cleanup barrier and, with `cdc_sdk_require_history_cutoff`, a history retention
+  barrier (`SetAllInitialCDCSDKRetentionBarriers`, `change_metadata_operation.cc:320-321`). A
+  staleness check exists for the history barrier (`is_cdc_sdk_safe_time_stale`,
+  `tablet_peer.cc:1293`). Not checked: whether the copy's retention path
+  (`LocalCatalogAllowedHistoryCutoff`) honors these barriers, and when they are reset;
+- the stream's WAL retention period (`change_metadata_operation.cc:146-153`).
+
+On an ordinary tablet, the tserver's CDC service moves these barriers forward from the stream
+checkpoints in `cdc_state`. On master's system catalog tablet, master does it, and the history
+barrier follows `timestamp_syscatalog_history_retention_interval_sec` (TODO #26427 in
+`xrepl_catalog_manager.cc:1896-1898`). Nothing moves them on the copy: it has no `cdc_state` row
+and is outside `tablet_map_` (C20). The copy needs none of them, because no CDC stream reads the
+copy.
+
+These records are also the only table-schema records on the system catalog today: no migration
+changes an existing catalog table's schema. A table-schema record replayed after its table was
+removed fails: the schema-version lookup for the table returns an error
+(`change_metadata_operation.cc:174-180`), and a failed apply is a glog FATAL
+(`operation_driver.cc:425-427`). The copy then crash-loops, because a restart pushes the same
+record again from the checkpoint. The sequence is: a stream is created, its database is dropped,
+and a copy restarts from a checkpoint older than both (T38).
+
+Change:
+
+1. Before submitting a schema-change record, the applier clears `retention_requester_id`,
+   `cdc_sdk_require_history_cutoff` and `wal_retention_secs`.
+2. It skips the record when nothing is left to apply: no table added or removed, and no schema
+   newer than the copy's.
+3. It skips a table-schema record whose table is absent from the copy's metadata. This is what
+   tablet bootstrap did before D19063 ("If table id isn't in metadata, ignore the replay as the
+   table might've been dropped", `tablet_bootstrap.cc:1820-1826`). It also covers a future
+   migration that adds a column to a per-database catalog table whose database is later dropped.
+
+Test: create a logical replication slot with the copy on. Assert that the copy's WAL barrier and
+WAL retention period are unchanged, and that the copy's WAL is cleaned up as before. Then drop the
+stream's database, restart a tserver with a checkpoint older than the stream creation
+(`TEST_` flag that skips `PersistCheckpoint`), and assert that the copy serves.
