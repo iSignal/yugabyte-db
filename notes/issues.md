@@ -29,7 +29,7 @@ them, in roughly the order listed within each priority.
 | 14  | Features that write the catalog outside DDL are disabled while the copy is on              | Medium   | [14](#14-features-that-write-the-catalog-outside-ddl-are-disabled-while-the-copy-is-on)      |
 | 15  | Checkpoint on schema change record apply                                                   | High     | [15](#15-checkpoint-on-schema-change-record-apply)                                           |
 | 16  | Metrics, routing log and flag-on CI for the copy                                           | High     | [16](#16-metrics-routing-log-and-flag-on-ci-for-the-copy)                                    |
-| 17  | Master load test harness: N simulated tservers, steady DDL, catch-up, `CREATE DATABASE`    | High     | [17](#17-master-load-test-harness)                                                           |
+| 17  | Performance test plan: master load and DDL latency measured on simulated tservers          | High     | [17](#17-performance-test-plan)                                                              |
 | 18  | A copy that is corrupt or cannot apply takes itself out of the read path and re-seeds      | Medium   | [18](#18-a-copy-that-is-corrupt-or-cannot-apply-takes-itself-out-of-the-read-path)           |
 | 19  | PITR of a database is applied in place on every copy; connections after RESTORED see it    | Medium   | [19](#19-pitr-of-a-database-is-applied-in-place-on-every-copy)                               |
 | 20  | Major version upgrade works with the copy serving throughout                               | Medium   | [20](#20-major-version-upgrade-works-with-the-copy-serving-throughout)                       |
@@ -45,6 +45,7 @@ them, in roughly the order listed within each priority.
 | 30  | Web pages and ASH wait events for the copy                                                 | Medium   | [30](#30-web-pages-and-ash-wait-events-for-the-copy)                                         |
 | 31  | The copy works without object locking (backport to 2026.1)                                 | Low      | [31](#31-the-copy-works-without-object-locking)                                              |
 | 32  | xCluster DDL queue handler reads are checked against the copy                              | Low      | [32](#32-xcluster-ddl-queue-handler-reads-are-checked-against-the-copy)                      |
+| 33  | Correctness test plan on a real cluster: DDL streams, lease rejoin, rolling restarts, node additions | High     | [33](#33-correctness-test-plan-on-a-real-cluster)                                            |
 
 ---
 
@@ -481,22 +482,39 @@ log; EXPLAIN's served-by-copy count. CI: the Java regress schedules and the C++ 
 
 **Tests.** Each counter asserted by the routing tests; a flag-on CI job.
 
-## 17. Master load test harness
+## 17. Performance test plan
 
-**Summary:** Master load test harness: N simulated tservers, steady DDL, catch-up, `CREATE DATABASE`.
+**Summary:** Performance test plan: master load and DDL latency measured on simulated tservers.
 
-**Scenario.** Master's CPU, memory and NIC under 1,000 tservers can be measured on one host before
-and after each optimization.
+**Scenario.** Before the feature is on by default we can state, with numbers from a repeatable
+run, what master pays per tserver and per DDL, how long a DDL takes while its release fans out,
+and how long a cluster of 1,000 tservers takes to catch up after a burst. Every optimization
+(issues 10, 27) is measured against the same plan.
 
-**Technical details.** `pg_local_catalog_load-test` from the prototype: N push receivers in the test
-process register with master (`TEST_local_catalog_push_extra_targets`), acknowledge and discard;
-scenarios `PushSteady` (4 DDL sessions, N=200/1000), `PushJoinerWave` (K receivers behind by 50 or
-2000 DDLs), `CreateDatabaseFanout`, `PushIdle` (N=8000), `RealTserversOnly`, `DdlWalSize`; per-run
-master CPU from `/proc`, pidstat, vmstat, optional perf profile; results in
-[loadtest-summary.md](loadtest-summary.md). Add: DDL latency with real lease holders (receivers
-that hold a lease), full-inline `CREATE DATABASE` fan-out (issue 1's no-cap payload).
+**What the plan covers.**
 
-**Tests.** The harness is the test; results checked into the notes per run.
+- Harness: `pg_local_catalog_load-test` from the prototype: N push receivers in the test process
+  register with master (`TEST_local_catalog_push_extra_targets`), acknowledge and discard;
+  receivers that hold a YSQL lease, so that a DDL waits for them; per-run master CPU from `/proc`,
+  pidstat per thread, vmstat, an optional perf profile; results checked into the notes per run
+  ([loadtest-summary.md](loadtest-summary.md) has the prototype's).
+- Scenarios, each at N=100 and N=1,000 (and N=8,000 for idle): steady DDL stream (4 sessions of
+  `CREATE TABLE` / `ADD COLUMN` / `DROP TABLE`, 30 s); catch-up of K tservers behind by 50 and by
+  2,000 DDLs; `CREATE DATABASE` fan-out (11.6 MB per tserver, inline and through the bounded
+  push); idle cluster; a migration batch of 20 statements in one transaction; `DROP SCHEMA ...
+  CASCADE` with 100 tables; `ANALYZE` of a 100-table database.
+- Measured per scenario: master cores (and above the no-receiver baseline), CPU per push RPC and
+  per MB, bytes sent, in-flight maxima, push failures and gaps, time until the last receiver holds
+  the DDL, DDL p50/p99 with lease-holding receivers, coordinator status RPC rate.
+- Backend-side numbers on the three-region cluster (design §10.2): cold, warm and post-DDL
+  latencies for the query set, repeated per release; the r6 numbers are the baseline.
+
+**Pass criteria** (to be confirmed when the plan is written): steady DDL at N=1,000 under 3 master
+cores above baseline; idle cluster at N=8,000 under 0.5 core; catch-up of 1,000 × 2,000 DDLs under
+30 CPU-s; DDL p99 with 1,000 lease-holding receivers within 2× of the no-receiver p99; cold
+backend latencies within 2× of the r6 numbers.
+
+**Deliverable.** The plan as a notes file, the harness in tree, one results file per run.
 
 ## 18. A copy that is corrupt or cannot apply takes itself out of the read path
 
@@ -739,3 +757,48 @@ messages on. Behaviour changes are performance only.
 a consistency GUC; document which catalog reads it issues and whether any must bypass the copy.
 `CREATE EXTENSION` itself needs nothing: it is an ordinary DDL whose release reaches every lease
 holder before it returns.
+
+## 33. Correctness test plan on a real cluster
+
+**Summary:** Correctness test plan on a real cluster: DDL streams, lease rejoin, rolling restarts,
+node additions, with minimum performance guarantees checked alongside.
+
+**Scenario.** Unit tests cover each mechanism in isolation on a mini cluster. Before the feature is
+on by default it has to be exercised the way a deployment hits it: many tservers, DDLs arriving
+while nodes leave, rejoin, restart and get added, with every backend's reads checked against the
+catalog state they are entitled to see. This plan is what the concurrent-DDL suite run on a
+customer-like cluster (plan step 5) is measured by.
+
+**What the plan covers.**
+
+- Cluster: a multi-AZ or multi-region universe of a few dozen tservers with the flag on, object
+  locking and invalidation messages on; a connection pool per node; a DDL stream from one or
+  several nodes (`CREATE`/`ALTER`/`DROP TABLE`, `CREATE INDEX` with backfill, `GRANT`/`REVOKE`,
+  role and database DDL, `CREATE TEMP TABLE`, transactional DDL blocks that commit and that roll
+  back) interleaved with DML on the same tables.
+- Correctness oracle: every statement's result compared against what a run with the copy off
+  returns, and invariants checked continuously: a backend that was told version V never reads
+  rows older than V (compare `pg_class`/`pg_attribute` snapshots on each node against master at the
+  copy's safe time); a DDL that returned success is visible on every node immediately after; DML
+  against an altered table never writes with a stale schema; `\dt` on every node agrees once the
+  last DDL returned.
+- Scenarios: (1) steady DDL stream for an hour, pool connections cycling; (2) lease loss and
+  rejoin of one node and of a third of the nodes (network partition, then heal) during the stream;
+  (3) rolling restart of all tservers during the stream; (4) adding nodes during the stream, with
+  the new node's copy bootstrapping under load; (5) master leader change during the stream;
+  (6) `CREATE DATABASE` and `DROP SCHEMA ... CASCADE` with hundreds of objects during the stream;
+  (7) PITR of one database and a major-version upgrade once issues 19 and 20 land;
+  (8) a tserver whose copy is forced to fail (issue 18) during the stream.
+- Minimum performance guarantees checked in every scenario: cold-connection first-query latency on
+  a far node within a bound (design §10.2: tens of ms, not seconds); DDL latency p99 within 2× of
+  the copy-off run; no DDL exceeds the synchronous timeout except in scenario 2 while nodes are
+  partitioned; master CPU within the issue 17 bounds; PG start after rejoin or restart within one
+  push round trip plus the catch-up volume.
+- Logging and metrics to collect per run (issue 16): routing counters per node, gate wait
+  histogram, floor requests, re-seeds, release status on master.
+
+**Pass criteria.** No oracle mismatch and no invariant violation in any scenario; every
+performance guarantee met; every failure triaged to a test defect or a filed issue.
+
+**Deliverable.** The plan as a notes file; the scenario scripts (reusing the three-region harness
+and the concurrent-DDL suite); one results file per run.
