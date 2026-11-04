@@ -11,6 +11,7 @@
 // under the License.
 
 #include <algorithm>
+#include <future>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -25,6 +26,9 @@
 
 #include "yb/common/common_net.h"
 #include "yb/common/common_types.pb.h"
+
+#include "yb/consensus/consensus.pb.h"
+#include "yb/consensus/raft_consensus.h"
 
 #include "yb/gutil/casts.h"
 
@@ -41,6 +45,8 @@
 #include "yb/master/master_cluster_client.h"
 #include "yb/master/master_heartbeat.proxy.h"
 #include "yb/master/master_types.pb.h"
+#include "yb/master/mini_master.h"
+#include "yb/master/sys_catalog_constants.h"
 #include "yb/master/ts_descriptor.h"
 #include "yb/master/ts_manager.h"
 
@@ -48,11 +54,14 @@
 #include "yb/rpc/proxy.h"
 #include "yb/rpc/rpc_controller.h"
 
+#include "yb/tablet/tablet_peer.h"
+
 #include "yb/tserver/mini_tablet_server.h"
 #include "yb/tserver/tablet_server.h"
 #include "yb/tserver/tserver_service.proxy.h"
 
 #include "yb/util/backoff_waiter.h"
+#include "yb/util/enums.h"
 #include "yb/util/logging_test_util.h"
 #include "yb/util/metrics.h"
 #include "yb/util/tostring.h"
@@ -618,18 +627,25 @@ TEST_F(MasterHeartbeatITestOneTServer, FullReportContinutation) {
   }
 }
 
-class MasterHeartbeatITestSixTablets : public MasterHeartbeatITest {
+// How the heartbeat that carries the first chunk of a full report fails after the master processed
+// the chunk.
+YB_DEFINE_ENUM(FirstChunkFailure, (kHeartbeatTimeout)(kLeaseLoss));
+
+class MasterHeartbeatITestSixTablets : public MasterHeartbeatITest,
+                                       public ::testing::WithParamInterface<FirstChunkFailure> {
  protected:
+  size_t num_masters() override { return 3; }
   int num_tablets() override { return 6; }
+
+  void FailFirstChunkByHeartbeatTimeout(const master::TSDescriptorPtr& ts);
+  void FailFirstChunkByLeaseLoss(
+      master::MiniMaster& leader_master, const master::TSDescriptorPtr& ts);
 };
 
-// A tserver abandons a full report whenever the heartbeat RPC carrying the first chunk times out,
-// even if the master went on to process that RPC, and starts a new full report. The master must
-// accept the continuations of the new report. Here the master is slow enough that the first full
-// report chunk times out on the tserver but is still processed by the master.
-TEST_F(MasterHeartbeatITestSixTablets, FullReportCompletesAfterHeartbeatTimeout) {
-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_load_balancing) = false;
-  auto& catalog_mgr = ASSERT_RESULT(mini_cluster_->GetLeaderMiniMaster())->catalog_manager();
+// The master is slow enough that the first chunk times out on the tserver but is still processed
+// by the master.
+void MasterHeartbeatITestSixTablets::FailFirstChunkByHeartbeatTimeout(
+    const master::TSDescriptorPtr& ts) {
   // Each full report chunk carries 2 tablets, so the master processes it in 2 batches and sleeps
   // between them. Every tserver hosts a replica of each of the 6 tablets, so a full report has
   // several chunks.
@@ -637,9 +653,6 @@ TEST_F(MasterHeartbeatITestSixTablets, FullReportCompletesAfterHeartbeatTimeout)
   const auto heartbeat_rpc_timeout = MonoDelta::FromSeconds(2 * kTimeMultiplier);
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_heartbeat_rpc_timeout_ms) =
       narrow_cast<int32_t>(heartbeat_rpc_timeout.ToMilliseconds());
-
-  auto ts = catalog_mgr.GetAllLiveNotBlacklistedTServers()[0];
-  ASSERT_TRUE(ts->has_tablet_report());
 
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_inject_latency_during_tablet_report_ms) =
       (heartbeat_rpc_timeout + 1s).ToMilliseconds();
@@ -655,11 +668,109 @@ TEST_F(MasterHeartbeatITestSixTablets, FullReportCompletesAfterHeartbeatTimeout)
       [&ts, stored_report] { return ts->latest_report_seqno() > stored_report; },
       30s * kTimeMultiplier, "TServer starts a new report"));
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_inject_latency_during_tablet_report_ms) = 0;
+}
+
+// A master config change resets the leader leases the followers acknowledged, so the master
+// leader has no lease until a majority of the new config replies again. The master finishes the
+// first chunk in this window, so the leader check at the end of TSHeartbeat fails and the tserver
+// gets LEADER_HAS_NO_LEASE.
+void MasterHeartbeatITestSixTablets::FailFirstChunkByLeaseLoss(
+    master::MiniMaster& leader_master, const master::TSDescriptorPtr& ts) {
+  // The first chunk carries 5 of the 6 tablets, so the master processes it in 5 batches and sleeps
+  // between them.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_tablet_report_limit) = 5;
+  constexpr auto kBatchLatency = 200ms;
+  // Shorter than the leader lease, so the remaining follower keeps the lease alive on its own,
+  // except right after the config change resets the acknowledged leases.
+  constexpr auto kFollowerDelay = 800ms;
+
+  std::vector<master::MiniMaster*> followers;
+  for (size_t i = 0; i != mini_cluster_->num_masters(); ++i) {
+    auto* mini_master = mini_cluster_->mini_master(i);
+    if (mini_master != &leader_master) {
+      followers.push_back(mini_master);
+    }
+  }
+  ASSERT_EQ(followers.size(), 2);
+  auto* remaining_master = followers[0];
+  auto* removed_master = followers[1];
+  auto leader_consensus = ASSERT_RESULT(leader_master.tablet_peer()->GetRaftConsensus());
+  auto remaining_consensus = ASSERT_RESULT(remaining_master->tablet_peer()->GetRaftConsensus());
+  auto leader_has_lease = [&leader_consensus] {
+    return leader_consensus->GetLeaderLeaseStatusIfLeader(nullptr) ==
+           consensus::LeaderLeaseStatus::HAS_LEASE;
+  };
+  const auto ts_uuid = ts->permanent_uuid();
+
+  remaining_consensus->TEST_DelayUpdate(kFollowerDelay);
+
+  StringWaiterLogSink processing_log("Sleeping in CatalogManager::ProcessTabletReport");
+  StringWaiterLogSink first_chunk_log(ts_uuid + " receiving first full report");
+  RegexWaiterLogSink no_lease_log(".*" + ts_uuid + ".*Failed to poll.*LEADER_HAS_NO_LEASE.*");
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_inject_latency_during_tablet_report_ms) =
+      kBatchLatency / 1ms;
+  // Same effect as a master leader change: the next heartbeat gets needs_full_tablet_report.
+  ts->set_has_tablet_report(false);
+  ASSERT_OK(processing_log.WaitFor(30s * kTimeMultiplier));
+  ASSERT_FALSE(first_chunk_log.IsEventOccurred());
+  ASSERT_TRUE(leader_has_lease());
+
+  // Remove the other follower while the master processes the first chunk.
+  consensus::ChangeConfigRequestPB req;
+  req.set_tablet_id(master::kSysCatalogTabletId);
+  req.set_type(consensus::REMOVE_SERVER);
+  req.set_dest_uuid(leader_master.permanent_uuid());
+  req.mutable_server()->set_permanent_uuid(removed_master->permanent_uuid());
+  auto change_config_done = std::make_shared<std::promise<Status>>();
+  auto change_config_future = change_config_done->get_future();
+  std::optional<tserver::TabletServerErrorPB::Code> error_code;
+  ASSERT_OK(leader_consensus->ChangeConfig(
+      req, [change_config_done](const Status& s) { change_config_done->set_value(s); },
+      &error_code));
+
+  // Let the master finish the chunk as soon as the leader has no lease.
+  const auto lease_deadline = CoarseMonoClock::now() + 10s * kTimeMultiplier;
+  while (leader_has_lease()) {
+    ASSERT_LT(CoarseMonoClock::now(), lease_deadline) << "Leader did not lose its lease";
+    SleepFor(1ms);
+  }
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_inject_latency_during_tablet_report_ms) = 0;
+
+  ASSERT_OK(first_chunk_log.WaitFor(30s * kTimeMultiplier));
+  ASSERT_OK(no_lease_log.WaitFor(10s * kTimeMultiplier));
+
+  remaining_consensus->TEST_DelayUpdate(0s);
+  ASSERT_EQ(change_config_future.wait_for(30s * kTimeMultiplier), std::future_status::ready);
+  ASSERT_OK(change_config_future.get());
+  ASSERT_OK(WaitFor(leader_has_lease, 30s * kTimeMultiplier, "Leader regains its lease"));
+}
+
+// A tserver abandons a full report whenever the heartbeat RPC carrying the first chunk fails, even
+// if the master processed that chunk, and starts a new full report. The master must accept the
+// continuations of the new report.
+TEST_P(MasterHeartbeatITestSixTablets, FullReportCompletesAfterFirstChunkFails) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_load_balancing) = false;
+  auto* leader_master = ASSERT_RESULT(mini_cluster_->GetLeaderMiniMaster());
+  auto ts = leader_master->catalog_manager().GetAllLiveNotBlacklistedTServers()[0];
+  ASSERT_TRUE(ts->has_tablet_report());
+
+  switch (GetParam()) {
+    case FirstChunkFailure::kHeartbeatTimeout:
+      ASSERT_NO_FATALS(FailFirstChunkByHeartbeatTimeout(ts));
+      break;
+    case FirstChunkFailure::kLeaseLoss:
+      ASSERT_NO_FATALS(FailFirstChunkByLeaseLoss(*leader_master, ts));
+      break;
+  }
 
   ASSERT_OK(WaitFor(
       [&ts] { return ts->has_tablet_report(); }, 30s * kTimeMultiplier,
       "Master receives a complete full report"));
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    FirstChunkFailure, MasterHeartbeatITestSixTablets, ::testing::ValuesIn(kFirstChunkFailureArray),
+    ::testing::PrintToStringParamName());
 
 TEST_F(MasterHeartbeatITest, TestRegistrationThroughRaftPersisted) {
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_persist_tserver_registry) = true;
